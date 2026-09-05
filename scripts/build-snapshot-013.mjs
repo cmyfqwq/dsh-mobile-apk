@@ -20,17 +20,30 @@ const ROOT = dirname(dirname(fileURLToPath(import.meta.url)))
 const ABI = process.argv[2] ?? 'arm64'
 if (!['arm64', 'x86_64'].includes(ABI)) { console.error('用法: node build-snapshot-013.mjs <arm64|x86_64>'); process.exit(1) }
 
+// ── 数据模块（Phase 2b 外置：scripts/snapshot-config/，双仓同版——雷点 10）──
+// 清单/模板与编排逻辑分离：预装包、镜像链、剥离清单、瘦身清单、seed 模板、apt.conf、
+// install-clang.sh 均在本目录维护；编排器只读数据 + 走流程。@@PREFIX@@ 为模板占位
+// （构建期替换为设备端前缀，本地 stage 路径不可烧入）。
+const CFG_DIR = join(ROOT, 'scripts', 'snapshot-config')
+const readCfg = (f) => readFileSync(join(CFG_DIR, f), 'utf8')
+const PREINSTALL = JSON.parse(readCfg('preinstall.json'))
+const STRIP = JSON.parse(readCfg('strip.json'))
+const SLIM = JSON.parse(readCfg('slim.json'))
+const SEED_SETTINGS = readCfg('seed-settings.yaml')
+const APT_CONF_TPL = readCfg('apt.conf.template')
+const INSTALL_CLANG_TPL = readCfg('install-clang.sh')
+for (const [name, v] of [['preinstall', PREINSTALL], ['strip', STRIP], ['slim', SLIM]]) {
+  if (!v || typeof v !== 'object') { console.error(`snapshot-config/${name} 无效`); process.exit(1) }
+}
+
 // ── 配置 ────────────────────────────────────────────────────────────────
 const TERMUX_PKG = ABI === 'arm64' ? 'aarch64' : 'x86_64'
-const MIRRORS = [
-  'https://mirrors.tuna.tsinghua.edu.cn/termux/apt/termux-main',   // 国内镜像优先（镜像回退链 D11）
-  'https://packages.termux.dev/apt/termux-main',                    // 官方原仓库（最终回落）
-]
+const MIRRORS = PREINSTALL.mirrors
 // android-tools（adb 36）：下一里程碑「真实 ADB 通道」的执行客户端——
 // 壳侧用「adb pair」真实配对握手（码值不出壳），引擎侧用「adb connect/shell」经本机 adbd（shell uid）执行。
 // 注：termux 无 `licenses` 包（实测索引不存在）——usr/share/LICENSES 标准文本来自基座 bootstrap 或本脚本的
 // 仓库 LICENSE 复制（见 ensureLicenseTexts；x64 基座曾缺 → 架构无关确定化）。
-const TARGETS = ['python', 'python-pip', 'perl', 'ruby', 'ripgrep', 'zip', 'vim', 'openssl', 'openssl-tool', 'zsh', 'socat', 'busybox', 'dpkg', 'termux-exec', 'termux-elf-cleaner', 'termux-keyring', 'android-tools', 'git']
+const TARGETS = PREINSTALL.targets
 const NEW_PREFIX = '/data/user/0/com.dsharnessmobile.shell/files/usr'
 const OLD_PREFIX = '/data/data/com.termux/files/usr'
 const BASE_DIR = join(ROOT, '.deploy-tmp', ABI === 'arm64' ? 'arm64-base' : 'x64-base')
@@ -68,41 +81,24 @@ if (existsSync(baseDsh)) {
 // 无 key、无 apiKeyEnv 指向未配置、无真实 endpoint 明文（门禁 check-snapshot-secrets.ps1
 // 校验模板不得含 sk-/apiKey 明文）。
 const DH = join(STAGE, 'root', 'home', '.dsh')
-for (const leaf of ['.credentials.yaml', '.anonymous-user-id']) {
+for (const leaf of STRIP.secretLeaves) {
   const p = join(DH, leaf)
   if (existsSync(p)) { rmSync(p, { force: true }); log(`strip secret: ${leaf}`) }
 }
 // seed 非机密 settings.yaml 模板（Q14；零机密：deepseek 官方段骨架，key 由壳私有文件注入）
-const seedSettings = [
-  '# dsh-mobile 0.13.0 开箱默认（非机密模板；用户配置请在设置界面操作，UI 保存会覆盖本文件）',
-  '# DeepSeek 官方 provider：key 由壳侧私有文件注入（DEEPSEEK_API_KEY 环境变量），此处不落任何凭据。',
-  // 必须给空对象而非裸键：settings-file 的 section() 对 null 抛 TypeError（llm-deepseek 插件 apply 中途死亡，模型页全灭——2026-08-28 模拟器首启实验实锤）。
-  'llm-deepseek: {}',
-  '  # apiKeyEnv: DEEPSEEK_API_KEY  # 壳体注入，无需手写；无 key 时错误信息引导去设置界面填写',
-  '',
-  '# 第三方/自定义 provider（OpenRouter、OpenCode Zen Go 等）请在「设置 → 添加自定义供应商」添加：',
-  '# 面板会写入 llm-pi-ai.providers.<route> 并引导填写 key，无需手写本文件。',
-  'llm-pi-ai:',
-  '  providers: {}',
-  '',
-  '',
-].join('\n')
+// 模板内容外置 snapshot-config/seed-settings.yaml（verbatim 写入）
 const seedSettingsPath = join(DH, 'settings.yaml')
-writeFileSync(seedSettingsPath, seedSettings)
+writeFileSync(seedSettingsPath, SEED_SETTINGS)
 log(`settings.yaml seed template written (zero-secret): ${seedSettingsPath}`)
 // F4 安装链（2026-08-23）：清陈旧 pnpm 状态记录——base-dsh 提取自运行设备，其
 // .modules.yaml / .pnpm-workspace-state / pnpm-lock 指向旧 store（含 com.dshmobile 残留路径），
 // 会让设备端 `dsh plugin add`（市场安装）报 ERR_PNPM_UNEXPECTED_STORE；插件实为目录注入，
 // 不存在于 pnpm 清单，清掉记录让安装从干净状态开始。
-for (const rel of [
-  'profiles/web/node_modules/.modules.yaml',
-  'profiles/web/node_modules/.pnpm-workspace-state-v1.json',
-  'profiles/web/pnpm-lock.yaml',
-]) {
+for (const rel of STRIP.stalePnpmState) {
   const p = join(DH, rel)
   if (existsSync(p)) { rmSync(p, { force: true }); log(`strip stale pnpm state: ${rel}`) }
 }
-for (const dir of ['sessions', 'storages', 'attachments', 'llm-deepseek']) {
+for (const dir of STRIP.runtimeDirs) {
   const p = join(DH, dir)
   if (existsSync(p)) { rmSync(p, { recursive: true, force: true }); log(`strip runtime: ${dir}/`) }
 }
@@ -343,11 +339,11 @@ if (existsSync(join(U, 'bin', 'git')) && existsSync(join(U, 'libexec', 'git-core
 // （自包含，bundledDependencies），解到 usr/lib/node_modules/pnpm + usr/bin/pnpm shim（node 执行）。
 // 镜像链（与 termux MIRRORS 同思路）：registry.npmjs.org → registry.npmmirror.com（下载失败回退）。
 log('装配 pnpm（standalone，F4 安装链）…')
-const PNPM_VERSION = '10.12.1'
+const PNPM_VERSION = PREINSTALL.pnpm.version
+const NPM_MIRRORS = PREINSTALL.npmMirrors
 const pnpmTgz = join(DEBPOOL, `pnpm-${PNPM_VERSION}.tgz`)
 try {
   if (!existsSync(pnpmTgz)) {
-    const NPM_MIRRORS = ['https://registry.npmjs.org', 'https://registry.npmmirror.com']
     let meta = null
     let mirror = 'none'
     for (const m of NPM_MIRRORS) {
@@ -394,11 +390,8 @@ try {
 // dependencies——manifest 可达后，设备端 pnpm 操作不再把它当孤儿清除。
 // ⚠️ 双份构建脚本（协调仓 + apk 仓云端副本）必须同改，禁止单边演进（AGENTS.md 雷点）。
 if (ABI === 'arm64') {
-  const CANVAS_VERSION = '1.0.8'
-  const canvasPkgs = [
-    { name: '@napi-rs/canvas', tgz: `canvas-${CANVAS_VERSION}.tgz` },
-    { name: '@napi-rs/canvas-android-arm64', tgz: `canvas-android-arm64-${CANVAS_VERSION}.tgz` },
-  ]
+  const CANVAS_VERSION = PREINSTALL.canvas.version
+  const canvasPkgs = PREINSTALL.canvas.pkgs.map((name) => ({ name, tgz: `${name.split('/')[1]}-${CANVAS_VERSION}.tgz` }))
   try {
     const profileDir = join(STAGE, 'root', 'home', '.dsh', 'profiles', 'web')
     if (!existsSync(join(profileDir, 'package.json'))) throw new Error('profiles/web/package.json 不存在（base-dsh 未合并？）')
@@ -407,7 +400,6 @@ if (ABI === 'arm64') {
       const short = pkg.name.split('/')[1]
       const dest = join(DEBPOOL, pkg.tgz)
       if (!existsSync(dest)) {
-        const NPM_MIRRORS = ['https://registry.npmjs.org', 'https://registry.npmmirror.com']
         let meta = null
         let mirror = 'none'
         for (const m of NPM_MIRRORS) {
@@ -465,28 +457,8 @@ const binDir = join(U, 'bin')
 const wrapHead = `#!/system/bin/sh\n# dsh-mobile 0.13.0: ${PKG_PREFIX} 编译期路径覆盖 wrapper（见 M3-VERIFICATION-NOTES §4）\nB="\${TERMUX__PREFIX:-${PKG_PREFIX}}"\nexport PREFIX="$B"\nexport APT_CONFIG="$B/etc/apt/apt.conf"\n`
 // apt.conf 主文件（APT_CONFIG 指向；覆盖全部编译期旧前缀目录）。
 // 注：真实路径用设备端 /data/user/0/...（与 wrapper 内 B 一致；构建期 stage 路径不可烧入）。
-writeFileSync(
-  join(U, 'etc/apt/apt.conf'),
-  `Dir::Etc "${PKG_PREFIX}/etc/apt";\n` +
-    `Dir::Etc::parts "${PKG_PREFIX}/etc/apt/apt.conf.d";\n` +
-    `Dir::Etc::main "${PKG_PREFIX}/etc/apt/apt.conf";\n` +
-    `Dir::Etc::sourcelist "${PKG_PREFIX}/etc/apt/sources.list";\n` +
-    `Dir::Etc::sourceparts "${PKG_PREFIX}/etc/apt/sources.list.d";\n` +
-    `Dir::Etc::trustedparts "${PKG_PREFIX}/etc/apt/trusted.gpg.d";\n` +
-    `Dir::State "${PKG_PREFIX}/var/lib/apt";\n` +
-    `Dir::State::status "${PKG_PREFIX}/var/lib/dpkg/status";\n` +
-    `Dir::Cache "${PKG_PREFIX}/var/cache/apt";\n` +
-    `Dir::Bin::Methods "${PKG_PREFIX}/lib/apt/methods";\n` +
-    `Dir::Bin "${PKG_PREFIX}/bin";\n` +
-    `Dir::Bin::apt-key "${PKG_PREFIX}/bin/apt-key";\n` +
-    `Dir::Bin::dpkg "${PKG_PREFIX}/bin/dpkg";\n` +
-    `Dir::Bin::dpkg-deb "${PKG_PREFIX}/bin/dpkg-deb";\n` +
-    `Acquire::https::CaInfo "${PKG_PREFIX}/etc/tls/cert.pem";\n` +
-    // Dir::Log（0.13.1 W6 实验补）：缺省时 apt 落到编译期旧前缀 var/log/apt → "E: Directory missing"
-    // 致命（app 域不可访问 com.termux 路径）。
-    `Dir::Log "${PKG_PREFIX}/var/log/apt";\n` +
-    `Dir::Log::History "${PKG_PREFIX}/var/log/apt/history";\n`,
-)
+// 模板外置 snapshot-config/apt.conf.template（@@PREFIX@@ 占位，Dir::Log 为 0.13.1 W6 实验补）。
+writeFileSync(join(U, 'etc/apt/apt.conf'), APT_CONF_TPL.replaceAll('@@PREFIX@@', PKG_PREFIX))
 // apt 运行目录骨架（缺失时 apt 报 packaging system type 无法确定；落在 usr/var 下与 Termux 布局一致）
 for (const d of ['var/cache/apt/archives/partial', 'var/lib/apt/lists/partial', 'var/lib/apt/periodic', 'var/log/apt']) {
   mkdirSync(join(U, d), { recursive: true })
@@ -534,88 +506,47 @@ if (existsSync(join(binDir, 'dpkg'))) {
 // 走 apt download-only + dpkg-deb 解包式安装（绕开 dpkg 数据库与 cfg.d 扫描）。
 // gcc 说明：Termux 不发布 gcc；脚本补 gcc -> clang 兼容符号链接（clang 自带 g++ 别名）。
 // dpkg 正规修复（LD_PRELOAD 路径重定向 interposer，需云构建 NDK）归 0.14。
-const installClangSh = `#!/system/bin/sh
-# dsh-mobile 0.13.1: clang 按需安装器（apt download-only + dpkg-deb 解包，绕开 dpkg 安装 bug）
-set -e
-B="\${TERMUX__PREFIX:-${PKG_PREFIX}}"
-export PATH="$B/bin:$PATH"
-# 0.13.1 修订：原生库路径必须先于一切外部命令导出（PATH 已指向 Termux bin，
-# mkdir 等 GNU coreutils ELF 依赖 libandroid-support.so——先导出后调用）。
-export LD_LIBRARY_PATH="$B/lib"
-export LD_PRELOAD="$B/lib/libtermux-exec-ld-preload.so"
-export HOME="\${HOME:-$B/../home}"
-export TMPDIR="$HOME/tmp"
-mkdir -p "$TMPDIR"
-export TERMUX__PREFIX="$B" TERMUX_PREFIX="$B"
-export APT_CONFIG="$B/etc/apt/apt.conf"
-export OPENSSL_CONF="$B/etc/tls/openssl.cnf"
-PKGS="clang binutils ndk-sysroot libllvm lld llvm libcompiler-rt libicu libxml2"
-echo "[install-clang] apt-get update…"
-apt-get update || echo "[install-clang] 警告：apt update 部分失败，继续用已缓存列表"
-echo "[install-clang] 下载依赖（download-only，不进 dpkg 数据库）…"
-apt-get install -y --download-only $PKGS
-echo "[install-clang] 解包（Termux deb 内嵌完整设备路径，需 usr 层平移）…"
-TMPX="$B/../ext-clang-tmp"
-mkdir -p "$TMPX"
-cd "$B/var/cache/apt/archives"
-found=0
-for deb in *.deb; do
-  case "$deb" in
-    clang_*|binutils_*|ndk-sysroot_*|libllvm_*|lld_*|llvm_*|libcompiler-rt_*|libicu_*|libxml2_*) ;;
-    *) continue ;;
-  esac
-  rm -rf "$TMPX/data"
-  "$B/bin/dpkg-deb" -x "$deb" "$TMPX"
-  cp -a "$TMPX/data/data/com.termux/files/usr/." "$B/"
-  found=1
-done
-rm -rf "$TMPX"
-[ "$found" = "1" ] || { echo "[install-clang] 错误：缓存中无目标包（apt 下载失败？）"; exit 1; }
-[ -e "$B/bin/gcc" ] || ln -s clang "$B/bin/gcc"
-echo "[install-clang] 冒烟验证…"
-printf 'int main(void){return 0;}\\n' > "$TMPDIR/.clang-smoke.c"
-"$B/bin/clang" "$TMPDIR/.clang-smoke.c" -o "$TMPDIR/.clang-smoke"
-"$TMPDIR/.clang-smoke"
-rm -f "$TMPDIR/.clang-smoke.c" "$TMPDIR/.clang-smoke"
-echo "[install-clang] 完成：$("$B/bin/clang" --version | head -1)"
-`
-writeFileSync(join(U, 'bin', 'install-clang.sh'), installClangSh, { mode: 0o755 })
+// 脚本本体外置 snapshot-config/install-clang.sh（@@PREFIX@@ 占位，构建期替换设备端前缀）。
+writeFileSync(join(U, 'bin', 'install-clang.sh'), INSTALL_CLANG_TPL.replaceAll('@@PREFIX@@', PKG_PREFIX), { mode: 0o755 })
 log('install-clang.sh 就位（usr/bin，按需 C 工具链安装器）')
 
 // ── 7e. 错位目录剔除（issue #80 P5，2026-08-24）：relocate-snapshot 历史上会把
-// 包内绝对路径 `/data/data/com.termux/...` 当作相对路径搬进 usr 树（如
-// usr/data/data/com.termux/files/usr/bin/curl*）——纯冗余（PATH 不会搜到），
-// 但混淆体检与体积审计。构建期无条件删除 usr/data/data 子树（无合法内容）。
+// 包内绝对路径 `/data/data/com.termux/...` 当作相对路径搬进 usr 树——纯冗余（PATH 不会搜到），
+// 但混淆体检与体积审计。清单外置 snapshot-config/slim.json（misplacedDirs）。
 log('剔除错位目录 usr/data/data/...（relocate 残留）…')
-// 只删 relocate 错位产生的 /data/data/com.termux 子树（usr/data/data/...）；不碰可能的正常 usr/data
-wsl(`rm -rf "${wslPath(join(U, 'data', 'data', 'com.termux'))}" 2>/dev/null || true`)
+for (const rel of SLIM.misplacedDirs) {
+  wsl(`rm -rf "${wslPath(join(U, rel))}" 2>/dev/null || true`)
+}
 
 // ── 8a. 快照瘦身（2026-08-23 体积审计）：node-pty 非 Android prebuilds + 全树 sourcemap ──
-// node-pty 的 prebuilds 含 win32-arm64/x64（27.7+29.4MB，纯 Windows 二进制 + ~52MB .pdb 调试符号）
-// 与 darwin（0.1MB×2）——Android 运行时永不加载，纯死重；linux-arm64/x64 保留。
-// 全树 .map（引擎上游包 35.2MB raw）与 home/.dsh 剥离语义一致（L83 同款），生产不调试源码。
+// node-pty 的 prebuilds 含 win32/darwin（纯死重 + ~52MB .pdb）——Android 运行时永不加载，
+// linux-arm64/x64 保留。全树 .map（引擎上游包 35.2MB raw）与 home/.dsh 剥离语义一致。
+// 清单外置 snapshot-config/slim.json（nodePtyPrebuilds / sourcemapDelete）。
 log('瘦身：node-pty win32/darwin prebuilds + usr 全树 .map…')
 const ptyPre = join(STAGE, 'root', npmDshRoot, 'node-pty', 'prebuilds')
-wsl(`
-  rm -rf "${wslPath(join(ptyPre, 'win32-arm64'))}" "${wslPath(join(ptyPre, 'win32-x64'))}" \
-       "${wslPath(join(ptyPre, 'darwin-arm64'))}" "${wslPath(join(ptyPre, 'darwin-x64'))}" 2>/dev/null || true
-  find "${wslPath(join(STAGE, 'root', 'usr'))}" -name '*.map' -delete 2>/dev/null || true
+{
+  const preArgs = SLIM.nodePtyPrebuilds.map((d) => `"${wslPath(join(ptyPre, d))}"`).join(' ')
+  const mapPart = SLIM.sourcemapDelete ? `find "${wslPath(join(STAGE, 'root', 'usr'))}" -name '*.map' -delete 2>/dev/null || true` : ''
+  wsl(`
+  rm -rf ${preArgs} 2>/dev/null || true
+  ${mapPart}
 `)
+}
 log('瘦身完成（win32/darwin prebuilds + .map 已剔除）')
 
 // ── 8a2. 瘦身扩展（2026-08-25，issue apk#86 相关体积审计）：pnpm 跨平台 reflink .node ──
-// pnpm standalone 自带的 win32-arm64/x64/darwin-arm64/x64 reflink 原生二进制（各 ~350-400KB，
-// 共 ~1.5MB）在 Android/pnpm 运行时永不加载（reflink 仅 win32/darwin 平台 feature）——
-// 纯死重，与 node-pty prebuilds 同类剔除。保留 linux-arm64/x64（pnpm 不随包分发 linux 版本时
-// 该目录本就缺，幂等无妨）。
+// pnpm standalone 自带的 win32/darwin reflink 原生二进制在 Android/pnpm 运行时永不加载——
+// 纯死重剔除，保留 linux-arm64/x64。
 // 注意：glob 在双引号内不被 shell 展开，rm -f "path/*.node" 是字面量匹配（静默 no-op）——
-// 必须用 find -name（find 自身做模式匹配，不依赖 shell 展开）。
+// 必须用 find -name（find 自身做模式匹配，不依赖 shell 展开）。清单外置 slim.json。
 log('瘦身扩展：pnpm 跨平台 reflink .node…')
 const pnpmDist = join(U, 'lib', 'node_modules', 'pnpm', 'dist')
-wsl(`
-  find "${wslPath(pnpmDist)}" -maxdepth 1 -name 'reflink.win32-*.node' -delete 2>/dev/null || true
-  find "${wslPath(pnpmDist)}" -maxdepth 1 -name 'reflink.darwin-*.node' -delete 2>/dev/null || true
-`)
+{
+  const findCmds = SLIM.reflinkGlobs
+    .map((g) => `find "${wslPath(pnpmDist)}" -maxdepth 1 -name '${g}' -delete 2>/dev/null || true`)
+    .join('\n  ')
+  wsl(`\n  ${findCmds}\n`)
+}
 log('瘦身扩展完成（pnpm reflink.win32/darwin .node 已剔除）')
 
 // ── 8. 归档 ────────────────────────────────────────────────────────────
