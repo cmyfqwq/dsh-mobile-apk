@@ -47,7 +47,7 @@ def main():
                 tout.addfile(member, fobj)
             else:
                 tout.addfile(member)
-    with lzma.open(dst, 'wb', preset=9) as f:
+    with lzma.open(dst, 'wb', preset=int(__import__("os").environ.get("DSH_INJECT_PRESET", "9"))) as f:
         f.write(outbuf.getvalue())
     print('replaced patches:', replaced, '| written:', dst, os.path.getsize(dst))
 

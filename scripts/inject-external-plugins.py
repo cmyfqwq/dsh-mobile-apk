@@ -123,7 +123,7 @@ def main():
                 tout.addfile(newm, io.BytesIO(data))
                 replaced += 1
             print(f"  added package tree: {pkg} ({sum(1 for r in repl[pkg])} files)")
-    with lzma.open(dst, "wb", preset=9) as f:
+    with lzma.open(dst, "wb", preset=int(__import__("os").environ.get("DSH_INJECT_PRESET", "9"))) as f:
         f.write(outbuf.getvalue())
     print("replaced/added entries:", replaced)
     print("written:", dst, os.path.getsize(dst), "bytes")

@@ -554,9 +554,11 @@ log('归档 snapshot.tar.xz…')
 const archive = join(OUT_DIR, 'snapshot.tar.xz')
 rmSync(archive, { force: true })
 // 输出结构对齐既有快照：usr/ + home/.dsh/ + home/.gitconfig（home 其余目录不随快照）
+// 2c 提速（2026-09-05 实测）：tar -cJf 单线程 xz → tar -c | xz -T0 -6 多线程（同 preset 档，
+// 743MB tar 380s 级 → 48s；产物字节因分块并行而不同，sha256 由下游重算，一致性门禁不受影响）。
 wsl(`
   cd "${wslPath(join(STAGE, 'root'))}" && \
-  tar -cJf "${wslPath(archive)}" usr home/.dsh home/.gitconfig 2>/dev/null && \
+  tar -c usr home/.dsh home/.gitconfig 2>/dev/null | xz -T0 -6 > "${wslPath(archive)}" && \
   ls -lh "${wslPath(archive)}"
 `)
 const sha = createHash('sha256').update(readFileSync(archive)).digest('hex')

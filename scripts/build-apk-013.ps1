@@ -5,10 +5,17 @@ param(
     [string]$Suffix = "-SN-1-13",          # 快照测试后缀；正式版传 ""
     [string]$OnlyAbi = "",
     [switch]$SkipInject,
-    [switch]$ExportSnapshots               # 0.13.2 增补：导出注入后快照资产 + 一致性门禁（见第 4 步）
+    [switch]$ExportSnapshots,              # 0.13.2 增补：导出注入后快照资产 + 一致性门禁（见第 4 步）
+    [switch]$Fast                          # 2c 快速档（2026-09-05）：单 ABI（缺省 x86_64=MuMu 开发目标）+ 注入链 preset 1
 )
 $ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent $PSScriptRoot
+# Fast 档：dev 循环产物（sha256 与内嵌自洽即可，体积大不发布）——注入链压缩 380s→75s/遍（实测）。
+if ($Fast) {
+    if (-not $OnlyAbi) { $OnlyAbi = 'x86_64' }
+    $env:DSH_INJECT_PRESET = '1'
+    Write-Host "== Fast 档：OnlyAbi=$OnlyAbi，DSH_INJECT_PRESET=1（产物体积增大，禁止用于发布资产）=="
+}
 # 根自检测：协调仓布局（apk 子仓在 $Root\dsh-mobile-apk）与 apk 仓自包含布局（$Root 即 apk 仓根）
 # 共用同一份脚本——双仓字节级同版，杜绝雷点 10 单边演进。
 $apkDir = Join-Path $Root "dsh-mobile-apk"
@@ -54,15 +61,12 @@ foreach ($abi in @('arm64', 'x86_64')) {
         # 雷点 8：全量输出——Select-First 截断管道会杀 node 致误判失败
         node (Join-Path $Root "scripts\patches\apply-patches.mjs") (Join-Path $Root "vendor") 2>&1
         if ($LASTEXITCODE -ne 0) { Write-Host "vendor 补丁校验/施加失败，拒绝打包（$abi）"; continue }
-        Write-Host "== 注入 @dsh-android 插件（$abi）=="
-        python (Join-Path $Root "scripts\inject-snapshot.py") $snap (Join-Path $work "snap-injected.tar.xz") @pluginDirs | Select-Object -Last 2
-        Write-Host "== 注入根级插件（undo/market）=="
-        python (Join-Path $Root "scripts\inject-external-plugins.py") (Join-Path $work "snap-injected.tar.xz") (Join-Path $work "snap-final.tar.xz") $undo $market | Select-Object -Last 2
-        # 权威装配覆盖（C2 修复 2026-08-23）：update-snapshot-patch.py 此前是手工步骤，
-        # snap-final 停留在 0.12.5 旧装配（缺 undo/market/bridge）。接入自动化，保证
-        # 出品的快照 patch === scripts/profile-web.cordis.patch.yml 的当前权威版。
-        Write-Host "== 权威 patch 覆盖（$abi）=="
-        python (Join-Path $Root "scripts\update-snapshot-patch.py") (Join-Path $work "snap-final.tar.xz") (Join-Path $work "snap-final2.tar.xz") (Join-Path $Root "scripts\profile-web.cordis.patch.yml") | Select-Object -Last 2
+        # 单 pass 注入（2c 提速 2026-09-05）：@dsh-android + 根级插件 + 权威 patch 覆盖合并
+        # 为一次 tar 流处理——压缩/解压从 ×4 → ×1（原三步各自全量重压缩 ~743MB）。
+        # 雷点 8：全量输出。
+        Write-Host "== 单 pass 注入（@dsh-android + undo/market + 权威 patch）（$abi）=="
+        python (Join-Path $Root "scripts\inject-all.py") $snap (Join-Path $work "snap-final2.tar.xz") (Join-Path $Root "scripts\profile-web.cordis.patch.yml") --dsh-android @pluginDirs --external $undo $market 2>&1
+        if ($LASTEXITCODE -ne 0) { Write-Host "注入失败，拒绝打包（$abi）"; continue }
         # 防回归（审校 C4 2026-08-23）：patch 挂载集 ⊇ 注入集——缺条目（如 linux-env 漏挂）直接拒打包
         Write-Host "== 挂载集校验（$abi）=="
         node (Join-Path $Root "scripts\check-patch-mounts.mjs") (Join-Path $Root "scripts\profile-web.cordis.patch.yml") @pluginDirs $undo $market 2>&1 | Select-Object -First 4

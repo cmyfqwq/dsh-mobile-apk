@@ -120,7 +120,7 @@ def main():
                 added += 1
             print("  [add] %s (%d files)" % (pkg, len(repl[pkg])))
     print("replaced entries:", replaced, "| added packages:", added, "(", ", ".join(need_add) if need_add else "(none)", ")")
-    with lzma.open(dst, "wb", preset=9) as f:
+    with lzma.open(dst, "wb", preset=int(__import__("os").environ.get("DSH_INJECT_PRESET", "9"))) as f:
         f.write(outbuf.getvalue())
     print("written:", dst, os.path.getsize(dst), "bytes")
 

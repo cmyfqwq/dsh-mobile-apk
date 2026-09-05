@@ -15,3 +15,6 @@ token*
 plugins/*/lib/
 plugins/*/node_modules/
 plugins/*/cbin_*
+
+# Python 编译缓存
+__pycache__/

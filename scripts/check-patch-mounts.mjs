@@ -39,6 +39,6 @@ if (missing.length === 0) {
   console.log(`patch mounts ok: ${injected.size} 个注入包全部挂载（${[...injected].sort().join(', ')}）`)
   process.exit(0)
 }
-console.error(`[FAIL] patch 挂载集缺少注入包: ${missing.join(', ')}`)
+console.error(`❌ patch 挂载集缺少注入包: ${missing.join(', ')}`)
 console.error('（注入进快照却未挂载 = 功能静默不装载；请补 profile-web.cordis.patch.yml 条目）')
 process.exit(1)

@@ -71,12 +71,8 @@ try {
     // ---- 1. 插件注入链（python，跨平台）----
     // 统一补丁门禁（Phase 2a）：undo E1-E7 + marketplace A-D 幂等施加与校验（registry.json）
     run('node', [join(ROOT, 'scripts', 'patches', 'apply-patches.mjs'), join(ROOT, 'vendor')])
-    log('注入 @dsh-android 插件…')
-    run('python', [join(ROOT, 'scripts', 'inject-snapshot.py'), snapSrc, join(work, 'snap-injected.tar.xz'), ...pluginDirs])
-    log('注入根级插件（undo/market）…')
-    run('python', [join(ROOT, 'scripts', 'inject-external-plugins.py'), join(work, 'snap-injected.tar.xz'), join(work, 'snap-final.tar.xz'), undo, market])
-    log('权威 patch 覆盖…')
-    run('python', [join(ROOT, 'scripts', 'update-snapshot-patch.py'), join(work, 'snap-final.tar.xz'), join(work, 'snap-final2.tar.xz'), join(ROOT, 'scripts', 'profile-web.cordis.patch.yml')])
+    log('单 pass 注入（@dsh-android + undo/market + 权威 patch）…')
+    run('python', [join(ROOT, 'scripts', 'inject-all.py'), snapSrc, join(work, 'snap-final2.tar.xz'), join(ROOT, 'scripts', 'profile-web.cordis.patch.yml'), '--dsh-android', ...pluginDirs, '--external', undo, market])
     snapIn = join(work, 'snap-final2.tar.xz')
   } else {
     snapIn = snapSrc
