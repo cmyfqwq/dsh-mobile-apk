@@ -1502,7 +1502,7 @@ class MainActivity : ComponentActivity() {
 
   private fun defaultHint(phase: GuidePhase): String = when (phase) {
     GuidePhase.Starting -> "首次启动会解压内嵌运行时，请保持应用在前台。"
-    GuidePhase.Extracting -> "正在写入内嵌 Termux 环境，约 70MB。"
+    GuidePhase.Extracting -> "正在写入内嵌 Termux 环境，约 700MB，需数分钟，请勿关闭应用。"
     GuidePhase.Updating -> "下载并校验快照后会自动切换运行时。"
     GuidePhase.Recovering -> "看门狗正在拉起引擎，通常几秒内恢复。"
     GuidePhase.Undoing -> "正在把配置/插件回滚到最后良好快照（自动回撤）。"

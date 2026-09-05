@@ -6,7 +6,7 @@
 
 ## 1. 形态与边界
 
-- **内嵌运行时**：随包 `assets/snapshot.tar.xz`（~70MB，node + bash + coreutils + dsh + 插件），
+- **内嵌运行时**：随包 `assets/snapshot.tar.xz`（~154MB，解压后 ~740MB；node + bash + coreutils + dsh + 插件），
   首启解压到应用自身目录并启动引擎；完全离线，无需 Termux app；
 - **WebView 消费** `http://127.0.0.1:3080`（快照内 dsh web 服务）；APK 与引擎版本解耦
   （桥协议版本化 `androidBridge.version`）；
