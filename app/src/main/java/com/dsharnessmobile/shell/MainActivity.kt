@@ -651,6 +651,32 @@ class MainActivity : ComponentActivity() {
     }
   }
 
+  /** Android 10（API 29）共享目录 raw 写解锁（docs/ANDROID10-SAF-ROUTING.md 方案 B）：
+   *  SAF 授权只给本进程 DocumentFile 通路，引擎（bash/node）raw path 仍被 scoped
+   *  storage FUSE 拦截——经既有 ADB 授权通道跑 appop LEGACY_STORAGE allow（shell uid
+   *  持 MANAGE_APP_OPS_MODES），随做 /sdcard 写探测验证生效性。异步执行；未授权/
+   *  连接不可用/ROM 不认 appop 时仅记日志（storageMode 降级 saf-only 由 Phase 5
+   *  真机验证定案）。仅 API 29 调用（picker 回调处守卫）。 */
+  internal fun unlockLegacyStorageApi29() {
+    if (android.os.Build.VERSION.SDK_INT != 29) return
+    Thread {
+      try {
+        val out = AdbState.adbShellExecute(
+          this, engineManager,
+          "appops set --user 0 $packageName LEGACY_STORAGE allow && appops get $packageName LEGACY_STORAGE",
+        )
+        LogCollector.log("dsh-saf", "appop LEGACY_STORAGE: " + out.take(300))
+        val probe = AdbState.adbShellExecute(
+          this, engineManager,
+          "touch /storage/emulated/0/.dsh-write-probe && rm -f /storage/emulated/0/.dsh-write-probe && echo PROBE_OK",
+        )
+        LogCollector.log("dsh-saf", "raw 写探测: " + probe.take(200))
+      } catch (t: Throwable) {
+        LogCollector.log("dsh-saf", "appop 解锁失败: " + t.message)
+      }
+    }.start()
+  }
+
   /** 进程级崩溃标记：记录未捕获异常摘要，交回默认 handler（不吞异常）。 */
   private fun installCrashMarker() {
     val default = Thread.getDefaultUncaughtExceptionHandler()

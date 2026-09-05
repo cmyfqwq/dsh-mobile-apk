@@ -91,6 +91,30 @@ internal class DirectoryPickerController(private val activity: MainActivity) {
       pendingPermissionRequest = false
       if (callback != null) {
         if (uri != null) {
+          // SAF 持久化（docs/ANDROID10-SAF-ROUTING.md 方案 A）：系统 SAF 授权默认随
+          // 进程结束失效——takePersistable 后重启仍在，sharedDirs 不再变死路径。
+          // prefs 留档 tree URI 供后续清理/审计。
+          try {
+            activity.contentResolver.takePersistableUriPermission(
+              uri,
+              android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                android.content.Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
+            )
+            activity.getSharedPreferences("dsh-saf-dirs", Context.MODE_PRIVATE)
+              .edit().putStringSet(
+                "trees",
+                (activity.getSharedPreferences("dsh-saf-dirs", Context.MODE_PRIVATE)
+                  .getStringSet("trees", emptySet()) ?: emptySet()) + uri.toString(),
+              ).apply()
+          } catch (_: SecurityException) {
+            // 部分 ROM 返回非 persistable 授权：降级为会话内有效，不阻断 pick。
+          }
+          // Android 10（API 29）：SAF 授权 ≠ 引擎 raw path 写权限（scoped storage FUSE 拦截，
+          // 方案 B）——经既有 ADB 授权链解锁 appop LEGACY_STORAGE（shell uid 持
+          // MANAGE_APP_OPS_MODES），异步执行不阻塞 pick 结算；真机验证归 Phase 5。
+          if (android.os.Build.VERSION.SDK_INT == 29) {
+            activity.unlockLegacyStorageApi29()
+          }
           val path = AndroidBridge.resolvePickedPath(uri)
           activity.webView.evaluateJavascript(
             "window.__dshBridge?.onDirectoryPicked?.(" + jsString(callback) + ", " + jsString(path) + ")", null,
@@ -158,11 +182,11 @@ internal class DirectoryPickerController(private val activity: MainActivity) {
       return
     }
     if (android.os.Build.VERSION.SDK_INT < 30) {
-      if (android.os.Build.VERSION.SDK_INT >= 26) {
-        // Android 8/9：运行时权限放行（无分区存储，授权后真实路径完整可用）。
+      if (android.os.Build.VERSION.SDK_INT <= 28) {
+        // Android 8/9：无分区存储，运行时 READ/WRITE 授权后真实路径完整可用。
         val hasRead = activity.checkSelfPermission(android.Manifest.permission.READ_EXTERNAL_STORAGE) ==
           android.content.pm.PackageManager.PERMISSION_GRANTED
-        val hasWrite = if (android.os.Build.VERSION.SDK_INT >= 29) true else
+        val hasWrite =
           activity.checkSelfPermission(android.Manifest.permission.WRITE_EXTERNAL_STORAGE) ==
             android.content.pm.PackageManager.PERMISSION_GRANTED
         if (hasRead && hasWrite) {
@@ -177,23 +201,29 @@ internal class DirectoryPickerController(private val activity: MainActivity) {
         pendingPermissionRequest = true
         pickTtlHandler.removeCallbacks(pickTtlRunnable)
         pickTtlHandler.postDelayed(pickTtlRunnable, 5 * 60_000L)
-        val perms = if (android.os.Build.VERSION.SDK_INT >= 29) {
-          arrayOf(android.Manifest.permission.READ_EXTERNAL_STORAGE)
-        } else {
+        storagePermLauncher.launch(
           arrayOf(
             android.Manifest.permission.READ_EXTERNAL_STORAGE,
             android.Manifest.permission.WRITE_EXTERNAL_STORAGE,
-          )
-        }
-        storagePermLauncher.launch(perms)
+          ),
+        )
         return
       }
-      // Android 10（SDK 29）：不可达但显式拒绝（reason=android-10），不再假装取消。
-      activity.webView.evaluateJavascript(
-        "window.__dshBridge?.onDirectoryPicked?.(" + jsString(callbackId) + ", " +
-          jsString(MainActivity.PICK_REFUSED_PREFIX + "android-10") + ")", null,
+      // Android 10（API 29，docs/ANDROID10-SAF-ROUTING.md）：scoped storage 下唯一通路 =
+      // SAF 文件夹授权（方案 A 持久化 + 方案 B ADB 授权链 appop 解锁 raw 写）。
+      // 修正历史行为：此前本分支误注「Android 8/9」并假设 API 29 WRITE 天然可用
+      // （hasWrite 恒 true），拒绝分支为不可达死代码——现显式请求 READ+WRITE
+      // （manifest WRITE 上限已提至 29），授权后经通用 resume 流进 SAF 树选择器。
+      pendingPickCallback = callbackId
+      pendingPermissionRequest = true
+      pickTtlHandler.removeCallbacks(pickTtlRunnable)
+      pickTtlHandler.postDelayed(pickTtlRunnable, 5 * 60_000L)
+      storagePermLauncher.launch(
+        arrayOf(
+          android.Manifest.permission.READ_EXTERNAL_STORAGE,
+          android.Manifest.permission.WRITE_EXTERNAL_STORAGE,
+        ),
       )
-      activity.showTestNotification("外部工作区不可用", "Android 10 不支持选择外部目录")
       return
     }
     if (android.os.Environment.isExternalStorageManager()) {
