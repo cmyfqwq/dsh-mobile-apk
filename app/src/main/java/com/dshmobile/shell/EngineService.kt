@@ -33,20 +33,33 @@ class EngineService : Service() {
   }
 
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-    if (!userShutdown) ensureEngine() else { watchdog?.shutdownNow(); watchdog = null }
+    if (!userShutdown) ensureEngine() else {
+      watchdog?.shutdownNow(); watchdog = null
+      // 用户停机/划掉关闭后的 START_STICKY 重投递：不再常驻（撤前台通知、允许进程结束）。
+      if (intent == null) { stopSelf(); return START_NOT_STICKY }
+    }
     return START_STICKY
   }
 
   override fun onBind(intent: Intent?): IBinder? = null
 
-  /** 任务移除（生命周期礼仪 F5.3）：允许进程结束，尽力清理本次文件直达临时会话/工作区，
-   *  不启动任何隐藏复活（不反弹）；后台阶段保活不受影响（见 F2 主题）。 */
+  /** 任务移除（生命周期礼仪 F5.3）：不启动任何隐藏复活（不反弹）。
+   *  ADB-F9 修复（2026-09-05 用户拍板语义）：划掉后台 = 主动关闭——完整停机，不保活。
+   *  保活（前台服务 + 看门狗）只服务「App 仍在后台未划掉」的场景。撤悬浮球 UI +
+   *  requestShutdown（userShutdown 标记 + 停看门狗 + 停引擎）+ stopSelf（撤前台通知，
+   *  onDestroy 释放 wakelock / 停日志）；START_STICKY 重投递被 userShutdown 门拦截。 */
   override fun onTaskRemoved(rootIntent: Intent?) {
     try {
       FileIncoming.cleanupTmp(this)
-      LogCollector.log("dsh-file-open", "onTaskRemoved: temp cleanup done (no resurrection)")
     } catch (_: Exception) {
     }
+    try {
+      stopService(Intent(this, OverlayService::class.java))
+    } catch (_: Exception) {
+    }
+    requestShutdown()
+    stopSelf()
+    LogCollector.log("dsh-file-open", "onTaskRemoved: full shutdown (swipe-away = user close)")
     super.onTaskRemoved(rootIntent)
   }
 

@@ -24,7 +24,7 @@
 import { Context } from '@deepseek-ai/cordis'
 import { defineTool, type JsonValue } from '@deepseek-ai/dsh-tools'
 import { join } from 'node:path'
-import { existsSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs'
 import { parseUiTreeXml, pruneNodes, resolveRef, findActionableAncestor, type UiNode } from './ui-tree.js'
 
 export const name = 'dsh-android-manage'
@@ -42,13 +42,6 @@ interface PrivilegeFace {
   execAdbLine?(line: string): Promise<{ ok: boolean; stdout: string; guidance?: string }>
 
   audit(action: string, detail: Record<string, unknown>, ok: boolean): void
-}
-
-function deny(guidance: string) {
-  return {
-    text: `未授权：${guidance}\n\n请完成授权：完全访问档位 → 开发者选项「无线调试」开启 → 应用内「允许访问」开关 → 输入配对码。`,
-    denied: true,
-  }
 }
 
 /**
@@ -74,6 +67,50 @@ function tools(priv: PrivilegeFace) {
     return a
   }
 
+  // ── ADB 可靠性批次公共件（2026-09-05，docs/BUGS-open-2026-09-05-ADB-field-report.md）──
+
+  const ANIM_KEYS = ['window_animation_scale', 'transition_animation_scale', 'animator_duration_scale']
+
+  /** F1 止血：读动画三开关当前值。$k/$(...) 由 execAdbShell 的远端段整体转义保护（0.1.3 起），
+   *  本地 bash 不展开、由设备端求值。 */
+  async function readAnimScales(): Promise<Record<string, string>> {
+    if (!priv.execAdbShell) return {}
+    const cmd = 'for k in ' + ANIM_KEYS.join(' ') + '; do echo R:$k=$(settings get global $k); done'
+    const r = await priv.execAdbShell(cmd).catch(() => ({ ok: false, stdout: '' }))
+    const out: Record<string, string> = {}
+    for (const m of r.stdout.matchAll(/R:(\w+)=(\S+)/g)) out[m[1]] = m[2]
+    return out
+  }
+
+  /** F1 止血：动画三开关置值——uiautomator dump 的 idle 等待依赖无障碍事件流安静，
+   *  音乐类 App 播放条常驻动画使窗口永不 idle（"could not get idle state" 实锤根因）。 */
+  async function setAnimScales(v: string): Promise<void> {
+    if (!priv.execAdbShell) return
+    await priv.execAdbShell(ANIM_KEYS.map((k) => `settings put global ${k} ${v}`).join('; ')).catch(() => undefined)
+  }
+
+  /** F1 止血：还原动画三开关（读数失败的键回 1 标准值）。 */
+  async function restoreAnimScales(old: Record<string, string>): Promise<void> {
+    if (!priv.execAdbShell) return
+    await priv.execAdbShell(ANIM_KEYS.map((k) => `settings put global ${k} ${old[k] ?? '1'}`).join('; ')).catch(() => undefined)
+  }
+
+  /** F10：本地临时产物统一目录（TMPDIR/dsh-tmp/）+ 按 prefix LRU 清理，杜绝私有目录无限堆积。 */
+  function pruneTmp(prefix: string, keep: number): string {
+    const dir = join(process.env.TMPDIR ?? '/tmp', 'dsh-tmp')
+    try { mkdirSync(dir, { recursive: true }) } catch { /* 忽略 */ }
+    try {
+      const files = readdirSync(dir)
+        .filter((f) => f.startsWith(prefix))
+        .map((f) => ({ f, t: statSync(join(dir, f)).mtimeMs }))
+        .sort((a, b) => b.t - a.t)
+      for (const x of files.slice(keep)) {
+        try { rmSync(join(dir, x.f), { force: true }) } catch { /* 忽略 */ }
+      }
+    } catch { /* 忽略 */ }
+    return dir
+  }
+
   const screenshot = defineTool({
     name: 'android_screenshot',
     description:
@@ -88,6 +125,8 @@ function tools(priv: PrivilegeFace) {
         additionalProperties: false,
         properties: {
           imagePath: { type: 'string', required: true },
+          width: { type: 'number', description: '设备物理分辨率宽（截图像素坐标换算锚点）' },
+          height: { type: 'number', description: '设备物理分辨率高' },
           denied: { type: 'boolean' },
           text: { type: 'string' },
         },
@@ -104,13 +143,22 @@ function tools(priv: PrivilegeFace) {
       try {
         const n = Date.now()
         const remote = `/data/local/tmp/dsh-shot-${n}.png`
-        const local = join(process.env.TMPDIR ?? '/tmp', `dsh-shot-${n}.png`)
-        const r = await priv.execAdbLine(`adb shell screencap -p ${remote} && adb pull ${remote} ${local} && ls -l ${local}`)
+        const local = join(pruneTmp('dsh-shot-', 20), `dsh-shot-${n}.png`)
+        const r = await priv.execAdbLine(`adb shell screencap -p ${remote} && adb pull ${remote} ${local} && ls -l ${local}; adb shell rm -f ${remote}`)
         if (!r.ok) return { imagePath: '', denied: false, text: r.guidance ?? (r.stdout || '截图执行失败') }
         if (!/^-rw|^-|^total|dsh-shot/.test(r.stdout.trim()) && !existsSync(local)) {
           return { imagePath: '', denied: false, text: '截图未落地：' + (r.stdout.trim().slice(-400) || '无输出') }
         }
-        return { imagePath: local, denied: false, text: `截图已保存：${local}` }
+        // F2 统一坐标系：回传物理分辨率锚点。模型侧 read_image 可能降采样（maxDim 2048），
+        // 严禁直接用截图像素坐标点击——归一化用 android_ui_click 的 nx/ny。
+        const size = await screenSize()
+        return {
+          imagePath: local,
+          denied: false,
+          width: size.w,
+          height: size.h,
+          text: `截图已保存：${local}（设备物理分辨率 ${size.w}x${size.h}；读图可能降采样，定位换算用归一化坐标 nx/ny）`,
+        }
       } catch (e) {
         return { imagePath: '', denied: false, text: '截图失败：' + String((e as Error).message) }
       }
@@ -145,13 +193,20 @@ function tools(priv: PrivilegeFace) {
       try {
         const n = Date.now()
         const remote = `/data/local/tmp/dsh-ui-${n}.xml`
-        const local = join(process.env.TMPDIR ?? '/tmp', `dsh-ui-${n}.xml`)
-        const r = await priv.execAdbLine(`adb shell uiautomator dump ${remote} && adb pull ${remote} ${local} && ls -l ${local}`)
-        if (!r.ok) return { treeXmlPath: '', denied: false, text: r.guidance ?? (r.stdout || '控件树导出失败') }
-        if (!existsSync(local)) {
-          return { treeXmlPath: '', denied: false, text: '控件树未落地（厂商 ROM 可能限制 uiautomator）：' + (r.stdout.trim().slice(-400) || '无输出') }
+        const local = join(pruneTmp('dsh-ui-', 10), `dsh-ui-${n}.xml`)
+        // F1 止血：dump 前关动画（事件流安静才能过 idle 等待），dump 后还原。
+        const oldAnim = await readAnimScales()
+        await setAnimScales('0')
+        try {
+          const r = await priv.execAdbLine(`adb shell uiautomator dump ${remote} && adb pull ${remote} ${local} && ls -l ${local}; adb shell rm -f ${remote}`)
+          if (!r.ok) return { treeXmlPath: '', denied: false, text: r.guidance ?? (r.stdout || '控件树导出失败') }
+          if (!existsSync(local)) {
+            return { treeXmlPath: '', denied: false, text: '控件树未落地（厂商 ROM 可能限制 uiautomator）：' + (r.stdout.trim().slice(-400) || '无输出') }
+          }
+          return { treeXmlPath: local, denied: false, text: `控件树已导出：${local}` }
+        } finally {
+          await restoreAnimScales(oldAnim)
         }
-        return { treeXmlPath: local, denied: false, text: `控件树已导出：${local}` }
       } catch (e) {
         return { treeXmlPath: '', denied: false, text: '控件树导出失败：' + String((e as Error).message) }
       }
@@ -172,6 +227,7 @@ function tools(priv: PrivilegeFace) {
           androidVersion: { type: 'string' },
           frontApp: { type: 'string' },
           resolution: { type: 'string' },
+          devices: { type: 'array', items: { type: 'string' }, description: '当前 adb 设备清单（serial+型号+状态，多设备消歧用）' },
           denied: { type: 'boolean' },
           text: { type: 'string' },
         },
@@ -197,6 +253,10 @@ function tools(priv: PrivilegeFace) {
           const m = /^(MODEL|VER|SDK|FOCUS|RES)=(.*)$/.exec(line.trim())
           if (m) kv[m[1]] = m[2].trim()
         }
+        // F4 多设备消歧：宿主侧 adb devices -l 原样列出（serial+model:device 状态），
+        // 供模型/用户确认工具绑定的是哪台设备（127.0.0.1:5555 与 emulator 并存时实测踩坑）。
+        const dl = priv.execAdbLine ? await priv.execAdbLine('adb devices -l').catch(() => ({ ok: false, stdout: '' })) : { ok: false, stdout: '' }
+        const devices = (dl.ok ? dl.stdout : '').split('\n').map((s) => s.trim()).filter((s) => s.includes('\t') || s.includes('device product:'))
         return {
           model: kv.MODEL ?? '(未知)',
           // 热补丁：可选成员一律空串兜底——undefined 成员会被引擎 lossless-JSON
@@ -204,8 +264,10 @@ function tools(priv: PrivilegeFace) {
           androidVersion: kv.VER ?? '',
           frontApp: kv.FOCUS ? kv.FOCUS.replace(/^.*mCurrentFocus=\{\s*(\S+).*$/, '$1') : '',
           resolution: kv.RES ? kv.RES.replace(/^.*init=(\d+x\d+).*$/, '$1') : '',
+          devices,
           denied: false,
-          text: `model=${kv.MODEL ?? '?'} ver=${kv.VER ?? '?'} sdk=${kv.SDK ?? '?'} focus=${kv.FOCUS ?? '?'} res=${kv.RES ?? '?'}`,
+          text: `model=${kv.MODEL ?? '?'} ver=${kv.VER ?? '?'} sdk=${kv.SDK ?? '?'} focus=${kv.FOCUS ?? '?'} res=${kv.RES ?? '?'}` +
+            (devices.length ? `\nadb 设备：\n  ${devices.join('\n  ')}` : ''),
         }
       } catch (e) {
         return { model: '', denied: false, text: '设备信息查询失败：' + String((e as Error).message) }
@@ -299,6 +361,15 @@ function tools(priv: PrivilegeFace) {
     | { nodes: UiNode[]; byId: ReturnType<typeof pruneNodes>['byId']; byOrig: ReturnType<typeof pruneNodes>['byOrig']; screen: { w: number; h: number }; rotation: number; ts: number }
     | null = null
 
+  /** F2 统一坐标系锚点：屏幕物理尺寸（wm size）。uiDump 缓存优先，否则现场查。 */
+  async function screenSize(): Promise<{ w: number; h: number }> {
+    if (uiCache && Date.now() - uiCache.ts <= UI_CACHE_TTL && uiCache.screen.w > 0) return uiCache.screen
+    if (!priv.execAdbLine) return { w: 0, h: 0 }
+    const s = await priv.execAdbLine(`adb shell wm size | grep -m1 'Physical size'`)
+    const m = /Physical size:\s*(\d+)x(\d+)/.exec(s.ok ? s.stdout : '')
+    return m ? { w: Number(m[1]), h: Number(m[2]) } : { w: 0, h: 0 }
+  }
+
   /** 语义清单渲染（模型侧文本；完整 JSON 在 return 里）。 */
   const nodeSummary = (nodes: UiNode[]): string => {
     const lines = nodes.slice(0, 8).map((n) => `  ${n.id} ${n.clickable ? '可点' : n.editable ? '可编辑' : n.scrollable ? '可滚动' : '文本'} "${(n.text || n.desc).slice(0, 24)}"`)
@@ -340,11 +411,20 @@ function tools(priv: PrivilegeFace) {
       if (!priv.execAdbLine) return { ok: false, denied: false, screen: { w: 0, h: 0 }, rotation: 0, count: 0, rawCount: 0, nodes: [], text: 'ADB 执行通道未接通（dsh-android-bridge 未提供 execAdbLine）' }
       const n = Date.now()
       const remote = `/data/local/tmp/dsh-ui-${n}.xml`
-      const local = join(process.env.TMPDIR ?? '/tmp', `dsh-ui-${n}.xml`)
+      const local = join(pruneTmp('dsh-ui-', 10), `dsh-ui-${n}.xml`)
       try {
-        const r = await priv.execAdbLine(
-          `adb shell uiautomator dump ${remote}; adb pull ${remote} ${local} >/dev/null 2>&1; adb shell wm size | grep -m1 'Physical size'`,
-        )
+        // F1 止血：uiautomator dump 阻塞等待窗口 idle——音乐类 App 播放条常驻动画使事件流
+        // 永不安静（"could not get idle state" 实锤）。dump 前关动画三开关，dump 后还原。
+        const oldAnim = await readAnimScales()
+        await setAnimScales('0')
+        let r: { ok: boolean; stdout: string; guidance?: string }
+        try {
+          r = await priv.execAdbLine(
+            `adb shell uiautomator dump ${remote}; adb pull ${remote} ${local} >/dev/null 2>&1; adb shell rm -f ${remote}; adb shell wm size | grep -m1 'Physical size'`,
+          )
+        } finally {
+          await restoreAnimScales(oldAnim)
+        }
         if (!r.ok) return { ok: false, denied: false, screen: { w: 0, h: 0 }, rotation: 0, count: 0, rawCount: 0, nodes: [], text: r.guidance ?? (r.stdout || '控件清单导出失败') }
         if (!existsSync(local)) {
           return { ok: false, denied: false, screen: { w: 0, h: 0 }, rotation: 0, count: 0, rawCount: 0, nodes: [], text: '控件树未落地（厂商 ROM 可能限制 uiautomator）：' + (r.stdout.trim().slice(-300) || '无输出') }
@@ -385,10 +465,14 @@ function tools(priv: PrivilegeFace) {
     description:
       '语义点击：按 android_ui_dump 清单中的引用点按控件（解析 bounds 中心 → input tap，AI 不猜像素）。' +
       '引用格式：id:n3 / text:设置（精确文本）/ desc:… / rid:…；裸数字按 id。' +
+      '控件树不可用时可用 nx/ny 归一化坐标兜底：相对设备物理屏幕（0-1），' +
+      '由截图像素换算 nx=像素x/截图宽、ny=像素y/截图高——工具层负责映射到物理分辨率，模型无需手工乘缩放系数。' +
       '目标不可点自动回退最近可点祖先；不在最近 dump 中返回引导（页面已变请重新 dump）。' +
       '需 ADB 授权 + 会话档位 danger-full-access；每次调用审计。',
     parameters: {
-      ref: { type: 'string', required: true, description: '控件引用（id:n3 或 text:精确文本 等）' },
+      ref: { type: 'string', description: '控件引用（id:n3 或 text:精确文本 等；与 nx/ny 二选一）' },
+      nx: { type: 'number', description: '归一化 X（0-1，相对物理屏宽；= 截图内像素 x ÷ 截图宽）——无 ref 时使用' },
+      ny: { type: 'number', description: '归一化 Y（0-1，相对物理屏高；= 截图内像素 y ÷ 截图高）——无 ref 时使用' },
     },
     output: {
       schema: {
@@ -409,33 +493,50 @@ function tools(priv: PrivilegeFace) {
         { type: 'text', text: String(v.text ?? '') },
       ],
     },
-    execute: async ({ ref }: { ref: string }, exec) => {
-      const a = guard('ui_click', { ref }, exec as { agent?: { session?: unknown } })
+    execute: async ({ ref, nx, ny }: { ref?: string; nx?: number; ny?: number }, exec) => {
+      const a = guard('ui_click', { ref, nx, ny }, exec as { agent?: { session?: unknown } })
       if (!a.ok) return { ok: false, denied: true, text: a.guidance }
-      if (!uiCache || Date.now() - uiCache.ts > UI_CACHE_TTL) {
-        return { ok: false, denied: false, text: '没有最近的控件清单——请先执行 android_ui_dump' }
-      }
-      const hit = resolveRef(uiCache.byId, uiCache.nodes, ref)
-      if (!hit.ok) return { ok: false, denied: false, text: hit.error }
-      let node = hit.node
-      if (!node.clickable && !node.editable && !node.scrollable) {
-        const anc = findActionableAncestor(uiCache.byOrig, node)
-        if (!anc) return { ok: false, denied: false, text: `目标「${(node.text || node.desc).slice(0, 20)}」不可点击且无可用祖先——考虑滚动或重新 dump` }
-        node = anc
+      const useRef = typeof ref === 'string' && ref.trim().length > 0
+      const useNorm =
+        typeof nx === 'number' && Number.isFinite(nx) && nx >= 0 && nx <= 1 &&
+        typeof ny === 'number' && Number.isFinite(ny) && ny >= 0 && ny <= 1
+      if (!useRef && !useNorm) return { ok: false, denied: false, text: '需要 ref（语义引用）或 nx/ny（0-1 归一化坐标）二者之一' }
+      let cx = 0; let cy = 0; let hitId = ''; let label = ''
+      if (useRef) {
+        if (!uiCache || Date.now() - uiCache.ts > UI_CACHE_TTL) {
+          return { ok: false, denied: false, text: '没有最近的控件清单——请先执行 android_ui_dump' }
+        }
+        const hit = resolveRef(uiCache.byId, uiCache.nodes, ref!.trim())
+        if (!hit.ok) return { ok: false, denied: false, text: hit.error }
+        let node = hit.node
+        if (!node.clickable && !node.editable && !node.scrollable) {
+          const anc = findActionableAncestor(uiCache.byOrig, node)
+          if (!anc) return { ok: false, denied: false, text: `目标「${(node.text || node.desc).slice(0, 20)}」不可点击且无可用祖先——考虑滚动或重新 dump` }
+          node = anc
+        }
+        cx = node.cx; cy = node.cy; hitId = node.id; label = (node.text || node.desc).slice(0, 24)
+      } else {
+        const size = await screenSize()
+        if (!size.w || !size.h) return { ok: false, denied: false, text: '屏幕尺寸未知（wm size 失败）——请先 android_ui_dump 或改用 ref' }
+        cx = Math.round(nx! * size.w); cy = Math.round(ny! * size.h)
+        hitId = `norm(${nx!.toFixed(3)},${ny!.toFixed(3)})`
+        label = '归一化坐标'
       }
       if (!priv.execAdbShell) return { ok: false, denied: false, text: 'ADB 执行通道未接通' }
-      const r = await priv.execAdbShell(`input tap ${node.cx} ${node.cy}`)
+      const r = await priv.execAdbShell(`input tap ${cx} ${cy}`)
       if (!r.ok) return { ok: false, denied: false, text: r.guidance ?? (r.stdout || '点击执行失败') }
       const errMark = /error:|Error|Exception|unknown/.test(r.stdout)
       return {
         ok: !errMark,
         denied: false,
-        ref,
-        id: node.id,
-        label: (node.text || node.desc).slice(0, 40),
-        x: node.cx,
-        y: node.cy,
-        text: errMark ? '点击返回异常：' + r.stdout.slice(0, 300) : `已点击 ${node.id}「${(node.text || node.desc).slice(0, 24)}」(${node.cx},${node.cy})——建议重新 dump 验证`,
+        ref: useRef ? ref!.trim() : '',
+        id: hitId,
+        label,
+        x: cx,
+        y: cy,
+        text: errMark
+          ? '点击返回异常：' + r.stdout.slice(0, 300)
+          : `已点击 ${hitId}「${label}」(${cx},${cy})${useRef ? '——建议重新 dump 验证' : '（归一化坐标）'}`,
       }
     },
   })
@@ -520,11 +621,14 @@ function tools(priv: PrivilegeFace) {
   const uiInput = defineTool({
     name: 'android_ui_input',
     description:
-      '语义文本输入：向当前聚焦输入框注入文本。纯可见 ASCII + 无 shell 元字符走 input text；' +
-      '含中文等非 ASCII 走 ADBKeyboard 广播（am broadcast ADB_INPUT_TEXT，需设备装有 ADBKeyboard 系 IME' +
-      '——0.13.2 内嵌 IME 落地后自动可用）。长度 ≤500。需 ADB 授权 + 会话档位 danger-full-access。',
+      '语义文本输入：向当前聚焦输入框注入文本。默认走 ADBKeyboard 广播（input text 在部分 ROM 丢字/丢空格——F5 实锤），' +
+      '含自动 IME 引导：探测当前输入法、临时切到内嵌 ADB 输入通道、注入后还原。' +
+      'clear: true 先原子清空聚焦框（全选+删除，可单独使用）。channel: "input" 可强制走 input text（仅 ASCII，不推荐）。' +
+      '长度 ≤500。需 ADB 授权 + 会话档位 danger-full-access。',
     parameters: {
-      text: { type: 'string', required: true, description: '要输入的文本（≤500 字符）' },
+      text: { type: 'string', description: '要输入的文本（≤500 字符；与 clear 至少其一）' },
+      clear: { type: 'boolean', description: '先清空当前聚焦输入框（ADBKeyboard ADB_CLEAR_TEXT 广播；可单独使用）' },
+      channel: { type: 'string', enum: ['auto', 'adbkeyboard', 'input'], description: '输入通道（默认 auto=ADBKeyboard 优先）' },
     },
     output: {
       schema: {
@@ -541,38 +645,51 @@ function tools(priv: PrivilegeFace) {
         { type: 'text', text: String(v.text ?? '') },
       ],
     },
-    execute: async ({ text }: { text: string }, exec) => {
-      const a = guard('ui_input', { text }, exec as { agent?: { session?: unknown } })
+    execute: async ({ text, clear, channel }: { text?: string; clear?: boolean; channel?: string }, exec) => {
+      const a = guard('ui_input', { text, clear, channel }, exec as { agent?: { session?: unknown } })
       if (!a.ok) return { ok: false, denied: true, text: a.guidance }
       if (!priv.execAdbShell) return { ok: false, denied: false, text: 'ADB 执行通道未接通' }
-      const raw = text ?? ''
-      if (raw.length === 0 || raw.length > 500) return { ok: false, denied: false, text: 'text 长度需为 1-500 字符' }
+      const raw = typeof text === 'string' ? text : ''
+      if (!clear && (raw.length === 0 || raw.length > 500)) return { ok: false, denied: false, text: 'text 长度需为 1-500，或传 clear: true 单独清空' }
+      const wantKb = channel !== 'input'
+      const IME_ID = 'com.dsharnessmobile.shell/.AdbKeyboardService'
+      if (wantKb) {
+        // ADBKeyboard 协议：am broadcast -a ADB_INPUT_TEXT / ADB_CLEAR_TEXT --es msg <文本>。
+        // 本应用 0.13.2 起内嵌同协议 IME。F5 修复：ime enable 只入列不生效（广播被静默丢弃）——
+        // 探测当前默认 IME → 临时 ime set 切到本通道 → 注入 → 还原原 IME（借道不劫持）。
+        const cur = await priv.execAdbShell(`settings get secure default_input_method`).catch(() => ({ ok: false, stdout: '' }))
+        const prev = (cur.ok ? cur.stdout : '').trim().replace(/^"|"$/g, '')
+        await priv.execAdbShell(`ime enable ${IME_ID}`).catch(() => undefined)
+        const needSwitch = prev.length > 0 && prev !== IME_ID
+        if (needSwitch) await priv.execAdbShell(`ime set ${IME_ID}`).catch(() => undefined)
+        const parts: string[] = []
+        if (clear) parts.push(`am broadcast -a ADB_CLEAR_TEXT`)
+        if (raw) parts.push(`am broadcast -a ADB_INPUT_TEXT --es msg '${raw.replace(/'/g, `'\\''`)}'`)
+        let r: { ok: boolean; stdout: string; guidance?: string } = { ok: true, stdout: '' }
+        for (const p of parts) {
+          r = await priv.execAdbShell(p)
+          if (!r.ok) break
+        }
+        // 还原用户原 IME（广播已被接收器入队提交，留 0.4s 提交窗口防切换竞态）。
+        if (needSwitch) await priv.execAdbShell(`sleep 0.4; ime set ${prev}`).catch(() => undefined)
+        if (!r.ok) return { ok: false, denied: false, channel: 'adbkeyboard', text: r.guidance ?? (r.stdout || 'ADBKeyboard 输入失败') }
+        const act = [clear ? '已清空' : '', raw ? `已输入 ${raw.slice(0, 24)}${raw.length > 24 ? '…' : ''}` : ''].filter(Boolean).join(' + ')
+        return {
+          ok: true,
+          denied: false,
+          channel: 'adbkeyboard',
+          text: `${act}（ADBKeyboard${needSwitch ? '，IME 已临时切换并还原；若文本未落地请确认页面输入框处于聚焦态' : ''}）`,
+        }
+      }
+      // input text 兜底（channel: "input" 强制；仅可见 ASCII——部分 ROM 丢字/丢空格，F5 不推荐）
       const asciiOnly = /^[\x20-\x7E]+$/.test(raw)
-      let line: string; let channel: string
-      if (asciiOnly) {
-        if (/[\\'"\`$;&|<>*?(){}[\]\n\r]/.test(raw)) return { ok: false, denied: false, text: 'text 含 shell 元字符（仅允许可见 ASCII；中文请走 ADBKeyboard）' }
-        line = `input text ${raw.replace(/ /g, '%s')}`
-        channel = 'input'
-      } else {
-        // ADBKeyboard 协议：am broadcast -a ADB_INPUT_TEXT --es msg <文本>
-        // 本应用 0.13.2 起内嵌同协议 IME（com.dsharnessmobile.shell/.AdbKeyboardService）：
-        // 先 ime enable（加入输入法列表，不抢默认），广播仅在用户切到该 IME 时生效。
-        const IME_ID = 'com.dsharnessmobile.shell/.AdbKeyboardService'
-        await priv.execAdbShell(`ime enable ${IME_ID}`).catch(() => ({ ok: false, stdout: '' }))
-        const quoted = `'${raw.replace(/'/g, `'\\''`)}'`
-        line = `am broadcast -a ADB_INPUT_TEXT --es msg ${quoted}`
-        channel = 'adbkeyboard'
-      }
-      const r = await priv.execAdbShell(line)
-      if (!r.ok) return { ok: false, denied: false, text: r.guidance ?? (r.stdout || '输入执行失败') }
+      if (!asciiOnly) return { ok: false, denied: false, text: 'input text 仅允许可见 ASCII（中文等请走默认 ADBKeyboard 通道）' }
+      if (/[\\'"\`$;&|<>*?(){}[\]\n\r]/.test(raw)) return { ok: false, denied: false, text: 'text 含 shell 元字符' }
+      if (clear) await priv.execAdbShell(`input keyevent 123`).catch(() => undefined) // 123=MOVE_END；长文本清空建议 clear + ADBKeyboard
+      const r = await priv.execAdbShell(`input text ${raw.replace(/ /g, '%s')}`)
+      if (!r.ok) return { ok: false, denied: false, channel: 'input', text: r.guidance ?? (r.stdout || '输入执行失败') }
       const errMark = /error:|Error|Exception|unknown/.test(r.stdout)
-      if (errMark && channel === 'adbkeyboard' && /not found|Unable to find|无|没有/.test(r.stdout)) {
-        return { ok: false, denied: false, channel, text: 'ADBKeyboard IME 未安装：中文输入暂不可用（0.13.2 内嵌 IME 落地后解除）；ASCII 文本可用 input text' }
-      }
-      if (channel === 'adbkeyboard' && /broadcast not sent|no handlers|No receivers/.test(r.stdout)) {
-        return { ok: false, denied: false, channel, text: 'ADB 输入通道未生效：请在系统输入法设置中把「DeepSeek ADB 输入通道」切换为当前输入法后再试（ascii 文本不受影响）' }
-      }
-      return { ok: !errMark, denied: false, channel, text: errMark ? '输入返回异常：' + r.stdout.slice(0, 300) : `已输入 ${raw.slice(0, 24)}${raw.length > 24 ? '…' : ''}（${channel}）` }
+      return { ok: !errMark, denied: false, channel: 'input', text: errMark ? '输入返回异常：' + r.stdout.slice(0, 300) : `已输入 ${raw.slice(0, 24)}${raw.length > 24 ? '…' : ''}（input text）` }
     },
   })
 

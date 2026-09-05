@@ -242,16 +242,14 @@ class OverlayService : Service() {
       y = (resources.displayMetrics.heightPixels / 3)
     }
     rootParams = params
-    wm.addView(root, params)
-    rootView = root
-    attachBallTouch(ball)
-    // 键盘顶起面板：由独立面板窗口的系统 ADJUST_PAN 原生实现（showPanel 注释）。
-    // 球窗口收不到 IME insets（与键盘零相交的窗口系统不派发，实测 bottom=0 visible=false），
-    // 旧自监听方案已废。
 
     // 光环独立窗口：FLAG_NOT_TOUCHABLE（不参与触摸命中 → 触摸穿透到其下层 WebView，
     // 光环本身不再吞任何手势）。视觉光晕中心 = 球窗口中心；渐变半径 24dp（haloGlowPx）——
     // 球贴边时球心距屏边 25dp > 24dp，光晕圆完整在屏内（治「吸附后光圈与球错位」）。
+    // F8 z 序修复（2026-09-05 真机实测）：光环窗必须先于球窗 addView——同 TYPE_APPLICATION_OVERLAY
+    // 窗口 z 序按添加顺序、后加者在上，旧顺序辉光整窗盖住球面（「不是一圈氛围光而是整个球变红」）。
+    // z 序约定：状态切换只走 setHalo()/syncHalo()（换 drawable/updateViewLayout，不改 z 序），
+    // 三窗口生命周期内禁止 remove/re-add 重排。
     val halo = View(this).apply { background = newHaloDrawable(Halo.IDLE) }
     haloView = halo
     val haloP = WindowManager.LayoutParams(
@@ -269,6 +267,13 @@ class OverlayService : Service() {
     }
     haloParams = haloP
     try { wm.addView(halo, haloP) } catch (_: Exception) {}
+
+    wm.addView(root, params)
+    rootView = root
+    attachBallTouch(ball)
+    // 键盘顶起面板：由独立面板窗口的系统 ADJUST_PAN 原生实现（showPanel 注释）。
+    // 球窗口收不到 IME insets（与键盘零相交的窗口系统不派发，实测 bottom=0 visible=false），
+    // 旧自监听方案已废。
     emitFrame()
   }
 
@@ -802,6 +807,11 @@ class OverlayService : Service() {
                 // 思考=Deep diving 扫光；调工具=工具类型+概览。
                 currentToolName = j.optString("name", "")
                 currentToolSummary = toolSummary(j.optString("args", ""))
+                // ADB-F7 自动化避让（2026-09-05 真机实测）：android_* 工具（ADB 语义控制）
+                // 执行期间面板会挡住被控 App 的坐标命中区（「点列表第2条实点面板」）——
+                // 识别到自动化工具调用即自动收起面板；不自动恢复（用户点球重开），
+                // 避免恢复动作与下一发自动化点击竞态。
+                if (currentToolName.startsWith("android_") && expanded) hidePanel()
                 setHalo(Halo.WORKING)
                 changed = true
               }

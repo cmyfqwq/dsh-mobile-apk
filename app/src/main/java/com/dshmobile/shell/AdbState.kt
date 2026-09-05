@@ -334,7 +334,10 @@ object AdbState {
       .toString()
     // 幂等重连（adb connect 对已连接状态安全）+ 执行
     runAdb(engine, listOf("connect", "127.0.0.1:$port"), 20)
-    val out = runAdb(engine, listOf("-s", "127.0.0.1:$port", "shell", cmd), 30)
+    // F3 远端 PATH 污染修复（2026-09-05 真机实锤）：/system/bin 脚本（input/settings/am）
+    // 解析 cmd 时落到客户端传入 PATH 里的 app 私有目录（shell uid 无权读 → Permission denied）。
+    // 远端统一前置纯系统 PATH（argv 直传不经本地 shell，$ 原样到达设备端）。
+    val out = runAdb(engine, listOf("-s", "127.0.0.1:$port", "shell", "export PATH=/system/bin:/system/xbin; " + cmd), 30)
     val text = out.joinToString("\n")
     if (text.contains("error:") || text.contains("no devices") || text.contains("offline")) {
       prefs(context).edit().putBoolean(KEY_CONNECTED, false).apply()

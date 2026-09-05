@@ -265,6 +265,9 @@ function collectText(x: unknown): string {
  * 全部方法失败关闭：未授权 → 拒绝（return 未授权引导），不执行、不降级。
  */
 export class AndroidPrivilegeService {
+  /** 最近一次连接校验缓存的设备型号（F4 多设备消歧；空 = 未校验/校验失败）。 */
+  private liveModel = ''
+
   constructor(
     private readonly ctx: Context,
     private readonly defaultMode?: () => string | undefined,
@@ -324,16 +327,29 @@ export class AndroidPrivilegeService {
    * （vivo 等无线调试常驻端口；NSD 记录值会随无线调试重启轮换——2026-08-27 实锤 37575 失联）。
    * 端口为 loopback 信息不入审计。@returns 可用端口与 connect 输出；全失败返回 undefined。
    */
-  private async resolveLivePort(): Promise<{ port: string; output: string } | { port: undefined; output: string }> {
+  private async resolveLivePort(): Promise<{ port: string; output: string; model?: string } | { port: undefined; output: string; model?: undefined }> {
     const candidates = [...new Set([this.connectPort(), '5555'].filter((p): p is string => !!p))]
     let last = ''
     for (const port of candidates) {
       const c = await this.runLine(`adb connect 127.0.0.1:${port}`)
       if (!c.ok) { last = c.stdout; continue }
       last = c.stdout
-      if (/connected to|already connected/i.test(c.stdout)) return { port, output: c.stdout }
+      if (/connected to|already connected/i.test(c.stdout)) {
+        // F4 多设备消歧（2026-09-05 真机实测）：connect 成功 ≠ 绑定预期设备——
+        // emulator-5554 的 adb 端口恰为 127.0.0.1:5555，5555 兜底可能绑错对象。
+        // 回读型号做在场校验并缓存（android_privilege_status / device_info 展示）。
+        const id = await this.runLine(`adb -s 127.0.0.1:${port} shell getprop ro.product.model`)
+        const model = id.ok ? id.stdout.trim() : ''
+        if (model) this.liveModel = model
+        return { port, output: c.stdout, model: this.liveModel || undefined }
+      }
     }
     return { port: undefined, output: last }
+  }
+
+  /** 最近一次连接校验缓存的设备型号（F4；空 = 未校验/校验失败）。 */
+  boundModel(): string {
+    return this.liveModel
   }
 
   /** 经 termux 通道执行一行命令（adb 可执行；连接端口自动注入 `-s`）。 */
@@ -366,7 +382,14 @@ export class AndroidPrivilegeService {
       return { ok: false, stdout: live.output.slice(0, 2048), guidance: 'ADB 连接不可用（配置端口与 5555 均失联）：确认「无线调试」仍开启，必要时重新配对' }
     }
     const port = live.port
-    const out = await this.runLine(`adb -s 127.0.0.1:${port} shell ${command}`)
+    // F3 远端 PATH 污染修复（2026-09-05 真机实锤）：客户端环境把 Termux usr/bin 传进远端
+    // shell → /system/bin/input 等脚本解析 cmd 落到 app 私有目录（Permission denied，且
+    // shell uid 本就无权读 app 私有目录）。远端统一 export 纯系统 PATH；整段命令单引号
+    // 转义（本地以 bash -c 解析整行，$ 一律留给设备端求值——与 execAdbLine 的引号内文本
+    // 防误伤注记同源）。
+    const remote = 'export PATH=/system/bin:/system/xbin; ' + command
+    const quoted = "'" + remote.replace(/'/g, `'\\''`) + "'"
+    const out = await this.runLine(`adb -s 127.0.0.1:${port} shell ${quoted}`)
     if (!out.ok) return { ok: false, stdout: out.stdout }
     if (/(^|\n)error:|no devices\/emulators|offline/.test(out.stdout)) {
       return { ok: false, stdout: out.stdout.slice(0, 4096), guidance: 'ADB 连接不可用：确认「无线调试」仍开启，必要时重新配对' }
@@ -417,17 +440,18 @@ function tools(svc: AndroidPrivilegeService, shellFace?: { resolve?(spec: Record
           connected: { type: 'boolean' },
           authorized: { type: 'boolean' },
           writeMode: { type: 'string' },
+          deviceModel: { type: 'string', description: '当前绑定设备型号（连接校验缓存；空=未知）' },
           message: { type: 'string' },
         },
       },
       render: (_args, v: Record<string, unknown>) => [{
         type: 'text',
-        text: `授权档位 ${String(v.tier)}${v.message ? '——' + String(v.message) : ''}`,
+        text: `授权档位 ${String(v.tier)}${v.deviceModel ? ' · ' + String(v.deviceModel) : ''}${v.message ? '——' + String(v.message) : ''}`,
       }],
     },
     execute: async () => {
       const st = svc.status()
-      return { ...st }
+      return { ...st, deviceModel: svc.boundModel() }
     },
   })
   const termuxChannelTool = defineTool({
@@ -528,7 +552,7 @@ function tools(svc: AndroidPrivilegeService, shellFace?: { resolve?(spec: Record
       const r = await svc.execAdbShell(command)
       return r.ok
         ? { ok: true, stdout: r.stdout }
-        : { ok: false, text: r.guidance ?? (r.stdout || '执行失败') }
+        : { ok: false, guidance: r.guidance ?? '', text: r.guidance ?? (r.stdout || '执行失败') }
     },
   })
 
