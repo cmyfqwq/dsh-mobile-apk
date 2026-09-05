@@ -1,0 +1,90 @@
+{
+  "$comment": "vendor 固化插件补丁登记表（apply-patches.mjs 消费；id 必须与 IMPLS 一一对应，启动时交叉校验）。marker 语义见 README。",
+  "patches": [
+    {
+      "id": "market-A",
+      "target": "dshmarketplace-plugin/lib/index.js",
+      "summary": "pre-execute 守卫：tt() 双参签名 + 每条路径透传 next()（上游 listener 恒返 undefined → gate.kind 崩溃）",
+      "provenance": "0.13.0；全工具执行崩溃修复（Cannot read properties of undefined (reading 'kind')）",
+      "marker": "function tt(){return async (t,n)=>{"
+    },
+    {
+      "id": "market-B",
+      "target": "dshmarketplace-plugin/lib/index.js",
+      "summary": "安装 runner execPath 安全化：TERMUX__PREFIX 兜底烧写快照内 node 绝对路径",
+      "provenance": "0.13.1；apk issue #83/#89（linker64 回退污染 process.execPath → bad ELF magic: 23212f75）",
+      "marker": "execPath:(process.env.TERMUX__PREFIX"
+    },
+    {
+      "id": "market-C",
+      "target": "dshmarketplace-plugin/lib/client.js",
+      "summary": "不可安装条目置灰：installable:false → 按钮 disabled + title 说明",
+      "provenance": "0.13.1 Phase1；2026-08-29 真机风险确认后才 500 NO_COMMAND 实录",
+      "marker": "||e.installable===false",
+      "soft": true
+    },
+    {
+      "id": "market-D-server",
+      "target": "dshmarketplace-plugin/lib/index.js",
+      "summary": "搜索响应 compat/compatNote 富化（Wc()）+ mobile: 前缀过滤 desktop 条目 + COMPAT_MAP 幂等刷新",
+      "provenance": "0.13.2 W1（patch D server 侧）；兼容性数据出码 scripts/patches/data/compat-map.json",
+      "marker": "function Wc("
+    },
+    {
+      "id": "market-D-client",
+      "target": "dshmarketplace-plugin/lib/client.js",
+      "summary": "卡片兼容徽章（dshm-compat 四色）+ 搜索框「仅移动端可用」复选框",
+      "provenance": "0.13.2 W1（patch D client 侧）",
+      "marker": "dshm-compat"
+    },
+    {
+      "id": "undo-E1",
+      "target": "dsh-undo-savepoint/lib/client.js",
+      "summary": "移除头部撤销/恢复/快照按钮（保留快照徽章）",
+      "provenance": "0.13.0 真机适配；产品决策用户拍板：头部只留快照徽章",
+      "marker": "size: 14 }), t(\"snapshots\")]（存在=未应用）"
+    },
+    {
+      "id": "undo-E2",
+      "target": "dsh-undo-savepoint/lib/client.js",
+      "summary": "移除 KeyBindRow 函数区域（settings.general.item 注册组件）",
+      "provenance": "0.13.0 真机适配（手机无键盘）",
+      "marker": "//#region KeyBindRow (settings.general.item)（存在=未应用）"
+    },
+    {
+      "id": "undo-E3",
+      "target": "dsh-undo-savepoint/lib/client.js",
+      "summary": "移除 settings.general.item 注册块（undo-keys 快捷键行）",
+      "provenance": "0.13.0 真机适配（Ctrl+Alt+Z/Y 录入行彻底移除）",
+      "marker": "}, KeyBindRow)));（存在=未应用）"
+    },
+    {
+      "id": "undo-E4",
+      "target": "dsh-undo-savepoint/lib/client.js",
+      "summary": "移除全局 keydown 键盘监听（无快捷键配置后的死监听）",
+      "provenance": "0.13.0 真机适配",
+      "marker": "\"dsh-undo-savepoint: keyboard\"（存在=未应用）"
+    },
+    {
+      "id": "undo-E5",
+      "target": "dsh-undo-savepoint/lib/client.js",
+      "summary": "移除 exports.KeyBindRow 导出",
+      "provenance": "0.13.0 真机适配（E2/E3 连带）",
+      "marker": "exports.KeyBindRow（存在=未应用）"
+    },
+    {
+      "id": "undo-E6",
+      "target": "dsh-undo-savepoint/lib/client.js",
+      "summary": "徽章文本裁剪（去掉相对时间，防与 Session log 重叠）",
+      "provenance": "0.13.0 真机适配",
+      "marker": "relativeTime(stat.latest, t) || \"\"（存在=未应用）"
+    },
+    {
+      "id": "undo-E7",
+      "target": "dsh-undo-savepoint/lib/client.js",
+      "summary": "徽章宽度封顶（max-width:30vw + 省略号，新增类）",
+      "provenance": "0.13.0 真机适配（双保险）",
+      "marker": "gap:5px;white-space:nowrap;flex:none;max-width:30vw（存在=已应用）"
+    }
+  ]
+}

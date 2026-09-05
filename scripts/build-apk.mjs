@@ -69,9 +69,8 @@ try {
   let snapIn
   if (!SKIP_INJECT) {
     // ---- 1. 插件注入链（python，跨平台）----
-    // undo 移动端适配 + marketplace 修复校验（门槛；patch-undo-mobile / patch-marketplace 均 node）
-    run('node', [join(ROOT, 'scripts', 'patch-undo-mobile.mjs'), join(undo, 'lib', 'client.js'), '--check'])
-    run('node', [join(ROOT, 'scripts', 'patch-marketplace.mjs'), join(market, 'lib')])
+    // 统一补丁门禁（Phase 2a）：undo E1-E7 + marketplace A-D 幂等施加与校验（registry.json）
+    run('node', [join(ROOT, 'scripts', 'patches', 'apply-patches.mjs'), join(ROOT, 'vendor')])
     log('注入 @dsh-android 插件…')
     run('python', [join(ROOT, 'scripts', 'inject-snapshot.py'), snapSrc, join(work, 'snap-injected.tar.xz'), ...pluginDirs])
     log('注入根级插件（undo/market）…')

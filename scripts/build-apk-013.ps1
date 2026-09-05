@@ -49,14 +49,11 @@ foreach ($abi in @('arm64', 'x86_64')) {
         $market = Join-Path $Root "vendor\dshmarketplace-plugin"
         if (-not (Test-Path (Join-Path $undo "package.json"))) { Write-Host "缺 undo 注入源 $undo（git clone lire1131/dsh-undo-savepoint）"; continue }
         if (-not (Test-Path (Join-Path $market "package.json"))) { Write-Host "缺 marketplace 注入源 $market（vendor 固化副本）"; continue }
-        # marketplace 修复门禁：非修复版直接拒绝打包（幂等脚本，输出 already fixed / patched ok 即通过）
-        # 雷点 8：禁止 Select-First 截断管道——脚本固定输出 2 行（index+client），截断会杀 node 致误判失败
-        node (Join-Path $Root "scripts\patch-marketplace.mjs") (Join-Path $market "lib") 2>&1
-        if ($LASTEXITCODE -ne 0) { Write-Host "marketplace 修复校验失败，拒绝打包（$abi）"; continue }
-        # undo 移动端适配门禁：非裁剪版（含快捷键行/全局键盘监听）直接拒绝打包
+        # 统一补丁门禁（Phase 2a）：marketplace A-D + undo E1-E7 幂等施加与校验，
+        # 登记表 scripts/patches/registry.json。默认 ensure 语义（缺席即施加，锚点失配拒打包）。
         # 雷点 8：全量输出——Select-First 截断管道会杀 node 致误判失败
-        node (Join-Path $Root "scripts\patch-undo-mobile.mjs") (Join-Path $undo "lib\client.js") --check 2>&1
-        if ($LASTEXITCODE -ne 0) { Write-Host "undo 移动端裁剪校验失败，拒绝打包（$abi）"; continue }
+        node (Join-Path $Root "scripts\patches\apply-patches.mjs") (Join-Path $Root "vendor") 2>&1
+        if ($LASTEXITCODE -ne 0) { Write-Host "vendor 补丁校验/施加失败，拒绝打包（$abi）"; continue }
         Write-Host "== 注入 @dsh-android 插件（$abi）=="
         python (Join-Path $Root "scripts\inject-snapshot.py") $snap (Join-Path $work "snap-injected.tar.xz") @pluginDirs | Select-Object -Last 2
         Write-Host "== 注入根级插件（undo/market）=="
