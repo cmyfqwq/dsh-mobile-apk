@@ -314,12 +314,25 @@ object AdbState {
    * ADB shell 执行原语（真实通道，0.14）：授权满足时经 adbd（shell uid=2000）执行。
    * 失败关闭：未授权 / adb 缺失 / 连接未建立一律返回引导 JSON，绝不静默降级。
    * 命令黑名单与引擎侧 bridge 工具同策略（looksDangerous）；此处仅兜底拒绝 root 型破坏面。
+   *
+   * requireFullAccess=false 为 **API 29 SAF 方案 B 专用门**（docs/ANDROID10-SAF-ROUTING.md
+   * 审查 P1 修复）：fullAccess（All Files Access）是 API 30+ 概念，Android 10 上恒 false
+   * 会把方案 B 自锁死。SAF 路由解锁走通道级门（ADB 可用 + 连接端口在场 + 应用内允许
+   * 访问开关仍需满足）——用户同意层 = SAF 文件夹授权 + 本机 adbd RSA 弹窗，原理上
+   * 不依赖 API 30 权限模型。
    */
-  fun adbShellExecute(context: Context, engine: EngineManager, cmd: String): String {
-    if (!authorized(context)) {
+  fun adbShellExecute(context: Context, engine: EngineManager, cmd: String, requireFullAccess: Boolean = true): String {
+    if (requireFullAccess) {
+      if (!authorized(context)) {
+        return JSONObject()
+          .put("ok", false)
+          .put("guidance", "未授权：请完成授权（完全访问档位 → 允许访问开关 → 配对码）后再调用 ADB 通道")
+          .toString()
+      }
+    } else if (!allowSwitch(context)) {
       return JSONObject()
         .put("ok", false)
-        .put("guidance", "未授权：请完成授权（完全访问档位 → 允许访问开关 → 配对码）后再调用 ADB 通道")
+        .put("guidance", "未授权：请在应用内开启「允许访问」开关后重试（Android 10 SAF 存储解锁通道）")
         .toString()
     }
     val adb = adbBin(context)

@@ -70,12 +70,13 @@ internal class ConfigTransfer(private val homeDir: File, private val dshDataDir:
  * SAF 目录选择控制器（带 All Files Access 引导；自 MainActivity 拆出）：
  * 外部工作区要求 bash 进程能直接访问所选真实路径；无权限时先跳系统授权页并提示页面侧重试。
  *
- * #120（2026-09）：SDK<30 不再一刀切静默拒绝——
+ * #120（2026-09）+ SAF 路由修订（2026-09-05，docs/ANDROID10-SAF-ROUTING.md）：
  * - SDK 26-28（无分区存储）：运行时 READ/WRITE 授权后走 SAF（真实路径直接可用）；
- * - SDK 29（Android 10）：分区存储 + targetSdk≥30 时 requestLegacyExternalStorage
- *   被忽略（MT 管理器调研实锤：SO 63365334 / cgeo #10386 / 小米适配指南），
- *   SAF 授权无法解锁 FUSE 原始路径（bash 只能 POSIX open）→ 不可达，
- *   但仍改为显式拒绝（reason=android-10）而非假装取消，页面得明确错误对话框。
+ * - SDK 29（Android 10）：同样走 SAF 文件夹授权（takePersistable 持久化）+ ADB 授权链
+ *   appop LEGACY_STORAGE 解锁 raw 写（方案 B，MainActivity.unlockLegacyStorageApi29）。
+ *   历史注记：本分支曾按 #120 结论显式拒绝（reason=android-10），后经源码核实该拒绝
+ *   分支为不可达死代码（SDK>=26 恒真）——实际行为一直是放行 SAF，现按方案 A/B 显式化。
+ *   appop 在厂商 ROM 的生效性待真机验证（Phase 5 API 29 行）。
  */
 internal class DirectoryPickerController(private val activity: MainActivity) {
 

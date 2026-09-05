@@ -70,7 +70,7 @@
 | CSS 变量注入 | `--dsh-android-system-bottom` / `--dsh-android-ime-bottom` | MainActivity.kt:553-558（insets 投影 CSS px） |
 | 悬浮球避让帧 | body padding JS（当前恒为归零帧） | OverlayService.kt:586,593 → frameConsumer（MainActivity.kt:197 注册/:284 注销） |
 
-哨兵约定：目录选择显式拒绝时 path 传 `__dsh_pick_refused__:<reason>`（reason=permission-denied|android-10，MainActivity.kt:93，#120 协议）。
+哨兵约定：目录选择显式拒绝时 path 传 `__dsh_pick_refused__:<reason>`（当前唯一发射点 reason=permission-denied——权限弹窗被拒；android-10 分支已随 SAF 路由批移除（2026-09-05，docs/ANDROID10-SAF-ROUTING.md），ConfigTransfer.kt，#120 协议）。
 
 ## 4. MuxClient 协议（悬浮球待答通道，MuxClient.kt:12-26 协议注释）
 

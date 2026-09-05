@@ -71,7 +71,7 @@ cd ..\plugins\dsh-android-<pkg> && npm run build
 
 | 改动面 | 落点 | 约束 |
 |---|---|---|
-| 壳层（桥/服务/看门狗/快照/权限） | 壳内 `app/src/main/java/com/dshmobile/shell/` | 提交在壳子仓库独立 git |
+| 壳层（桥/服务/看门狗/快照/权限） | 壳内 `app/src/main/java/com/dsharnessmobile/shell/` | 提交在壳子仓库独立 git |
 | 快照内容 / assets | 壳内 `app/src/main/assets/` | `snapshot.tar.xz` + `snapshot.sha256` **必须成对换**（坑 18） |
 | 构建链 / 门禁 | 协调根 `scripts/` | 改后跑完整门禁；命令变更须同步本文档 |
 | 安卓能力插件 | 协调根 `plugins/dsh-android-*` | `npm run build` 通过；重装配须「权威 patch 覆盖 + 冷启动」（坑 19） |
@@ -99,7 +99,7 @@ cd ..\plugins\dsh-android-<pkg> && npm run build
 
 > **维护者文档（2026-09-05 Phase 4 起，权威登记处）**：`docs/ARCHITECTURE.md`（35 模块地图+依赖方向+assets 结构）/ `docs/BRIDGE-API.md`（桥协议：androidBridge 31 方法+consoleBridge 6+回调通道 8+MuxClient 协议）/ `docs/ANDROID-API-USAGE.md`（android.* 85 类按域分组+API 等级守卫点）/ `docs/DEPENDENCIES.md`（gradle 依赖+升级策略）/ `docs/RUNTIME-PATCHES.md`（assets/patched 六文件登记）。本节保留速查职能，与五文档冲突时以文档（源码 grep 实证）为准。
 
-`app/src/main/java/com/dshmobile/shell/`：
+`app/src/main/java/com/dsharnessmobile/shell/`：
 
 | 文件 | 作用 | 关键点（0.13.0 定稿） |
 |---|---|---|

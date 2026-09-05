@@ -664,11 +664,13 @@ class MainActivity : ComponentActivity() {
         val out = AdbState.adbShellExecute(
           this, engineManager,
           "appops set --user 0 $packageName LEGACY_STORAGE allow && appops get $packageName LEGACY_STORAGE",
+          requireFullAccess = false,
         )
         LogCollector.log("dsh-saf", "appop LEGACY_STORAGE: " + out.take(300))
         val probe = AdbState.adbShellExecute(
           this, engineManager,
           "touch /storage/emulated/0/.dsh-write-probe && rm -f /storage/emulated/0/.dsh-write-probe && echo PROBE_OK",
+          requireFullAccess = false,
         )
         LogCollector.log("dsh-saf", "raw 写探测: " + probe.take(200))
       } catch (t: Throwable) {
