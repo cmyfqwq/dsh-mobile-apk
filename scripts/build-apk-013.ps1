@@ -4,11 +4,18 @@
 param(
     [string]$Suffix = "-SN-1-13",          # 快照测试后缀；正式版传 ""
     [string]$OnlyAbi = "",
-    [switch]$SkipInject
+    [switch]$SkipInject,
+    [switch]$ExportSnapshots               # 0.13.2 增补：导出注入后快照资产 + 一致性门禁（见第 4 步）
 )
 $ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent $PSScriptRoot
-$Out = Join-Path $Root "out\v0.13.0"
+# 根自检测：协调仓布局（apk 子仓在 $Root\dsh-mobile-apk）与 apk 仓自包含布局（$Root 即 apk 仓根）
+# 共用同一份脚本——双仓字节级同版，杜绝雷点 10 单边演进。
+$apkDir = Join-Path $Root "dsh-mobile-apk"
+if (-not (Test-Path $apkDir)) { $apkDir = $Root }
+# 版本单一来源：build.gradle.kts（0.13.1 踩坑：硬编码 out\v0.13.0 与 $ver 会让纯净版产物错误命名旧版本）
+$GradleVer = (Select-String -Path (Join-Path $apkDir "app\build.gradle.kts") -Pattern 'versionName = "([^"]+)"').Matches[0].Groups[1].Value
+$Out = Join-Path $Root ("out\v" + $GradleVer)
 $apkDir = Join-Path $Root "dsh-mobile-apk"
 New-Item -ItemType Directory -Force -Path $Out | Out-Null
 
@@ -43,10 +50,12 @@ foreach ($abi in @('arm64', 'x86_64')) {
         if (-not (Test-Path (Join-Path $undo "package.json"))) { Write-Host "缺 undo 注入源 $undo（git clone lire1131/dsh-undo-savepoint）"; continue }
         if (-not (Test-Path (Join-Path $market "package.json"))) { Write-Host "缺 marketplace 注入源 $market（vendor 固化副本）"; continue }
         # marketplace 修复门禁：非修复版直接拒绝打包（幂等脚本，输出 already fixed / patched ok 即通过）
-        node (Join-Path $Root "scripts\patch-marketplace.mjs") (Join-Path $market "lib\index.js") 2>&1 | Select-Object -First 2
+        # 雷点 8：禁止 Select-First 截断管道——脚本固定输出 2 行（index+client），截断会杀 node 致误判失败
+        node (Join-Path $Root "scripts\patch-marketplace.mjs") (Join-Path $market "lib") 2>&1
         if ($LASTEXITCODE -ne 0) { Write-Host "marketplace 修复校验失败，拒绝打包（$abi）"; continue }
         # undo 移动端适配门禁：非裁剪版（含快捷键行/全局键盘监听）直接拒绝打包
-        node (Join-Path $Root "scripts\patch-undo-mobile.mjs") (Join-Path $undo "lib\client.js") --check 2>&1 | Select-Object -First 2
+        # 雷点 8：全量输出——Select-First 截断管道会杀 node 致误判失败
+        node (Join-Path $Root "scripts\patch-undo-mobile.mjs") (Join-Path $undo "lib\client.js") --check 2>&1
         if ($LASTEXITCODE -ne 0) { Write-Host "undo 移动端裁剪校验失败，拒绝打包（$abi）"; continue }
         Write-Host "== 注入 @dsh-android 插件（$abi）=="
         python (Join-Path $Root "scripts\inject-snapshot.py") $snap (Join-Path $work "snap-injected.tar.xz") @pluginDirs | Select-Object -Last 2
@@ -81,20 +90,19 @@ foreach ($abi in @('arm64', 'x86_64')) {
     # 注：check-snapshot-secrets.ps1 内部走 cmd /c tar，外层 $LASTEXITCODE 不可靠
     # （反映 cmd 尾命令而非脚本 exit 码——PASSED 时可能残留 1 造成误判 continue）。
     # 以脚本输出标记为准。
-    $secretResult = & node (Join-Path $Root "scripts\check-snapshot-secrets.mjs") $snapIn 2>&1 | Out-String
+    $secretResult = & (Join-Path $PSScriptRoot "check-snapshot-secrets.ps1") $snapIn 2>&1 | Out-String
     if ($secretResult -match 'FAIL\[' -or $secretResult -match 'CHECK_FAILED') {
-        Write-Host "SNAPSHOT_SECRET_CHECK_FAILED（$abi）：快照含机密，拒绝打包"
+        Write-Host "🔒 SNAPSHOT_SECRET_CHECK_FAILED（$abi）：快照含机密，拒绝打包"
         ($secretResult -split "`n") | Select-Object -First 6
         continue
     }
     if ($secretResult -notmatch 'CHECK_PASSED') {
-        Write-Host "gate 输出异常（$abi）：$($secretResult.Trim())"
+        Write-Host "⚠️ 门禁输出异常（$abi）：$($secretResult.Trim())"
     }
     $wslPath = $snapIn.Replace('D:', '/mnt/d').Replace('\', '/')
     $wslCmd = "tar -tf `"$wslPath`" | grep -cE '^usr/bin/(node|bash|rg|python|perl|ruby|zip|vim|zsh|openssl|socat|busybox)$'; tar -tf `"$wslPath`" | grep -c '^-'"
     wsl -e bash -lc $wslCmd 2>$null | Select-Object -First 2
     node (Join-Path $Root "scripts\elf-check.mjs") $snapIn $abi 2>&1 | Select-Object -First 3
-    if ($LASTEXITCODE -ne 0) { Write-Host "ELF 架构校验失败，拒绝打包（$abi）"; continue }
 
     # 3. 双 ABI APK（cp 快照 + 指纹 → gradle assembleDebug）
     Write-Host "== 构建 APK（$abi, suffix=$Suffix）=="
@@ -109,11 +117,34 @@ foreach ($abi in @('arm64', 'x86_64')) {
     try {
         & .\gradlew :app:assembleDebug --no-daemon -PversionNameSuffix="$Suffix" 2>&1 | Select-Object -Last 4
         if ($LASTEXITCODE -ne 0) { throw "gradle 构建失败（$abi）" }
-        $ver = "0.13.0$Suffix"
+        $ver = "$GradleVer$Suffix"
         Copy-Item "app\build\outputs\apk\debug\app-debug.apk" (Join-Path $Out "dsh-mobile-apk-v$ver-$abi.apk") -Force
         Write-Host "产物: $Out\dsh-mobile-apk-v$ver-$abi.apk"
     } finally {
         Pop-Location
+    }
+}
+
+# 4. 发布快照资产导出 + 一致性门禁（0.13.2 增补；0.13.1 实锤教训：Release snapshot-*.tar.xz
+#    被误取为注入前 build-snapshot 原始产物——缺 6 个注入包 + shell-termux 0.1.2 无 FENCE_KEYS，
+#    而 APK 内嵌的是注入后 snap-final2。铁律：发布快照资产必须与 APK 内嵌快照同源一致，
+#    禁止手工从 .deploy-tmp\snapshot-013\<abi>\ 拷贝）
+if ($ExportSnapshots) {
+    foreach ($abi in @('arm64', 'x86_64')) {
+        if ($OnlyAbi -and $OnlyAbi -ne $abi) { continue }
+        $snapIn = Join-Path $Root ".deploy-tmp\build-\13-$abi\snap-final2.tar.xz"
+        if (-not (Test-Path $snapIn)) { Write-Host "缺注入后快照 $snapIn，跳过导出（$abi）"; continue }
+        $outSnap = Join-Path $Out "snapshot-$abi.tar.xz"
+        Copy-Item $snapIn $outSnap -Force
+        Set-Content -Path (Join-Path $Out "snapshot-$abi.tar.xz.sha256") -Value ((Get-FileHash $outSnap -Algorithm SHA256).Hash.ToLower()) -NoNewline -Encoding ascii
+        Write-Host "快照资产导出: $outSnap"
+        $apkOut = Join-Path $Out ("dsh-mobile-apk-v" + $GradleVer + $Suffix + "-" + $abi + ".apk")
+        if (Test-Path $apkOut) {
+            & (Join-Path $PSScriptRoot "check-snapshot-asset.ps1") -ApkPath $apkOut -SnapshotPath $outSnap
+            if ($LASTEXITCODE -ne 0) { Write-Host "快照资产一致性校验失败，拒绝发布组装（$abi）"; continue }
+        } else {
+            Write-Host "警告: 缺 APK $apkOut，跳过一致性校验（$abi）"
+        }
     }
 }
 Write-Host "=== 完成。产物目录：$Out ==="

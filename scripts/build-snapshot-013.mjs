@@ -607,12 +607,14 @@ log('瘦身完成（win32/darwin prebuilds + .map 已剔除）')
 // pnpm standalone 自带的 win32-arm64/x64/darwin-arm64/x64 reflink 原生二进制（各 ~350-400KB，
 // 共 ~1.5MB）在 Android/pnpm 运行时永不加载（reflink 仅 win32/darwin 平台 feature）——
 // 纯死重，与 node-pty prebuilds 同类剔除。保留 linux-arm64/x64（pnpm 不随包分发 linux 版本时
-// 该目录本就缺，rm 幂等无妨）。
+// 该目录本就缺，幂等无妨）。
+// 注意：glob 在双引号内不被 shell 展开，rm -f "path/*.node" 是字面量匹配（静默 no-op）——
+// 必须用 find -name（find 自身做模式匹配，不依赖 shell 展开）。
 log('瘦身扩展：pnpm 跨平台 reflink .node…')
 const pnpmDist = join(U, 'lib', 'node_modules', 'pnpm', 'dist')
 wsl(`
-  rm -f "${wslPath(join(pnpmDist, 'reflink.win32-*.node'))}" \
-        "${wslPath(join(pnpmDist, 'reflink.darwin-*.node'))}" 2>/dev/null || true
+  find "${wslPath(pnpmDist)}" -maxdepth 1 -name 'reflink.win32-*.node' -delete 2>/dev/null || true
+  find "${wslPath(pnpmDist)}" -maxdepth 1 -name 'reflink.darwin-*.node' -delete 2>/dev/null || true
 `)
 log('瘦身扩展完成（pnpm reflink.win32/darwin .node 已剔除）')
 

@@ -110,6 +110,106 @@ if (existsSync(clientPath)) {
   } else {
     console.error('client.js: 置灰锚点未命中——安装按钮渲染可能已变，请人工核对（不阻断打包，仅警告）')
   }
-} else {
-  console.warn('client.js 不存在（旧版插件布局？）——跳过 C 修复')
 }
+
+// ── 补丁 D（0.13.2 Phase2-1，PRD W1：移动兼容性徽章 + mobile: 前缀过滤）──
+// server：/api/dshmarketplace/search 响应逐条富化 compat/compatNote（嵌入兼容性
+//   map，按 fullName 末段匹配；未登记默认 unknown），q 以 "mobile:" 前缀开头时
+//   过滤掉 desktop 条目（工具面 schema 不动——B 的 additionalProperties:false 校验
+//   只在 dshmarketplace_search 工具输出路径，富化仅发生在 webServer 响应层）。
+// client：卡片 meta 行加 compat 徽章（内联样式，免 CSS 修补）；搜索框旁「仅移动端
+//   可用」复选框 → 把 "mobile: " 前缀并入搜索词（回显可见、随搜索词一起提交）。
+const COMPAT_MAP = {
+  modlens: 'ok', 'dsh-better-sidebar': 'ok', 'dsh-whale-widget': 'ok',
+  'deepseek-balance-whale-widget': 'ok', 'dsh-ads': 'ok',
+  'dsh-at-file': 'ok', 'dsh-routing-suite': 'ok', 'dsh-web': 'ok', 'dsh-context': 'ok',
+  'anysearch-dsh': 'ok', 'dsh-mnemon': 'ok', 'whale-girl': 'ok', 'dsh-market': 'ok',
+  'dsh-pocket': 'ok', 'dsh-im': 'ok',
+  'dsh-desktop': 'desktop', 'pilot-harness': 'desktop', 'guizang-dsh-desktop': 'desktop',
+  'deepseek-harness-studio': 'desktop', 'dsh-transparent-ui-plugin': 'desktop',
+  'dsh-desktop-base': 'desktop', 'dsh-ios': 'desktop',
+  'dsh-browser': 'native',
+}
+const COMPAT_NOTE = { ok: '移动端可用', desktop: '仅桌面（bionic 不可用）', native: '含原生依赖（bionic 未验证）', unknown: '未验证（装前留意）' }
+
+// ── index.js D-server ──
+const D_MARK = 'function Wc('
+const D_SRV_INSERT_BEFORE = 'function qt(t){'
+const D_SRV = `function Wc(t){let _=${JSON.stringify(COMPAT_MAP)},e=String(t.fullName??"").split("#").pop().split("/").pop().toLowerCase(),f=_?.[e]??"unknown",n=${JSON.stringify(COMPAT_NOTE)}[f];return{...t,compat:f,compatNote:n}}`
+const D_SRV_OLD = 'let a=await u({q:s.searchParams.get("q")??void 0,category:s.searchParams.get("category")??void 0,limit:s.searchParams.get("limit")??60});l(e,200,a)'
+const D_SRV_NEW = 'let _q=s.searchParams.get("q")??void 0,_m=String(_q??"").startsWith("mobile:");if(_m)_q=String(_q).slice(7).trim()||void 0;let a=await u({q:_q,category:s.searchParams.get("category")??void 0,limit:s.searchParams.get("limit")??60});a.results=(a.results??[]).map(x=>Wc(x));if(_m)a.results=a.results.filter(x=>x.compat!=="desktop");l(e,200,a)'
+if (existsSync(indexPath)) {
+  let t = readFileSync(indexPath, 'utf8')
+  if (t.includes(D_MARK)) {
+    // 幂等 + map 强制同步（别名增补等数据更新直接反映到已修补文件）
+    const mapRe = /let _=\{.*?\},e=String\(t\.fullName/
+    if (!mapRe.test(t)) {
+      console.error('index.js: D map 锚点未命中——请人工核对')
+      process.exit(1)
+    }
+    t = t.replace(mapRe, `let _=${JSON.stringify(COMPAT_MAP)},e=String(t.fullName`)
+    writeFileSync(indexPath, t)
+    console.log('index.js: D map 已同步（幂等刷新）')
+  } else {
+    if (!t.includes(D_SRV_INSERT_BEFORE)) {
+      console.error('index.js: D 插入锚点 qt( 未命中——请人工核对')
+      process.exit(1)
+    }
+    t = t.replace(D_SRV_INSERT_BEFORE, D_SRV + D_SRV_INSERT_BEFORE)
+    if (!t.includes(D_SRV_OLD)) {
+      console.error('index.js: D 搜索端点锚点未命中——上游 handler 可能已变：')
+      const i = t.indexOf('searchParams.get("q")')
+      if (i >= 0) console.error(t.slice(i, i + 400))
+      process.exit(1)
+    }
+    t = t.replace(D_SRV_OLD, D_SRV_NEW)
+    if (!t.includes(D_MARK) || !t.includes('compat!==\"desktop\"')) {
+      console.error('index.js: D 复核失败——不写回')
+      process.exit(1)
+    }
+    writeFileSync(indexPath, t)
+    console.log('index.js: patched ok (D 兼容徽章富化 + mobile: 过滤)')
+  }
+}
+
+// ── client.js D-client（徽章 + 仅移动端复选框）──
+const D_CLI_MARK = 'dshm-compat'
+const D_CLI_HELPERS = `function Uq(e){return e==="ok"?"#2f9e68":e==="desktop"?"#b96a2a":e==="native"?"#8a5fc0":"#8a8f98"}function Uw(e){return e==="ok"?"移动可用":e==="desktop"?"仅桌面":e==="native"?"原生?":"未验证"}`
+const D_CLI_HELPERS_ANCHOR = 'var B=Object.create;var h=Object.defineProperty;'
+const D_CLI_BADGE_OLD = 'i?s.default.createElement("span",{className:"dshm-risk"},e.riskFlags.join(" \\xB7 ")):null,s.default.createElement("a",{href:e.url,target:"_blank",rel:"noopener"},r("details"))'
+const D_CLI_BADGE_NEW = 'i?s.default.createElement("span",{className:"dshm-risk"},e.riskFlags.join(" \\xB7 ")):null,s.default.createElement("span",{className:"dshm-compat",style:{margin:"0 0 0 6px",fontSize:11,padding:"0 6px",borderRadius:4,color:"#fff",background:Uq(e.compat)}},Uw(e.compat)),s.default.createElement("a",{href:e.url,target:"_blank",rel:"noopener"},r("details"))'
+const D_CLI_FILTER_OLD = 'onChange:o=>m(o.target.value)}),l==="loading"'
+const D_CLI_FILTER_NEW = 'onChange:o=>m(o.target.value)}),s.default.createElement("label",{style:{marginLeft:10,display:"inline-flex",alignItems:"center",gap:4,fontSize:13}},s.default.createElement("input",{type:"checkbox",checked:/^mobile:/.test(n),onChange:o=>{let v=(n||"").replace(/^mobile:\\s*/,"");m(o.target.checked?"mobile: "+v:v)}}),"仅移动端可用"),l==="loading"'
+if (existsSync(clientPath)) {
+  let c = readFileSync(clientPath, 'utf8')
+  if (c.includes(D_CLI_MARK)) {
+    console.log('client.js: already fixed (D 徽章在场)——跳过')
+  } else {
+    if (!c.includes(D_CLI_HELPERS_ANCHOR)) {
+      console.error('client.js: D 助手锚点未命中——请人工核对')
+      process.exit(1)
+    }
+    c = c.replace(D_CLI_HELPERS_ANCHOR, D_CLI_HELPERS + D_CLI_HELPERS_ANCHOR)
+    if (!c.includes(D_CLI_BADGE_OLD)) {
+      console.error('client.js: D 徽章锚点未命中——dshm-risk 段已变：')
+      const i = c.indexOf('dshm-risk"')
+      if (i >= 0) console.error(c.slice(i, i + 260))
+      process.exit(1)
+    }
+    c = c.replace(D_CLI_BADGE_OLD, D_CLI_BADGE_NEW)
+    if (!c.includes(D_CLI_FILTER_OLD)) {
+      console.error('client.js: D 过滤锚点未命中——搜索框段已变：')
+      const j = c.indexOf('dshm-search"')
+      if (j >= 0) console.error(c.slice(j, j + 200))
+      process.exit(1)
+    }
+    c = c.replace(D_CLI_FILTER_OLD, D_CLI_FILTER_NEW)
+    if (!c.includes('dshm-compat') || !c.includes('仅移动端可用')) {
+      console.error('client.js: D 复核失败——不写回')
+      process.exit(1)
+    }
+    writeFileSync(clientPath, c)
+    console.log('client.js: patched ok (D 徽章 + 仅移动端复选框)')
+  }
+}
+console.log('patch-marketplace: ALL OK')
