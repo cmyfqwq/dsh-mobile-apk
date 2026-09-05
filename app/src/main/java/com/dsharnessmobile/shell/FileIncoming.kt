@@ -1,6 +1,7 @@
 package com.dsharnessmobile.shell
 
 import android.content.Context
+import android.content.Intent
 import android.net.Uri
 import java.io.File
 import java.net.URLDecoder
@@ -175,6 +176,104 @@ object FileIncoming {
       dir.listFiles()?.forEach { it.delete() }
       LogCollector.log("dsh-file-open", "temp workspace cleaned (task removed ritual)")
     } catch (_: Exception) {
+    }
+  }
+
+  /**
+   * VIEW/SEND 外部来件接线（0.13.0 F5/M3.5；自 MainActivity.maybeProcessIncoming 迁入）：
+   * 校验净化 → 拷贝临时工作区 → 通知引擎侧插件。
+   * 外部路径不留原件引用（一律拷贝，权限模型对齐 F1.8）；引擎未启动先启动（启动流先于通知）。
+   * 拒绝/失败提示经 notify 回调（MainActivity.showTestNotification）。
+   */
+  fun processIncomingIntent(context: Context, intent: Intent?, notify: (title: String, text: String) -> Unit) {
+    if (intent == null) return
+    val action = intent.action
+    val uri: Uri? = when (action) {
+      Intent.ACTION_VIEW -> intent.data
+      Intent.ACTION_SEND -> intent.getParcelableExtra(Intent.EXTRA_STREAM)
+      else -> null
+    }
+    if (uri == null) return
+    // 每次文件入队前先做 TTL 清扫（issue #60 F5.1：临时文件 7 天自动回收，防止无限堆积）
+    sweepExpired(context)
+    val validated = validate(uri.toString(), context) ?: run {
+      notify("文件直达被拒绝", "路径不在允许范围（仅系统打开/分享的真实路径）")
+      return
+    }
+    val target = copyIn(context, validated) ?: run {
+      notify("文件拷贝失败", "无法读取传入文件")
+      return
+    }
+    recordOpening(context, target.absolutePath)
+    LogCollector.log("dsh-file-open", "incoming processed: " + target.absolutePath)
+    // 引擎侧插件端点：路径交给 dsh-android-file-open 强制新会话（引擎未起时端点由启动流承托）。
+    Thread {
+      try {
+        val conn = java.net.URL("http://127.0.0.1:3080/api/android/file-incoming").openConnection(java.net.Proxy.NO_PROXY) as java.net.HttpURLConnection
+        conn.requestMethod = "POST"
+        conn.doOutput = true
+        conn.connectTimeout = 3000
+        val body = org.json.JSONObject().put("path", target.absolutePath).toString()
+        conn.outputStream.use { it.write(body.toByteArray()) }
+        conn.responseCode
+        conn.disconnect()
+      } catch (_: Exception) {
+      }
+    }.start()
+  }
+
+  /**
+   * 用外部阅读器打开文件路径（issue #52；自 MainActivity.openNativePathWithReader 迁入）：
+   * 引擎 native-path-opener 仅支持 mac/win/linux，Android 上文件提及按钮会失败。路径解析：
+   * - /storage/emulated/0/Documents/dshdata/...（导出仓库）→ FileProvider content Uri
+   * - 应用私有文件区（工作区/usr/bin）→ FileProvider content Uri
+   * - 其他（content://、不可读、或私密区路径如 .dsh/.credentials.yaml）→ false，
+   *   前端回退引擎 RPC（桌面宿主行为）。
+   * 安全（2026-08-23 CRITICAL 修复）：运行时白名单 canonical 校验，与
+   * res/xml/file_paths.xml 的映射面一致——FileProvider 若配到更宽路径也会被此层拦截。
+   */
+  fun openWithExternalReader(activity: MainActivity, path: String): Boolean {
+    return try {
+      val file = java.io.File(path)
+      if (!file.exists()) {
+        android.util.Log.w("dsh-image", "openNativePath: not exists: $path")
+        return false
+      }
+      if (!isReaderAllowedPath(activity, file)) {
+        android.util.Log.w("dsh-image", "openNativePath rejected (outside reader whitelist): $path")
+        return false
+      }
+      val uri = androidx.core.content.FileProvider.getUriForFile(
+        activity, activity.packageName + ".fileprovider", file,
+      )
+      val intent = Intent(Intent.ACTION_VIEW, uri).apply {
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+      }
+      activity.startActivity(intent)
+      android.util.Log.i("dsh-image", "openNativePath ok: $path")
+      true
+    } catch (e: Exception) {
+      android.util.Log.w("dsh-image", "openNativePath failed: $path -> ${e.message}")
+      false
+    }
+  }
+
+  /** 外部阅读器白名单（与 res/xml/file_paths.xml 映射面一致；canonical 比较防 symlink/.. 逃逸）。 */
+  private fun isReaderAllowedPath(activity: MainActivity, file: java.io.File): Boolean {
+    return try {
+      val canon = file.canonicalPath
+      val roots = listOf(
+        java.io.File(activity.filesDir, "home/.dsh/workspaces"),
+        java.io.File(activity.filesDir, "home/tmp"),
+        java.io.File(activity.filesDir, "usr/bin"),
+        java.io.File(
+          android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_DOCUMENTS),
+          "dshdata",
+        ),
+      ).map { it.canonicalPath }
+      roots.any { root -> canon == root || canon.startsWith(root + java.io.File.separator) }
+    } catch (_: Exception) {
+      false
     }
   }
 }
