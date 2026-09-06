@@ -11,7 +11,7 @@ import android.webkit.WebView
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 
-/** 窗口/页面 UI chrome 助手（自 MainActivity 拆出）：沉浸式状态栏、WebView 字体大小、
+/** 窗口/页面 UI chrome 助手（自 MainActivity 拆出）：沉浸式状态栏、
  *  原生剪贴板、屏幕常亮、系统深色主题推送——均为无业务逻辑的纯 UI 状态读写。 */
 internal class WebUiChrome(private val activity: MainActivity) {
 
@@ -63,27 +63,7 @@ internal class WebUiChrome(private val activity: MainActivity) {
     }
   }
 
-  /** 字体大小持久化读取（设置 → 通用设置 滑块；默认 100）。 */
-  fun textZoomPrefs(): Int {
-    return try {
-      activity.getSharedPreferences("dsh_settings", Context.MODE_PRIVATE).getInt("text_zoom", 100)
-    } catch (_: Exception) {
-      100
-    }
-  }
-
-  /** 字体大小设置（WebView textZoom）+ 持久化，重启/缓存刷新后仍生效。 */
-  fun setTextZoomPersisted(percent: Int) {
-    val p = percent.coerceIn(50, 200)
-    // JS 桥在 JavaBridge 线程调用；WebView 方法必须切回主线程。
-    activity.runOnUiThread { activity.webView.settings.textZoom = p }
-    try {
-      activity.getSharedPreferences("dsh_settings", Context.MODE_PRIVATE).edit().putInt("text_zoom", p).apply()
-      Log.i("dsh-image", "textZoom set: " + p)
-    } catch (e: Exception) {
-      Log.e("dsh-image", "textZoom persist failed: " + e.message)
-    }
-  }
+  /** 0.13.3：textZoom 桥与持久化退役（D6）——上游 ui-theme fontSize 原生覆盖字体调节。 */
 
   /**
    * 原生剪贴板写入（WebView 的 Clipboard API 在 Android 上被拒

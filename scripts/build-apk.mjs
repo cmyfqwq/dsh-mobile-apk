@@ -45,6 +45,7 @@ const pluginDirs = [
 ]
 const undo = join(ROOT, 'vendor', 'dsh-undo-savepoint')
 const market = join(ROOT, 'vendor', 'dshmarketplace-plugin')
+const modelSync = join(ROOT, 'vendor', 'dsh-model-sync') // 0.13.3 W7：@aiwayds/dsh-model-sync 0.3.1 固化副本
 const work = join(ROOT, '.deploy-tmp', `build-${ABI}`)
 const snapSrc = SNAP || join(ROOT, '.deploy-tmp', 'snapshot-013', ABI, 'snapshot.tar.xz')
 
@@ -65,6 +66,7 @@ try {
   pluginDirs.forEach((p) => requires('插件', p))
   requires('vendor undo', join(undo, 'package.json'))
   requires('vendor market', join(market, 'package.json'))
+  requires('vendor model-sync', join(modelSync, 'lib', 'index.js'))
 
   let snapIn
   if (!SKIP_INJECT) {
@@ -72,7 +74,7 @@ try {
     // 统一补丁门禁（Phase 2a）：undo E1-E7 + marketplace A-D 幂等施加与校验（registry.json）
     run('node', [join(ROOT, 'scripts', 'patches', 'apply-patches.mjs'), join(ROOT, 'vendor')])
     log('单 pass 注入（@dsh-android + undo/market + 权威 patch）…')
-    run('python', [join(ROOT, 'scripts', 'inject-all.py'), snapSrc, join(work, 'snap-final2.tar.xz'), join(ROOT, 'scripts', 'profile-web.cordis.patch.yml'), '--dsh-android', ...pluginDirs, '--external', undo, market])
+    run('python', [join(ROOT, 'scripts', 'inject-all.py'), snapSrc, join(work, 'snap-final2.tar.xz'), join(ROOT, 'scripts', 'profile-web.cordis.patch.yml'), '--dsh-android', ...pluginDirs, '--external', undo, market, modelSync])
     snapIn = join(work, 'snap-final2.tar.xz')
   } else {
     snapIn = snapSrc
@@ -80,7 +82,7 @@ try {
 
   // ---- 2. 门禁（全部跨平台脚本）----
   log('门禁：patch 挂载集校验…')
-  run('node', [join(ROOT, 'scripts', 'check-patch-mounts.mjs'), join(ROOT, 'scripts', 'profile-web.cordis.patch.yml'), ...pluginDirs, undo, market])
+  run('node', [join(ROOT, 'scripts', 'check-patch-mounts.mjs'), join(ROOT, 'scripts', 'profile-web.cordis.patch.yml'), ...pluginDirs, undo, market, modelSync])
   log('门禁：第三方许可…')
   run('node', [join(ROOT, 'scripts', 'check-third-party.mjs'), 'x', '--tar', snapIn])
   log('门禁：机密…')

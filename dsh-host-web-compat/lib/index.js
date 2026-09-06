@@ -30,6 +30,12 @@ const POLYFILLS = [
   // lack it while still offering crypto.getRandomValues (issue #110: randomUUID is not a function).
   // RFC 4122 v4: set version/variant bits, hex lowercase, canonical dashes.
   `if(typeof crypto!=='undefined'&&crypto.getRandomValues&&typeof crypto.randomUUID==='undefined'){crypto.randomUUID=function(){var b=new Uint8Array(16);crypto.getRandomValues(b);b[6]=(b[6]&0x0f)|0x40;b[8]=(b[8]&0x3f)|0x80;return Array.prototype.map.call(b,function(x){return('0'+x.toString(16)).slice(-2)}).join('').replace(/(.{8})(.{4})(.{4})(.{4})(.{12})/,'$1-$2-$3-$4-$5')}}`,
+  // Promise.withResolvers: Chrome 119+/Safari 17.4+; WebView 110 (0.13.2 矩阵下限) 缺位。
+  // 0.1.2-rc.1 起 host-webserver 的 READY_MARKUP 在页面内执行
+  // `(globalThis.__DSH_BOOT_READY__ ??= Promise.withResolvers()).resolve()`——缺该 API 即 boot
+  // TypeError（0.13.3 W5/D7 必做项）。must run BEFORE the boot-ready tail; the </head> injection
+  // point already guarantees that for the whole POLYFILLS array.
+  `if(typeof Promise!=='undefined'&&typeof Promise.withResolvers==='undefined'){Promise.withResolvers=function(){var resolve,reject;var promise=new this(function(res,rej){resolve=res;reject=rej});return{promise:promise,resolve:resolve,reject:reject}}}`,
 ];
 
 // Boot watchdog (2026-08-17, issue #36): when the page stays on "Loading plugins…" for over 40s,

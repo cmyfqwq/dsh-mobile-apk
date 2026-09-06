@@ -47,19 +47,25 @@ class OverlayPanel(private val svc: OverlayService) {
   private val pickerIds = ArrayList<String>()      // 与 pickerLabels 平行；空 = 新会话
   private var pickerInit = false                   // 首次填充防 onItemSelected 误触发
 
-  // 协议（dsh 0.1.1-rc.2 源码核实）：rpcId 只在 mux WebSocket 下行帧（server-request）里下发，
-  // 重开自动重放仍 pending 帧（rpcId 不变）；应答统一 POST /api/respond：
-  // 审批 value={sessionId,approvalId,outcome:"allowed-once"|"rejected"}；
-  // 提问 value={sessionId,answer:{answers:[{id,selected:[选项 label]}]}}（顺序配对、selected 用 label、
-  // 单选 custom 与 selected 互斥）；提问取消 result={ok:false,error:{code:"cancelled",...}}（审批无此通道）。
+  // 协议（0.1.2-rc.1 dsh-api-gateway/lib/{index,client}.js 核实，0.13.3 W3）：
+  // WS /api/remote.mux 上 open `$events` 流；服务端 item value 帧形：
+  //   ready = {type:"ready",clientId,host:{home}}（clientId 应答必须回带）；
+  //   waterfall = {type:"waterfall",event,eventId,agentId,request}（approval/request 与
+  //     user-questions/request）；
+  //   emit = {type:"emit",event,args}（api-session/status → args:[agentId,running] 忙态锚点）。
+  // 应答统一 POST /api/$events/result，client-request 信封 payload={args:{clientId,eventId,outcome}}：
+  //   审批 outcome={kind:"result",value:"allowed-once"|"rejected"}（值=审批词汇原字符串）；
+  //   提问 outcome={kind:"result",value:{answers:[{id,selected:[label,…],custom?}]}}（selected 数组）；
+  //   提问跳过 outcome={kind:"rejected",error:{name,message}}；审批无取消通道。
   private var mux: MuxClient? = null
+  @Volatile private var eventsClientId: String = ""   // ready 帧分配；应答与流实例绑定
   internal val pendingApprovals = LinkedHashMap<String, PendingApproval>()
   internal val pendingQuestions = LinkedHashMap<String, PendingQuestion>()
   private val multiSel = HashMap<String, ArrayList<String>>()   // 多选暂存：questionId → labels
   private val qSingle = HashMap<String, String>()               // 单选暂存：questionId → label
   private val qCustom = HashMap<String, String>()               // 自定义答案：questionId → text
   private var qPage = 0                                          // 多问分页（官方卡 1/N 风格）
-  private var pendingKey = ""                                    // 当前卡指纹（kind:rpcId），变化即清作答态
+  private var pendingKey = ""                                    // 当前卡指纹（kind:eventId），变化即清作答态
   private var renderedCardKey = ""                               // 卡片已渲染指纹（防 live 流重绘打断输入）
 
   /** 服务 onDestroy 联动：关闭 mux 长连接（原 mux?.close(); mux = null）。 */
@@ -68,35 +74,60 @@ class OverlayPanel(private val svc: OverlayService) {
   }
 
   internal fun startMux() {
-    mux = MuxClient("127.0.0.1", 3080, "/api/events.mux") { text -> handleMuxFrame(text) }
+    mux = MuxClient("127.0.0.1", 3080, "/api/remote.mux") { text -> handleMuxFrame(text) }
   }
 
   private fun handleMuxFrame(text: String) {
     val j = try { JSONObject(text) } catch (_: Exception) { return }
-    if (j.optString("type") != "server-request") return
-    val method = j.optString("method")
-    if (method != "approval/requested" && method != "approval/resolved" &&
-      method != "question/requested" && method != "question/resolved") return
-    val payload = j.optJSONObject("payload") ?: return
-    val rpcId = j.optString("rpcId")
-    when (method) {
-      "approval/requested" -> svc.main.post {
-        pendingApprovals[rpcId] = PendingApproval(rpcId, payload.optString("sessionId"), payload.optString("approvalId"), payload.optString("toolName", ""), payload.optString("reason", ""))
-        onPendingChanged()
+    when (j.optString("type")) {
+      "item" -> {
+        val value = j.optJSONObject("value") ?: return
+        handleEventValue(value)
       }
-      "approval/resolved" -> svc.main.post {
-        val aid = payload.optString("approvalId", "")
-        pendingApprovals.keys.filter { pendingApprovals[it]?.approvalId == aid }.toList()
-          .forEach { pendingApprovals.remove(it) }
-        onPendingChanged()
+      // 流被服务端终止（end）或出错（error）：重连由 MuxClient 重连循环处理
+      // （检测不到对端断开时 iframe 也会因 end 后无数据而 idle，这里主动重建连接）。
+      "end", "error" -> {
+        mux?.close()
+        mux = null
+        startMux()
       }
-      "question/requested" -> svc.main.post {
-        pendingQuestions[rpcId] = PendingQuestion(rpcId, payload.optString("sessionId"), payload.optJSONArray("questions") ?: org.json.JSONArray())
-        onPendingChanged()
+    }
+  }
+
+  private fun handleEventValue(value: JSONObject) {
+    when (value.optString("type")) {
+      "ready" -> {
+        eventsClientId = value.optString("clientId", "")
       }
-      "question/resolved" -> svc.main.post {
-        pendingQuestions.remove(payload.optString("questionRpcId", ""))
-        onPendingChanged()
+      "waterfall" -> {
+        val event = value.optString("event")
+        val eventId = value.optString("eventId")
+        val agentId = value.optString("agentId")
+        val request = value.optJSONObject("request") ?: return
+        when (event) {
+          "approval/request" -> svc.main.post {
+            pendingApprovals[eventId] = PendingApproval(eventId, agentId, request.optString("toolName", ""), request.optString("reason", ""))
+            onPendingChanged()
+          }
+          "user-questions/request" -> svc.main.post {
+            pendingQuestions[eventId] = PendingQuestion(eventId, agentId, request.optJSONArray("questions") ?: org.json.JSONArray())
+            onPendingChanged()
+          }
+        }
+      }
+      "emit" -> {
+        when (value.optString("event")) {
+          // 0.13.3 D6：api-session/status（args=[agentId, running]）= 官方忙态锚点，
+          // 替代旧 turn_start 专门行（bridge 0.1.4 起退役该行）。
+          "api-session/status" -> {
+            val args = value.optJSONArray("args") ?: return
+            if (args.length() >= 2) {
+              val agentId = args.optString(0)
+              val running = args.optBoolean(1)
+              svc.main.post { svc.applyAgentStatus(agentId, running) }
+            }
+          }
+        }
       }
     }
   }
@@ -105,13 +136,13 @@ class OverlayPanel(private val svc: OverlayService) {
   private fun currentPending(): Pair<String, Any>? {
     val sid = svc.activeSessionId
     val ok = { s: String -> sid.isEmpty() || s == sid }
-    pendingApprovals.values.firstOrNull { ok(it.sessionId) }?.let { return "approval" to it }
-    pendingQuestions.values.firstOrNull { ok(it.sessionId) }?.let { return "question" to it }
+    pendingApprovals.values.firstOrNull { ok(it.agentId) }?.let { return "approval" to it }
+    pendingQuestions.values.firstOrNull { ok(it.agentId) }?.let { return "question" to it }
     return null
   }
 
   internal fun onPendingChanged() {
-    val key = currentPending()?.let { "${it.first}:${(it.second as? PendingApproval)?.rpcId ?: (it.second as? PendingQuestion)?.rpcId ?: ""}" } ?: ""
+    val key = currentPending()?.let { "${it.first}:${(it.second as? PendingApproval)?.eventId ?: (it.second as? PendingQuestion)?.eventId ?: ""}" } ?: ""
     if (key != pendingKey) {
       pendingKey = key
       multiSel.clear(); qSingle.clear(); qCustom.clear(); qPage = 0; renderedCardKey = ""
@@ -575,37 +606,57 @@ class OverlayPanel(private val svc: OverlayService) {
     box.visibility = View.VISIBLE
   }
 
-  // ── 应答（POST /api/respond，两域同一入口，rpcId 原样回显） ──────────
+  // ── 应答（0.13.3 W3：POST /api/$events/result，{clientId,eventId,outcome}）──
 
-  private fun respondEnvelope(rpcId: String, result: JSONObject) =
-    JSONObject().put("type", "client-response").put("rpcId", rpcId).put("result", result)
-
-  private fun postRespond(envelope: JSONObject, onAccepted: (Boolean) -> Unit) {
+  /**
+   * 网关 RemoteEventResult：outcome = {kind:"result",value}（审批=词汇原字符串；
+   * 提问={answers:[…]}）或 {kind:"rejected",error:{name,message}}（提问跳过）。
+   * clientId 来自 ready 帧——应答与流实例绑定，未就绪（流未 ready）时直接报失败。
+   */
+  private fun postEventResult(eventId: String, outcome: JSONObject, onAccepted: (Boolean) -> Unit) {
     Thread {
       var accepted = false
       try {
-        val conn = URL("http://127.0.0.1:3080/api/respond").openConnection(java.net.Proxy.NO_PROXY) as HttpURLConnection
-        conn.requestMethod = "POST"
-        conn.doOutput = true
-        conn.connectTimeout = 3000
-        conn.readTimeout = 8000
-        conn.setRequestProperty("content-type", "application/json")
-        conn.outputStream.use { it.write(envelope.toString().toByteArray(Charsets.UTF_8)) }
-        val code = conn.responseCode
-        val body = (if (code in 200..299) conn.inputStream else conn.errorStream)?.bufferedReader()?.use { it.readText() } ?: ""
-        conn.disconnect()
-        accepted = code == 200 && body.contains("\"accepted\":true")
+        val payload = JSONObject()
+          .put("args", JSONObject()
+            .put("clientId", eventsClientId)
+            .put("eventId", eventId)
+            .put("outcome", outcome))
+        val envelope = JSONObject()
+          .put("type", "client-request")
+          .put("rpcId", "overlay-event-" + System.currentTimeMillis())
+          .put("method", "\$events/result")
+          .put("payload", payload)
+        var code = -1
+        for (attempt in 0..1) {
+          val conn = URL("http://127.0.0.1:3080/api/\$events/result").openConnection(java.net.Proxy.NO_PROXY) as HttpURLConnection
+          conn.requestMethod = "POST"
+          conn.doOutput = true
+          conn.connectTimeout = 3000
+          conn.readTimeout = 8000
+          conn.setRequestProperty("content-type", "application/json")
+          EngineAuth.attach(svc.applicationContext, conn)
+          conn.outputStream.use { it.write(envelope.toString().toByteArray(Charsets.UTF_8)) }
+          code = conn.responseCode
+          if (code == 401 && attempt == 0) {
+            conn.disconnect()
+            EngineAuth.handleUnauthorized(svc.applicationContext)
+            continue
+          }
+          conn.disconnect()
+          break
+        }
+        accepted = code == 200 && eventsClientId.isNotEmpty()
       } catch (_: Exception) {}
       svc.main.post { onAccepted(accepted) }
     }.start()
   }
 
   private fun respondApproval(a: PendingApproval, outcome: String) {
-    val value = JSONObject()
-      .put("sessionId", a.sessionId).put("approvalId", a.approvalId).put("outcome", outcome)
-    postRespond(respondEnvelope(a.rpcId, JSONObject().put("ok", true).put("value", value))) { accepted ->
+    val outcomeJson = JSONObject().put("kind", "result").put("value", outcome)
+    postEventResult(a.eventId, outcomeJson) { accepted ->
       if (accepted) {
-        pendingApprovals.remove(a.rpcId)
+        pendingApprovals.remove(a.eventId)
         // 批准后轮次继续（工具真正执行），下个 live 事件前先亮工作态（同发送空窗逻辑）
         svc.markBusyOptimistic()
         svc.flashStatus(if (outcome == "allowed-once") "已批准" else "已拒绝")
@@ -614,7 +665,8 @@ class OverlayPanel(private val svc: OverlayService) {
     }
   }
 
-  /** 提问作答：answers 按 questions 原序配对（协议硬约束）；单选 custom 与 selected 互斥。 */
+  /** 提问作答：answers 按 questions 原序配对（协议硬约束）；单选 custom 与 selected 互斥。
+   *  0.1.2-rc.1：selected 由旧协议的单 label 字符串改为 label 数组。 */
   private fun respondQuestion(qe: PendingQuestion) {
     val arr = org.json.JSONArray()
     for (i in 0 until qe.items.length()) {
@@ -628,11 +680,11 @@ class OverlayPanel(private val svc: OverlayService) {
       if (custom.isNotEmpty()) entry.put("custom", custom)
       arr.put(entry)
     }
-    val value = JSONObject().put("sessionId", qe.sessionId)
-      .put("answer", JSONObject().put("answers", arr))
-    postRespond(respondEnvelope(qe.rpcId, JSONObject().put("ok", true).put("value", value))) { accepted ->
+    val value = JSONObject().put("answers", arr)
+    val outcomeJson = JSONObject().put("kind", "result").put("value", value)
+    postEventResult(qe.eventId, outcomeJson) { accepted ->
       if (accepted) {
-        pendingQuestions.remove(qe.rpcId)
+        pendingQuestions.remove(qe.eventId)
         // 作答后轮次继续，下个 live 事件前先亮工作态（同发送空窗逻辑）
         svc.markBusyOptimistic()
         svc.flashStatus("已回答")
@@ -641,12 +693,15 @@ class OverlayPanel(private val svc: OverlayService) {
     }
   }
 
-  /** 跳过提问 = 引擎侧取消（result.ok:false + error.code:"cancelled"；审批无此通道）。 */
+  /** 跳过提问 = 拒绝该 waterfall（outcome rejected；审批无取消通道）。 */
   private fun dismissQuestion(qe: PendingQuestion) {
-    val err = JSONObject().put("code", "cancelled").put("message", "dismissed from overlay").put("details", JSONObject())
-    postRespond(respondEnvelope(qe.rpcId, JSONObject().put("ok", false).put("error", err))) { accepted ->
+    val outcomeJson = JSONObject().put("kind", "rejected").put(
+      "error",
+      JSONObject().put("name", "UserQuestionError").put("message", "dismissed from overlay").put("code", "cancelled"),
+    )
+    postEventResult(qe.eventId, outcomeJson) { accepted ->
       if (accepted) {
-        pendingQuestions.remove(qe.rpcId)
+        pendingQuestions.remove(qe.eventId)
         svc.flashStatus("已跳过")
         onPendingChanged()
       } else svc.flashStatus("应答失败")
@@ -742,8 +797,8 @@ class OverlayPanel(private val svc: OverlayService) {
   }
 }
 
-/** 权限审批待处理项（mux server-request payload 投影）。 */
-internal data class PendingApproval(val rpcId: String, val sessionId: String, val approvalId: String, val toolName: String, val reason: String)
+/** 权限审批待处理项（0.1.2-rc.1 $events waterfall 帧投影；eventId 关联键、agentId=目标会话 id）。 */
+internal data class PendingApproval(val eventId: String, val agentId: String, val toolName: String, val reason: String)
 
-/** AI 提问待处理项（mux server-request payload 投影，questions 原始 JSONArray）。 */
-internal data class PendingQuestion(val rpcId: String, val sessionId: String, val items: org.json.JSONArray)
+/** AI 提问待处理项（$events waterfall 帧投影，request.questions 原始 JSONArray）。 */
+internal data class PendingQuestion(val eventId: String, val agentId: String, val items: org.json.JSONArray)

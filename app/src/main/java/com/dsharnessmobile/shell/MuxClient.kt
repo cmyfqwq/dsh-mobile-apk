@@ -10,17 +10,23 @@ import java.security.MessageDigest
 import java.security.SecureRandom
 
 /**
- * 极简 WebSocket 客户端（0.13.2 悬浮球审批/提问原生应答通道，方案 B）：
- * 连引擎 mux 下行流 ws://127.0.0.1:3080/api/events.mux，只收 server-request 帧
- * （approval/requested|resolved、question/requested|resolved），应答走 HTTP
- * POST /api/respond（OverlayService 侧）。
+ * 极简 WebSocket 客户端（0.13.3 W3 传输面重做，0.13.2 版为 /api/events.mux 单向下行）：
+ * 连引擎网关流复用器 ws://127.0.0.1:3080/api/remote.mux（dsh-api-gateway，
+ * REMOTE_STREAM_MUX_PATH），open `$events` 逻辑流转发审批/提问 waterfall 帧与
+ * api-session/status emit 帧。应答走 HTTP POST /api/$events/result（OverlayPanel）。
  *
- * 协议事实（以 dsh 0.1.1-rc.2 源码 packages/host/apiproxy + packages/client/connection 核实）：
- * - mux 走网络只有 WebSocket（GET 直连 426，无 SSE 回退）；
- * - 回环 Host 即过信任围栏（DNS-rebinding 防务），无 token/子协议要求；
- * - 单向 downlink：客户端发「业务消息」会被 close(1008)——本端只发控制帧（pong/close，masked）；
- * - 每次重开连接自动重放全部仍 pending 的 requested 帧（rpcId 不变）→ 断线重连即状态收敛；
- * - 服务端帧恒不掩码；ping 由对端 ws 库自动 pong，本端仍兜底回 pong。
+ * 协议事实（以 0.1.2-rc.1 dsh-api-gateway/lib/{index,client}.js 核实）：
+ * - WS upgrade 请求过 connection.requestRejection → 必须带浏览器 Cookie（W2 EngineAuth；
+ *   每次连接尝试现取，401 类拒绝由重连循环自然吃到刷新后的 cookie）。
+ * - 客户端唯一合法消息：`{type:"open",streamId,endpoint,payload}`（exactKeys）与
+ *   `{type:"cancel",streamId}`；本端连上后发一次
+ *   `{type:"open",streamId:"dsh-overlay-<pid>",endpoint:"$events",payload:{args:{}}}`。
+ * - 服务端帧：`{type:"item",streamId,value}`（value=流事件）/{type:"end"}/{type:"error"}；
+ *   $events 首 item value = `{type:"ready",clientId,host:{home}}`（clientId 据此记录）。
+ *   事件 item value：`{type:"waterfall",event,eventId,agentId,request}`（approval/request、
+ *   user-questions/request）与 `{type:"emit",event,args}`（api-session/status 等）。
+ * - 心跳：网关 setInterval 发 WS ping，客户端 pong 缺席会被 terminate——本端 ping→pong 兜底保留。
+ * - 服务端帧恒不掩码；客户端帧（含 open 文本帧）必须掩码。
  *
  * 断线 1s 起步指数退避重连（上限 10s）；close() 终止。onFrame 在客户端线程回调（上层自行 post 主线程）。
  */
@@ -34,6 +40,9 @@ class MuxClient(
     private const val TAG = "dsh-overlay-mux"
     private const val GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
     private const val MAX_FRAME = 8 * 1024 * 1024
+    /** $events 流的 streamId（gateway 仅要求非空字符串；进程唯一即可）。 */
+    private const val STREAM_ID = "dsh-overlay-events"
+    private const val STREAM_OPEN = "{\"type\":\"open\",\"streamId\":\"$STREAM_ID\",\"endpoint\":\"\$events\",\"payload\":{\"args\":{}}}"
   }
 
   @Volatile
@@ -52,7 +61,6 @@ class MuxClient(
 
   private fun loop() {
     var backoff = 1000L
-    var first = true
     while (running) {
       try {
         connectAndServe()
@@ -73,10 +81,14 @@ class MuxClient(
     s.connect(InetSocketAddress(host, port), 3000)
     socket = s
     val key = Base64.encodeToString(ByteArray(16).also { SecureRandom().nextBytes(it) }, Base64.NO_WRAP)
+    // W3：upgrade 同过 connection 鉴权栅栏——握手带浏览器 Cookie（现取，重连吃到刷新后的值）。
+    // 雷区 5：不带 Origin/sec-fetch-site（多余的头反而触发 Host 栅栏交叉校验失败）。
+    val cookie = EngineAuth.attachMux() ?: ""
+    val cookieHeader = if (cookie.isNotEmpty()) "Cookie: $cookie\r\n" else ""
     val out = s.getOutputStream()
     out.write((
       "GET $path HTTP/1.1\r\nHost: $host:$port\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
-        "Sec-WebSocket-Key: $key\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        "Sec-WebSocket-Key: $key\r\nSec-WebSocket-Version: 13\r\n" + cookieHeader + "\r\n"
       ).toByteArray(Charsets.US_ASCII))
     out.flush()
     val ins = BufferedInputStream(s.getInputStream())
@@ -95,7 +107,9 @@ class MuxClient(
     }
     if (!status.contains(" 101")) throw Exception("handshake refused: $status")
     if (accept != expectedAccept(key)) throw Exception("bad sec-websocket-accept")
-    Log.i(TAG, "mux connected")
+    // 连上即 open $events 流（服务端无 open 不会转发任何事件）
+    sendFrame(out, 0x1, STREAM_OPEN.toByteArray(Charsets.UTF_8))
+    Log.i(TAG, "mux connected ($path, \$events open)")
     frameLoop(ins, out)
   }
 
@@ -142,7 +156,7 @@ class MuxClient(
         0x1 -> { textBuf.reset(); textBuf.write(payload); if (fin) emitText() }
         0x0 -> { textBuf.write(payload); if (fin) emitText() }
         0x8 -> { sendFrame(out, 0x8, payload); throw Exception("server close") }
-        0x9 -> sendFrame(out, 0xA, payload) // ping → pong（控制帧，不触发 downlink-only 关闭）
+        0x9 -> sendFrame(out, 0xA, payload) // ping → pong（网关心跳，缺席会被 terminate）
         0xA -> {} // pong：忽略
         else -> {}
       }
@@ -164,7 +178,7 @@ class MuxClient(
     }
   }
 
-  /** 控制帧发送（client→server 必须掩码）。仅 pong/close——绝不发业务帧（downlink-only）。 */
+  /** 客户端帧（open 控制消息/pong/close）——一律掩码。 */
   private fun sendFrame(out: java.io.OutputStream, opcode: Int, payload: ByteArray) {
     try {
       val mask = ByteArray(4).also { SecureRandom().nextBytes(it) }

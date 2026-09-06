@@ -23,7 +23,6 @@ class AndroidBridge(
   private val onImportConfig: () -> String = { """{"ok":false,"error":"bridge not wired"}""" },
   private val onGetSystemDark: () -> Boolean = { false },
   private val onPickImageRequest: (callbackId: String) -> Unit = {},
-  private val onSetTextZoomRequest: (percent: Int) -> Unit = {},
   private val onSetImmersiveRequest: (enable: Boolean) -> Unit = {},
   private val onCopyTextRequest: (text: String) -> Boolean = { false },
   private val pickToken: String? = null,
@@ -86,12 +85,6 @@ class AndroidBridge(
   @JavascriptInterface
   fun pickImage(callbackId: String) {
     onPickImageRequest(callbackId)
-  }
-
-  /** Set the WebView font scale (textZoom, 50–200); called by the Settings → General slider. */
-  @JavascriptInterface
-  fun setTextZoom(percent: Int) {
-    onSetTextZoomRequest(percent)
   }
 
   /** Immersive status bar toggle (true = status bar normally hidden); called by Settings → General. */

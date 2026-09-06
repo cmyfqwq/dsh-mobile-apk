@@ -43,10 +43,18 @@ object EngineProbe {
       conn.connectTimeout = timeoutMs
       conn.readTimeout = timeoutMs
       conn.requestMethod = "GET"
+      // 0.13.3 W2: /api is behind browser auth, but GET / is public (only index
+      // with ?token= exchanges). Sending the cookie when we have one yields a
+      // 200; without it the engine answers 401 — which still proves the HTTP
+      // server is up, so both count as "running" (a 401 must never make the
+      // watchdog kill a healthy engine, decision D3/W2).
+      EngineAuth.attach(conn)
       try {
         val code = conn.responseCode
+        val running = code == 200 || code == 401 || code == 303
         JSONObject()
-          .put("running", code == 200)
+          .put("running", running)
+          .put("auth", if (code == 200) "ok" else "missing")
           .put("latencyMs", System.currentTimeMillis() - start)
       } finally {
         conn.disconnect()

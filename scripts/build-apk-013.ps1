@@ -20,6 +20,22 @@ if ($Fast) {
 # 共用同一份脚本——双仓字节级同版，杜绝雷点 10 单边演进。
 $apkDir = Join-Path $Root "dsh-mobile-apk"
 if (-not (Test-Path $apkDir)) { $apkDir = $Root }
+
+# pi-ai 目录 diff（0.13.3 W1/P2）：baseline -> pin 信息性输出（构建日志 + 报告文件），
+# 删除清单供回归报告引用——不拒绝构建（删除项由 W4 降级补丁兜底）。
+$overlayManifest = Join-Path $Root "scripts\snapshot-config\engine-overlay.json"
+if (Test-Path $overlayManifest) {
+    $ov = Get-Content $overlayManifest -Raw | ConvertFrom-Json
+    if ($ov.catalogDiff -and $ov.pins) {
+        $pinVer = $ov.pins.'@earendil-works/pi-ai'
+        if ($pinVer -and $ov.catalogDiff.baseline) {
+            Write-Host "== pi-ai 目录 diff（$($ov.catalogDiff.baseline) -> $pinVer，信息性）=="
+            node (Join-Path $Root "scripts\pi-catalog-diff.mjs") --from $ov.catalogDiff.baseline --to $pinVer --out (Join-Path $Root ".deploy-tmp\pi-catalog-diff-report.md") 2>&1 | Select-Object -Last 6
+            if ($LASTEXITCODE -ne 0) { Write-Host "pi-ai 目录 diff 执行失败（网络/元数据）——继续构建但回归报告须补跑" }
+        }
+    }
+}
+
 # 版本单一来源：build.gradle.kts（0.13.1 踩坑：硬编码 out\v0.13.0 与 $ver 会让纯净版产物错误命名旧版本）
 $GradleVer = (Select-String -Path (Join-Path $apkDir "app\build.gradle.kts") -Pattern 'versionName = "([^"]+)"').Matches[0].Groups[1].Value
 $Out = Join-Path $Root ("out\v" + $GradleVer)
@@ -45,6 +61,11 @@ foreach ($abi in @('arm64', 'x86_64')) {
     $work = Join-Path $Root ".deploy-tmp\build-\13-$abi"
     New-Item -ItemType Directory -Force -Path $work | Out-Null
 
+    # 1b. 引擎 overlay 抽验门禁（0.13.3 W1）：登记表在快照内全量落位（版本精确断言 + presets 在场）
+    Write-Host "== 引擎 overlay 抽验（$abi）=="
+    node (Join-Path $Root "scripts\check-engine-overlay.mjs") $snap 2>&1
+    if ($LASTEXITCODE -ne 0) { Write-Host "引擎 overlay 抽验失败，拒绝打包（$abi）"; continue }
+
     # 1. 插件注入（@dsh-android 专用 + 通用根级包）
     if (-not $SkipInject) {
         New-Item -ItemType Directory -Force -Path (Join-Path $Root ".deploy-tmp\plugins") | Out-Null
@@ -54,8 +75,12 @@ foreach ($abi in @('arm64', 'x86_64')) {
         # marketplace 注入源：vendor/dshmarketplace-plugin（固化修复版，见其 PATCHES.md——
         # 上游 0.1.5 pre-execute 守卫不调 next() 导致全工具崩溃；build 前强制校验修复在场）
         $market = Join-Path $Root "vendor\dshmarketplace-plugin"
+        # model-sync 注入源（0.13.3 W7）：vendor/dsh-model-sync（@aiwayds/dsh-model-sync 0.3.1
+        # 固化副本，MIT；ZCode 式隐式模型补给，见其 PATCHES.md）
+        $modelSync = Join-Path $Root "vendor\dsh-model-sync"
         if (-not (Test-Path (Join-Path $undo "package.json"))) { Write-Host "缺 undo 注入源 $undo（git clone lire1131/dsh-undo-savepoint）"; continue }
         if (-not (Test-Path (Join-Path $market "package.json"))) { Write-Host "缺 marketplace 注入源 $market（vendor 固化副本）"; continue }
+        if (-not (Test-Path (Join-Path $modelSync "lib\index.js"))) { Write-Host "缺 model-sync 注入源 $modelSync（vendor 固化副本）"; continue }
         # 统一补丁门禁（Phase 2a）：marketplace A-D + undo E1-E7 幂等施加与校验，
         # 登记表 scripts/patches/registry.json。默认 ensure 语义（缺席即施加，锚点失配拒打包）。
         # 雷点 8：全量输出——Select-First 截断管道会杀 node 致误判失败
@@ -65,11 +90,11 @@ foreach ($abi in @('arm64', 'x86_64')) {
         # 为一次 tar 流处理——压缩/解压从 ×4 → ×1（原三步各自全量重压缩 ~743MB）。
         # 雷点 8：全量输出。
         Write-Host "== 单 pass 注入（@dsh-android + undo/market + 权威 patch）（$abi）=="
-        python (Join-Path $Root "scripts\inject-all.py") $snap (Join-Path $work "snap-final2.tar.xz") (Join-Path $Root "scripts\profile-web.cordis.patch.yml") --dsh-android @pluginDirs --external $undo $market 2>&1
+        python (Join-Path $Root "scripts\inject-all.py") $snap (Join-Path $work "snap-final2.tar.xz") (Join-Path $Root "scripts\profile-web.cordis.patch.yml") --dsh-android @pluginDirs --external $undo $market $modelSync 2>&1
         if ($LASTEXITCODE -ne 0) { Write-Host "注入失败，拒绝打包（$abi）"; continue }
         # 防回归（审校 C4 2026-08-23）：patch 挂载集 ⊇ 注入集——缺条目（如 linux-env 漏挂）直接拒打包
         Write-Host "== 挂载集校验（$abi）=="
-        node (Join-Path $Root "scripts\check-patch-mounts.mjs") (Join-Path $Root "scripts\profile-web.cordis.patch.yml") @pluginDirs $undo $market 2>&1 | Select-Object -First 4
+        node (Join-Path $Root "scripts\check-patch-mounts.mjs") (Join-Path $Root "scripts\profile-web.cordis.patch.yml") @pluginDirs $undo $market $modelSync 2>&1 | Select-Object -First 4
         if ($LASTEXITCODE -ne 0) { Write-Host "patch 挂载集校验失败，拒绝打包（$abi）"; continue }
         $snapIn = Join-Path $work "snap-final2.tar.xz"
     } else {

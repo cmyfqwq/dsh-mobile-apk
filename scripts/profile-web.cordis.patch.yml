@@ -100,3 +100,11 @@
 - insert:
     - id: picker-native-surface
       name: '@deepseek-ai/dsh-client-ui-directory-picker-native'
+
+# 隐式模型同步（0.13.3 W7，决策台账 D4-P3/D5）：vendor/dsh-model-sync（@aiwayds/dsh-model-sync
+# 0.3.1 固化副本，MIT）——启动+5s 首跑/240min 定时轮/设置变更重臂；pi.dev 目录抓取 → 翻译门控
+# → settings.mutate 写回 llm-pi-ai（store-first/字段级 merge/静默失败），ZCode 式隐式补给。
+# 断网零破坏；W4 pi-drift-F1 降级补丁与其互为犄角（显式列表不可服务时单模型缺席而非整包死）。
+- insert:
+    - id: dsh-model-sync
+      name: '@aiwayds/dsh-model-sync'

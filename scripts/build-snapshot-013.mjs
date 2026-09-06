@@ -106,6 +106,130 @@ for (const dir of STRIP.runtimeDirs) {
 wsl(`find "${wslPath(DH)}" -name '*.map' -delete 2>/dev/null || true`)
 const U = join(STAGE, 'root', 'usr')
 
+// ── 0e. 引擎升级 overlay（0.13.3 W1）：0.1.1-rc.2 → 0.1.2-rc.1 构建期逐包覆盖 ──
+// 机制（可行性报告 §3.1 方案一，用户拍板 D2）：npm 别名包装不出完整引擎（核心包在
+// devDependencies，已实证），设备基座继承旧引擎树 → 构建期按 engine-overlay.json 登记表
+// 逐包拉 tgz 覆盖进 stage 的引擎 node_modules。登记表数据面：
+//   rootPackage = 引擎别名包本体（lib/bin.js + package.json；整树宿主，只换 lib 不动 node_modules）
+//   packages    = @deepseek-ai 域逐包覆盖（旧树 191 重发布 + 新组合 29 包）
+//   vendorTop   = 顶层新增第三方闭包缺口（compression/undici/resolve.exports 等）
+//   nested      = 嵌套进宿主包 node_modules 的第三方依赖（lexical/@octokit/ACP/xterm 系）
+//   pins        = @earendil-works/pi-ai 精确 pin（P2 目录漂移防护，升级须跑 pi-catalog-diff）
+//   keepUnpublished = 未重发布包（树内保留旧版原样）
+// tgz 经 npm 镜像链拉取 + sha512 校验，缓存 .deploy-tmp/engine-overlay/（幂等）。
+// ⚠️ 双份构建脚本（协调仓 + apk 仓云端副本）必须同改，禁止单边演进（AGENTS.md 雷点 10）。
+log('引擎 overlay：0.1.2-rc.1 逐包覆盖…')
+const OVERLAY = JSON.parse(readCfg('engine-overlay.json'))
+const ENGINE_ROOT_STAGE = join(STAGE, 'root', 'usr/lib/node_modules/@deepseek-ai/dsh')
+const ENGINE_NM_STAGE = join(ENGINE_ROOT_STAGE, 'node_modules')
+const OVERLAY_CACHE = join(ROOT, '.deploy-tmp', 'engine-overlay')
+const OVERLAY_MIRRORS = PREINSTALL.npmMirrors
+let overlayOk = 0
+const overlayTgz = async (name, version) => {
+  const dest = join(OVERLAY_CACHE, `${name.replace('@', '').replace('/', '-')}-${version}.tgz`)
+  if (existsSync(dest)) return dest
+  mkdirSync(OVERLAY_CACHE, { recursive: true })
+  let meta = null
+  for (const m of OVERLAY_MIRRORS) {
+    try {
+      const r = await fetch(`${m}/${name}`, { signal: AbortSignal.timeout(30000) })
+      if (!r.ok) continue
+      meta = await r.json()
+      break
+    } catch { /* 下一镜像 */ }
+  }
+  const dist = meta?.versions?.[version]?.dist
+  if (!dist) throw new Error(`overlay 元数据不可得: ${name}@${version}`)
+  const buf = Buffer.from(await (await fetch(dist.tarball, { signal: AbortSignal.timeout(300000) })).arrayBuffer())
+  if (dist.sha512 && createHash('sha512').update(buf).digest('base64') !== dist.sha512) {
+    throw new Error(`overlay sha512 不匹配: ${name}@${version}`)
+  }
+  writeFileSync(dest, buf)
+  return dest
+}
+// 树内路径：scoped 包落在 node_modules/<scope>/<name>（基座实证 @deepseek-ai 域有嵌套 scope 目录）
+const overlayPkgDir = (name, base = ENGINE_NM_STAGE) => {
+  if (name.startsWith('@')) {
+    const [scope, short] = name.split('/')
+    return join(base, scope, short)
+  }
+  return join(base, name)
+}
+// 整目录替换 + 保留旧包内嵌套 node_modules（react/@tanstack、chokidar、pi-ai otel 三处先例——
+// npm publish 不含 node_modules，直接 rm 会连带删掉安装期解析出的嵌套依赖）。
+const overlayExtract = async (name, version, targetDir) => {
+  const tgz = await overlayTgz(name, version)
+  const oldNm = join(targetDir, 'node_modules')
+  const savedNm = targetDir + '.__nm_saved'
+  if (existsSync(oldNm)) {
+    wsl(`rm -rf "${wslPath(savedNm)}" && mv "${wslPath(oldNm)}" "${wslPath(savedNm)}"`)
+  }
+  wsl(`rm -rf "${wslPath(targetDir)}" && mkdir -p "${wslPath(targetDir)}" && tar -xzf "${wslPath(tgz)}" -C "${wslPath(targetDir)}" --strip-components=1 && chmod -R u+rwX "${wslPath(targetDir)}"`)
+  if (existsSync(savedNm)) {
+    wsl(`mkdir -p "${wslPath(oldNm)}" && (mv "${wslPath(savedNm)}"/* "${wslPath(oldNm)}"/ 2>/dev/null || true) && rm -rf "${wslPath(savedNm)}"`)
+  }
+  overlayOk++
+}
+try {
+  for (const [name, version] of Object.entries(OVERLAY.packages)) {
+    await overlayExtract(name, version, overlayPkgDir(name))
+  }
+  log(`  packages 覆盖: ${overlayOk}`)
+  for (const [name, version] of Object.entries(OVERLAY.vendorTop ?? {})) {
+    await overlayExtract(name, version, overlayPkgDir(name))
+  }
+  for (const [host, children] of Object.entries(OVERLAY.nested ?? {})) {
+    for (const [name, version] of Object.entries(children)) {
+      const hostDir = join(overlayPkgDir(host), 'node_modules')
+      await overlayExtract(name, version, overlayPkgDir(name, hostDir))
+    }
+  }
+  for (const [name, version] of Object.entries(OVERLAY.pins ?? {})) {
+    await overlayExtract(name, version, overlayPkgDir(name))
+    log(`  pin: ${name}@${version}（P2，升级须跑 pi-catalog-diff）`)
+  }
+  // 根包本体：只换 lib/ 与 package.json（node_modules 子树=全引擎依赖，绝不可动）
+  {
+    const root = OVERLAY.rootPackage
+    const tgz = await overlayTgz(root.name, root.version)
+    wsl(`rm -rf "${wslPath(join(ENGINE_ROOT_STAGE, 'lib'))}" "${wslPath(join(ENGINE_ROOT_STAGE, 'README.md'))}" 2>/dev/null || true; tar -xzf "${wslPath(tgz)}" -C "${wslPath(ENGINE_ROOT_STAGE)}" --strip-components=1 && chmod -R u+rwX "${wslPath(ENGINE_ROOT_STAGE)}"`)
+    log(`  rootPackage: ${root.name}@${root.version}`)
+  }
+  const pj = JSON.parse(readFileSync(join(ENGINE_ROOT_STAGE, 'package.json'), 'utf8'))
+  if (pj.version !== OVERLAY.engineVersion) throw new Error(`根包版本 ${pj.version} != 登记表 ${OVERLAY.engineVersion}`)
+  log(`引擎 overlay 完成（${overlayOk + 1} 包，引擎树 @ ${pj.version}）`)
+} catch (e) {
+  console.error(`[引擎 overlay 失败——快照不可发布] ${e?.stack ?? String(e)}`)
+  process.exit(1)
+}
+// keepUnpublished 断言：登记表内包必须仍在树内（防未来误删）
+for (const entry of OVERLAY.keepUnpublished ?? []) {
+  const name = entry.replace(/ \(.+\)$/, '')
+  if (!existsSync(join(overlayPkgDir(name), 'package.json'))) {
+    console.error(`[引擎 overlay 断言失败] keepUnpublished 包不在树内: ${name}`)
+    process.exit(1)
+  }
+}
+
+// ── 0f. 引擎树补丁（0.13.3 W4）：llm-pi-ai 目录漂移降级（scope=engine）──
+// 对 stage 施加 scripts/patches 登记表内全部 engine scope 补丁（幂等 + 锚点校验，
+// 失败拒打包）。vendor scope 补丁归 build-apk-013.ps1（vendor 目录），两处 scope 互不越界。
+// ⚠️ 双份构建脚本必须同改（雷点 10）。
+{
+  const stageRoot = join(STAGE, 'root')
+  log('施加引擎树补丁（pi-drift-F1，apply-patches --scope engine）…')
+  const script = join(ROOT, 'scripts', 'patches', 'apply-patches.mjs')
+  const out = execSync(`node "${script}" "${stageRoot}" --apply --scope engine`, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+  process.stdout.write(out)
+  // 施加后复查（防 exit 0 但补丁缺席的半成品）
+  const piAiIndex = join(overlayPkgDir('@deepseek-ai/dsh-llm-pi-ai', join(stageRoot, 'usr/lib/node_modules/@deepseek-ai/dsh/node_modules')), 'lib', 'index.js')
+  if (!existsSync(piAiIndex) || !readFileSync(piAiIndex, 'utf8').includes('dsh-mobile drift guard')) {
+    console.error('[引擎树补丁断言失败] pi-drift marker 不在场——快照不可发布')
+    process.exit(1)
+  }
+  log('引擎树补丁就位（pi-drift marker 在场）')
+}
+
 // ── 1. Termux 索引（镜像回退链 + 404/超时快速失败）──
 async function fetchMirror(path, timeoutMs = 20000) {
   let lastErr

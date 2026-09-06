@@ -111,6 +111,8 @@ class MainActivity : ComponentActivity() {
 
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
+    // 0.13.3 W2：引擎鉴权模块绑定应用上下文（EngineProbe 等 object 调用方的 cookie 来源）。
+    EngineAuth.initContext(this)
     // 崩溃标记：进程级未捕获异常写入 filesDir/.crashed（下次启动测试界面
     // 提示），随后交回默认 handler——只记录，不吞异常、不阻止崩溃。
     installCrashMarker()
@@ -323,8 +325,7 @@ class MainActivity : ComponentActivity() {
       // 禁用 HTTP 缓存：杜绝 WebView 命中旧 index/旧 bundle 造成"卡 loading 且
       // 无诊断层"（缓存页里没有页面看门狗；荣耀/MagicUI 实测类问题）。
       cacheMode = WebSettings.LOAD_NO_CACHE
-      // 字体大小（设置 → 通用设置）：从本地持久化恢复，不依赖页面缓存。
-      textZoom = textZoomPrefs().coerceIn(50, 200)
+      // 0.13.3：textZoom 持久化退役（D6 收益省略）——上游 ui-theme fontSize 原生管内容字号。
       // prefers-color-scheme 跟随系统深色（某些厂商 WebView 默认不跟随；
       // FORCE_DARK_AUTO 让 media query 反映系统深浅，dsh 的"跟随系统"主题依赖它）。
       if (Build.VERSION.SDK_INT >= 29) {
@@ -406,7 +407,6 @@ class MainActivity : ComponentActivity() {
             android.content.res.Configuration.UI_MODE_NIGHT_YES
         },
         onPickImageRequest = { callbackId -> mediaPickerController.pickImageForBridge(callbackId) },
-        onSetTextZoomRequest = { percent -> setTextZoomPersisted(percent) },
         onSetImmersiveRequest = { enable -> setImmersivePersisted(enable) },
         onCopyTextRequest = { text -> copyTextNative(text) },
         pickToken = pickToken,
@@ -455,30 +455,25 @@ class MainActivity : ComponentActivity() {
       ),
       "androidBridge",
     )
-    webView.loadUrl(EngineProbe.ENGINE_URL)
-  }
-
-  /** 字体大小持久化读取（设置 → 通用设置 滑块；默认 100）。 */
-  private fun textZoomPrefs(): Int {
-    return try {
-      getSharedPreferences("dsh_settings", MODE_PRIVATE).getInt("text_zoom", 100)
-    } catch (_: Exception) {
-      100
+    // 0.13.3 W2：引擎 /api 全前缀走浏览器鉴权（401）。WebView 首屏先换好 cookie：
+    // Kotlin 侧 P0（engine.log token 交换）/P1（credentials 密钥自 mint）拿到 cookie 后
+    // 注入 CookieManager——同源 XHR/WS 自动携带；交换失败时回退带 token 的 URL 让引擎
+    // 303+Set-Cookie 自愈（官方交换路径）。
+    val authCookie = EngineAuth.refresh(this)
+    if (authCookie != null) {
+      try {
+        android.webkit.CookieManager.getInstance().setCookie(EngineProbe.ENGINE_URL, authCookie)
+      } catch (t: Throwable) {
+        Log.w("dsh-engine-auth", "CookieManager injection failed: " + t.message)
+      }
+      webView.loadUrl(EngineProbe.ENGINE_URL)
+    } else {
+      val token = EngineAuth.tokenFromLog(this)
+      webView.loadUrl(if (token != null) EngineProbe.ENGINE_URL + "/?token=" + token else EngineProbe.ENGINE_URL)
     }
   }
 
-  /** 字体大小设置（WebView textZoom）+ 持久化，重启/缓存刷新后仍生效。 */
-  private fun setTextZoomPersisted(percent: Int) {
-    val p = percent.coerceIn(50, 200)
-    // JS 桥在 JavaBridge 线程调用；WebView 方法必须切回主线程。
-    runOnUiThread { webView.settings.textZoom = p }
-    try {
-      getSharedPreferences("dsh_settings", MODE_PRIVATE).edit().putInt("text_zoom", p).apply()
-      Log.i("dsh-image", "textZoom set: " + p)
-    } catch (e: Exception) {
-      Log.e("dsh-image", "textZoom persist failed: " + e.message)
-    }
-  }
+  /** 0.13.3：textZoom 桥与持久化退役（D6）——上游 ui-theme fontSize 原生覆盖字体调节。 */
 
   /**
    * 原生剪贴板写入（WebView 的 Clipboard API 在 Android 上被拒

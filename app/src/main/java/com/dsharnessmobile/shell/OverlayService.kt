@@ -426,6 +426,31 @@ class OverlayService : Service() {
     return true
   }
 
+  // ── 官方忙态锚点（0.13.3 D6/W3） ─────────────────────────────────
+
+  /**
+   * api-session/status emit（$events 流，args=[agentId, running]）——引擎 agent 运行态
+   * 官方信号，取代旧 bridge turn_start 专门行（0.1.4 起退役）。running=true 即确认
+   * 乐观忙态（optimisticBusyAt 清零）；running=false 等价 turn_end 回空闲。
+   * 会话感知与 live 流一致：无目标会话=全部接受，有目标=仅该会话。
+   */
+  internal fun applyAgentStatus(agentId: String, running: Boolean) {
+    val targeted = activeSessionId.isEmpty() || agentId == activeSessionId
+    if (!targeted) return
+    if (running) {
+      optimisticBusyAt = 0L
+      if (!sessionBusy) { sessionBusy = true; turnStartedAt = System.currentTimeMillis() }
+      setHalo(Halo.WORKING)
+    } else {
+      optimisticBusyAt = 0L
+      sessionBusy = false
+      toolCount = 0
+      currentToolName = ""; currentToolSummary = ""
+      setHalo(deriveHalo())
+    }
+    if (expanded) panel.updateBallOnly() else updateBallOnly()
+  }
+
   // ── 引擎探活（引擎维，应用级） ────────────────────────────────────
 
   private fun probeEngine() {
@@ -465,16 +490,28 @@ class OverlayService : Service() {
           .put("rpcId", "overlay-" + System.currentTimeMillis())
           .put("method", method)
           .put("payload", payload)
-        val conn = URL("http://127.0.0.1:3080/api/" + method).openConnection(java.net.Proxy.NO_PROXY) as HttpURLConnection
-        conn.requestMethod = "POST"
-        conn.doOutput = true
-        conn.connectTimeout = 3000
-        conn.readTimeout = 8000
-        conn.setRequestProperty("content-type", "application/json")
-        conn.outputStream.use { it.write(envelope.toString().toByteArray(Charsets.UTF_8)) }
-        code = conn.responseCode
-        body = conn.inputStream.bufferedReader().use { it.readText() }
-        conn.disconnect()
+        code = -1
+        // 0.13.3 W2: one cookie round-trip — on 401 refresh the cookie and retry once.
+        for (attempt in 0..1) {
+          val conn = URL("http://127.0.0.1:3080/api/" + method).openConnection(java.net.Proxy.NO_PROXY) as HttpURLConnection
+          conn.requestMethod = "POST"
+          conn.doOutput = true
+          conn.connectTimeout = 3000
+          conn.readTimeout = 8000
+          conn.setRequestProperty("content-type", "application/json")
+          EngineAuth.attach(applicationContext, conn)
+          conn.outputStream.use { it.write(envelope.toString().toByteArray(Charsets.UTF_8)) }
+          code = conn.responseCode
+          if (code == 401 && attempt == 0) {
+            conn.disconnect()
+            EngineAuth.handleUnauthorized(applicationContext)
+            continue
+          }
+          body = (if (code in 200..299) conn.inputStream else conn.errorStream)
+            ?.bufferedReader()?.use { it.readText() } ?: ""
+          conn.disconnect()
+          break
+        }
       } catch (e: Exception) {
         code = -1; body = e.message ?: "网络异常"
       }

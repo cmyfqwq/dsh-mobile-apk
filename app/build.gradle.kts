@@ -14,13 +14,15 @@ android {
     // (the embedded engine, bash, and every child command would need linker64
     // wrappers); 34 keeps native exec working on Android 15/16 devices.
     targetSdk = 34
-    // 0.13.2：versionCode 29（功能面：ADB 2.0 语义控件工具 + 内嵌 ADB 输入通道 IME +
-    // 悬浮球 v2（纯黑白球/光环/合体矩形/deep diving/插话）+ 市场移动兼容徽章 +
-    // #118 引擎探活/启动五项修复 + #120 工作区分代放行；覆盖安装 0.13.2-preview(28)）。
-    versionCode = 29
+    // 0.13.3：versionCode 30（功能面：引擎 0.1.2-rc.1 overlay（决策 D1/D2）+ /api 浏览器鉴权
+    // P0 token 交换 + P1 自 mint cookie（D3）+ MuxClient /api/remote.mux 传输面重做 +
+    // api-session/status 官方忙态锚点 + llm-pi-ai 目录漂移降级补丁（D4-P1）+ pi-ai 0.85.1 pin +
+    // 隐式模型同步插件 dsh-model-sync（D5）+ withResolvers polyfill（D7）+ 字体滑杆退役（D6）；
+    // 覆盖安装 0.13.2(29)）。
+    versionCode = 30
     // Snapshot builds append a suffix (e.g. -SN-1-RC8) via -PversionNameSuffix; release builds pass none.
     val snapshotSuffix = providers.gradleProperty("versionNameSuffix").getOrElse("")
-    versionName = "0.13.2" + snapshotSuffix
+    versionName = "0.13.3" + snapshotSuffix
     buildConfigField("String", "TERMUX_VERSION", "\"0.118.3\"")
   }
 

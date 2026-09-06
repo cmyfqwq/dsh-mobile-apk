@@ -640,12 +640,10 @@ export function apply(ctx: Context, config: Record<string, unknown> = {}) {
       const s = String(sess?.id ?? '')
       const t = Date.now()
       const k = ev.type ?? ''
-      if (k === 'turn/start') {
-        // 轮次启动（0.1.3）：悬浮球壳侧的忙态锚点——此前 live 流只有 tool_call/turn_end，
-        // 发送/插话/WebView 提问续跑到首个工具调用之间壳侧完全失聪（面板误显「空闲」）。
-        appendLive(JSON.stringify({ t, s, k: 'turn_start' }) + '\n')
-        return
-      }
+      // 0.1.4（0.13.3 D6/W3）：turn/start 专门行退役——壳侧忙态改消费官方
+      // api-session/status（agent/status → running 布尔，经 $events 流转发），
+      // 语义等价且覆盖所有起轮路径；.live.ndjson 仅保留工具名 chip 所需的
+      // tool_call/tool_result（壳侧保留 turn_start 行处理兼容旧包在装）。
       if (k === 'tool/call') {
         const d = ev.data as { name?: string; arguments?: string; callId?: string }
         const args = String(d.arguments ?? '').slice(0, 240)

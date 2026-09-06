@@ -88,16 +88,34 @@ internal class DownloadSaver(private val activity: MainActivity, private val dsh
       var conn: HttpURLConnection? = null
       try {
         // #118：本地引擎端点的下载（session.export）同样必须绕过系统代理直连。
-        val c = URL(url).openConnection(java.net.Proxy.NO_PROXY) as HttpURLConnection
-        conn = c
-        c.connectTimeout = 15_000
-        c.readTimeout = 60_000
-        c.requestMethod = "GET"
-        if (c.responseCode != HttpURLConnection.HTTP_OK) {
-          throw java.io.IOException("HTTP " + c.responseCode)
+        // 0.13.3 W2：/api/session.* 走浏览器鉴权——带 Cookie，401 自愈换一次后重试。
+        var c: HttpURLConnection
+        var code = -1
+        var stream: java.io.InputStream? = null
+        for (attempt in 0..1) {
+          c = URL(url).openConnection(java.net.Proxy.NO_PROXY) as HttpURLConnection
+          conn = c
+          c.connectTimeout = 15_000
+          c.readTimeout = 60_000
+          c.requestMethod = "GET"
+          EngineAuth.attach(activity.applicationContext, c)
+          code = c.responseCode
+          if (code == 401 && attempt == 0) {
+            EngineAuth.handleUnauthorized(activity.applicationContext)
+            conn?.disconnect()
+            continue
+          }
+          if (code != HttpURLConnection.HTTP_OK) {
+            throw java.io.IOException("HTTP " + code)
+          }
+          stream = c.inputStream
+          break
+        }
+        if (code != HttpURLConnection.HTTP_OK || stream == null) {
+          throw java.io.IOException("HTTP $code")
         }
         var saved: String? = null
-        c.inputStream.use { input ->
+        stream.use { input ->
           saved = saveExportToDshData(filename, input)
         }
         val finalPath = saved

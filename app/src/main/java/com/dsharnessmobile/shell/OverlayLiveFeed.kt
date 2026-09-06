@@ -33,12 +33,13 @@ class OverlayLiveFeed(private val svc: OverlayService) {
           try {
             val v = File(dir, ".overlay-test-pending").readText().trim()
             svc.main.post {
-              val rpcId = "test-" + System.currentTimeMillis()
+              val eventId = "test-" + System.currentTimeMillis()
               when (v) {
-                "approval" -> svc.panel.pendingApprovals[rpcId] = PendingApproval(rpcId, svc.activeSessionId, "ap-test", "bash", "rm -rf build/ 需要审批（debug 注入）")
+                // 0.13.3 W3 帧形：合成 $events waterfall 副本（eventId/agentId 字段）
+                "approval" -> svc.panel.pendingApprovals[eventId] = PendingApproval(eventId, svc.activeSessionId, "bash", "rm -rf build/ 需要审批（debug 注入）")
                 "question" -> {
                   val items = org.json.JSONArray("""[{"id":"q1","header":"简单问题1","question":"现在是白天还是晚上？","options":[{"label":"白天","description":"现在不在晚上"},{"label":"晚上","description":"现在是晚上"}],"multiSelect":false},{"id":"q2","header":"简单问题2","question":"要重试 TLS 同步吗（debug 注入）？","options":[{"label":"立即重试"},{"label":"稍后"}],"multiSelect":false}]""")
-                  svc.panel.pendingQuestions[rpcId] = PendingQuestion(rpcId, svc.activeSessionId, items)
+                  svc.panel.pendingQuestions[eventId] = PendingQuestion(eventId, svc.activeSessionId, items)
                 }
                 else -> { svc.panel.pendingApprovals.clear(); svc.panel.pendingQuestions.clear() }
               }

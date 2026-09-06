@@ -165,8 +165,7 @@ const IMPLS = {
   },
 
   // ── dsh-undo-savepoint E1-E7（0.3.8 移动端裁剪，字节级锚点）──
-  'undo-E1': {
-    file: 'dsh-undo-savepoint/lib/client.js',
+  'undo-E1': {    file: 'dsh-undo-savepoint/lib/client.js',
     // 移除类：标记不存在 = 已应用
     check: (s) => !s.includes('size: 14 }), t("snapshots")]'),
     apply: (s) => {
@@ -248,6 +247,56 @@ const IMPLS = {
       return s.slice(0, a) + 'gap:5px;white-space:nowrap;flex:none;max-width:30vw;overflow:hidden;text-overflow:ellipsis}.u_badge:hover' + s.slice(a + anchor.length)
     },
   },
+
+  // ── pi-drift-F1：llm-pi-ai 目录漂移降级（0.13.3 W4，引擎树补丁 scope=engine）──
+  // 不变量（用户拍板）：单条过期模型 id 或一条未描述路由，永远不能再打死整个 llm-pi-ai。
+  // 三处致命 invalid()（整包拒绝）降级为告警+跳过：override 未知 id/未知路由 → continue 丢该条；
+  // 路由零模型 → resolveRouteModels 返回 skipped 标记，调用方 continue 跳过该 provider。
+  // 锚点随引擎升级重验（0.1.2-rc.1 dsh-llm-pi-ai/lib/index.js）。
+  'pi-drift-F1': {
+    file: 'usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-llm-pi-ai/lib/index.js',
+    scope: 'engine',
+    check: (s) => [
+      'override skipped (dsh-mobile drift guard)',
+      'route skipped (dsh-mobile drift guard)',
+      'if (catalog.skipped) continue;',
+    ].every((m) => s.includes(m)),
+    apply: (s) => {
+      const REPL = [
+        // F1-a：路由整体不在目录（defaults.size === 0）时的 override → 跳过该条
+        {
+          old: 'if (defaults.size === 0) invalid(provider, `sets modelOverrides for "${id}", but the installed catalog does not describe this route; a declared route spells every model out in its models list`);',
+          neu: 'if (defaults.size === 0) { console.warn(`llm-pi-ai: provider "${provider}" sets modelOverrides for "${id}", but the installed catalog does not describe this route; override skipped (dsh-mobile drift guard)`); continue; }',
+        },
+        // F1-b：override 引用目录中不存在的模型 id → 跳过该条（路由保留目录默认模型）
+        {
+          old: 'if (!defaults.has(id)) invalid(provider, `modelOverrides names "${id}", which the installed catalog does not describe`);',
+          neu: 'if (!defaults.has(id)) { console.warn(`llm-pi-ai: provider "${provider}" modelOverrides names "${id}", which the installed catalog does not describe; override skipped (dsh-mobile drift guard)`); continue; }',
+        },
+        // F1-c：路由零模型 → 告警 + skipped 标记返回（不再 throw）
+        {
+          old: 'if (entries.length === 0) invalid(provider, "resolves no models; the installed catalog does not describe this route, so its models must be listed in configuration");',
+          neu: 'if (entries.length === 0) { console.warn("llm-pi-ai: provider \\"" + provider + "\\" resolves no models; the installed catalog does not describe this route, so its models must be listed in configuration; route skipped (dsh-mobile drift guard)"); return { models: [], configuredMaxTokens: /* @__PURE__ */ new Map(), skipped: true }; }',
+        },
+        // F1-d：调用方（resolveProfiles）消费 skipped 标记 → 跳过该 provider，其余路由照常
+        {
+          old: 'const { apiKeyEnv, retryPolicy, models: _models, displayName: _displayName, ...rest } = source;',
+          neu: 'if (catalog.skipped) continue;\n\t\tconst { apiKeyEnv, retryPolicy, models: _models, displayName: _displayName, ...rest } = source;',
+        },
+      ]
+      let changed = 0
+      for (const { old, neu } of REPL) {
+        if (s.includes(neu)) continue // 幂等（重复施加无害）
+        if (!s.includes(old)) throw new Error('pi-drift 锚点未命中：' + old.slice(0, 80) + '…——引擎升级后请人工核对 resolveRouteModels')
+        s = s.replace(old, neu)
+        changed++
+      }
+      const ok = ['override skipped (dsh-mobile drift guard)', 'route skipped (dsh-mobile drift guard)', 'if (catalog.skipped) continue;'].every((m) => s.includes(m))
+      if (!ok) throw new Error('pi-drift 复核失败——不写回')
+      console.log(`  pi-drift-F1: ${changed} 处锚点替换`)
+      return s
+    },
+  },
 }
 
 // ── 登记表 ↔ 实现 交叉校验（漂移即拒）──
@@ -267,12 +316,19 @@ const flags = argv.slice(1)
 const mode = flags.includes('--apply') ? 'apply' : flags.includes('--list') ? 'list' : 'check'
 const onlyIdx = flags.indexOf('--only')
 const only = onlyIdx >= 0 ? flags[onlyIdx + 1].split(',').map((s) => s.trim()) : null
-if (!vendorRoot || flags.some((f) => f.startsWith('-') && !['--check', '--apply', '--list', '--only'].includes(f))) {
-  console.error('用法: node scripts/patches/apply-patches.mjs <vendorRoot> [--check|--apply|--list] [--only id1,id2]')
+const scopeIdx = flags.indexOf('--scope')
+const scope = scopeIdx >= 0 ? flags[scopeIdx + 1] : 'vendor'
+if (!['vendor', 'engine', 'all'].includes(scope)) {
+  console.error('--scope 仅支持 vendor | engine | all（vendor=vendored plugins；engine=快照引擎树，build-snapshot 用）')
+  process.exit(2)
+}
+const scopeOf = (p) => p.scope ?? 'vendor'
+if (!vendorRoot || flags.some((f) => f.startsWith('-') && !['--check', '--apply', '--list', '--only', '--scope'].includes(f))) {
+  console.error('用法: node scripts/patches/apply-patches.mjs <vendorRoot|stageRoot> [--check|--apply|--list] [--only id1,id2] [--scope vendor|engine|all]')
   process.exit(2)
 }
 
-const order = registry.patches.map((p) => p.id).filter((id) => !only || only.includes(id))
+const order = registry.patches.filter((p) => scope === 'all' || scopeOf(p) === scope).map((p) => p.id).filter((id) => !only || only.includes(id))
 if (mode === 'list') {
   for (const p of registry.patches) {
     const status = p.soft ? 'soft' : 'gate'

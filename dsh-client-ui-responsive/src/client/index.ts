@@ -205,11 +205,11 @@ export function apply(ctx: ClientContext): void {
     children: { 'settings.dev.item': { kind: 'list', scope: 'root' } },
   }, DevSection))
 
-  // Android general-settings rows (issue #59): font-size slider + immersive
-  // status-bar toggle. The upstream General section lost these two rows; the
-  // shell bridges (setTextZoom / setImmersiveMode) exist and persist, the UI
-  // never called them. Registered into settings.general.item with a low order
-  // so the rows appear after the built-in items.
+  // Android general-settings rows (issue #59): immersive status-bar toggle.
+  // 0.13.3 (D6): the font-size slider retired — upstream ui-theme fontSize
+  // (12–17px) covers it natively; the shell's setTextZoom bridge is gone.
+  // The setImmersiveMode shell bridge persists, the UI registers the row at
+  // settings.general.item with a low order so it appears after the built-ins.
   ctx.slots.inject('settings.general.item', () => ctx.slots.register({
     name: 'settings.general.item',
     id: 'android-general',

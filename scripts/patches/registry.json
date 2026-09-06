@@ -85,6 +85,14 @@
       "summary": "徽章宽度封顶（max-width:30vw + 省略号，新增类）",
       "provenance": "0.13.0 真机适配（双保险）",
       "marker": "gap:5px;white-space:nowrap;flex:none;max-width:30vw（存在=已应用）"
+    },
+    {
+      "id": "pi-drift-F1",
+      "target": "usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-llm-pi-ai/lib/index.js",
+      "scope": "engine",
+      "summary": "llm-pi-ai 目录漂移降级：三处致命 invalid() 改告警+跳过（override 未知 id/未知路由丢该条；零模型路由 skipped 由调用方 continue），单条过期 id 永远打不死整包",
+      "provenance": "0.13.3 W4（0.1.2-rc.1 锚点；构建期由 build-snapshot 0f 步对 stage 施加，check-engine-overlay 门禁抽验 marker）",
+      "marker": "dsh-mobile drift guard（存在=已应用）"
     }
   ]
 }
