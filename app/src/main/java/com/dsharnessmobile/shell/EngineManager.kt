@@ -393,14 +393,16 @@ class EngineManager(private val context: Context, private val pickToken: String?
    * Runtime patches: overlay fix files from assets/patched onto the corresponding snapshot
    * locations (idempotent). Overlayed fixes (all marked by a sentinel string in the target file,
    * so they are re-applied automatically after a snapshot refresh/re-extract):
-   *  - primitives-index.js: clipboard fallback for WebViews where navigator.clipboard is denied
-   *  - attachment-local-index.js: Android link(2) blocked by sepolicy → copyFile fallback + EACCES tolerance
-   *  - web-frontend-index.html: immersive viewport-fit=cover patch
-   *  - llm-deepseek: NOT patched — dsh 0.1.1-rc.2 bundles deepseek-v4-flash-vision-exp natively
-   *    with the corrected image-request serialization (see applyRuntimePatches).
-   *  - session-persistence-jsonl-index.js / fs-local-index.js: Android link(2) fallback — dsh
-   *    0.1.1-rc.1 dropped the EACCES/EPERM/ENOTSUP → rename fallback that rc.8 shipped; Android
-   *    app domains forbid link(2) (sepolicy), re-add it as a full-file overlay (as in rc.8).
+   *  - attachment-local-index.js: Android link(2) blocked by sepolicy → rename fallback
+   *    (rebuilt onto 0.1.2-rc.1 source, 0.13.3 W9; the rc.2-locked asset was erasing the
+    *    engine upgrade's own new code, e.g. breaking prompt via stale persistence API)
+   *  - web-frontend-index.html: bundle-hash template (hashAdaptive rewrites the content-hashed
+   *    references on device; 0.13.3 rebuilt from the rc.1 dist — structurally identical to rc.2)
+   *  - session-persistence-jsonl-index.js: Android link(2) fallback — rebuilt onto 0.1.2-rc.1
+   *    source (0.13.3 W9): link(tmp, finalPath) failure on EACCES/EPERM/ENOTSUP → rename fallback.
+   *  - 0.13.3 retirements (both rc.2-locked assets, upstream 0.1.2-rc.1 covers them natively):
+   *    primitives (execCommand clipboard fallback is upstream-native) and fs-local
+   *    (rename fallback is upstream-native). llm-deepseek remains a dormant legacy asset.
    *  Patches use a content fingerprint (no fixed marker), so an updated asset re-applies on
    *  upgrade instead of being skipped by a stale marker string (the v1→v2 update bug).
    * (v0.12.4 rc8 removed the onImagePicked/llm-deepseek/textzoom patches — rc8's native image
@@ -409,24 +411,12 @@ class EngineManager(private val context: Context, private val pickToken: String?
   private fun applyRuntimePatches() {
     val dshPkgs = File(usrDir, "lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai")
     val webDist = File(dshPkgs, "dsh-web-frontend/dist")
-    val home = File(homeDir, ".dsh")
-    // v0.12.4 (rc8) migration: onImagePicked/describeImage/bundle-hardening/textzoom patches
-    // were removed — rc8's official native image request (serializeRequestWithImages) and no-cache
-    // hardening cover them; the textzoom feature was dropped after the settings-general rework
-    // (the bridge method is kept).
-    applyAssetPatch("patched/primitives-index.js",
-      File(dshPkgs, "dsh-client-ui-primitives/lib/index.js"))
     applyAssetPatch("patched/attachment-local-index.js",
       File(dshPkgs, "dsh-attachment-local/lib/index.js"))
     applyAssetPatch("patched/web-frontend-index.html",
       File(webDist, "index.html"), hashAdaptive = true)
-    // dsh 0.1.1-rc.2 bundles deepseek-v4-flash-vision-exp natively (with the corrected
-    // image-request serialization), so the old rc.1 catalog overlay is obsolete — the native
-    // file is left untouched.
     applyAssetPatch("patched/session-persistence-jsonl-index.js",
       File(dshPkgs, "dsh-session-persistence-jsonl/lib/index.js"))
-    applyAssetPatch("patched/fs-local-index.js",
-      File(dshPkgs, "dsh-fs-local/lib/index.js"))
   }
 
   /** Overwrite-style patch: applies when the target differs from the bundled asset (content

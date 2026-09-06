@@ -1,21 +1,11 @@
 import { dirname, join, parse, resolve } from "node:path";
 import z from "@deepseek-ai/schemastery";
-import { AttachmentError, AttachmentId, AttachmentStore, ImageVariantId } from "@deepseek-ai/dsh-attachment";
+import { AttachmentError, AttachmentId, AttachmentStore, ImageVariantId, requestImageDimensions } from "@deepseek-ai/dsh-attachment";
 import { resolveDshHome } from "@deepseek-ai/dsh-home-paths";
 import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { chmod, link, lstat, mkdir, open, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
-let sharpModule = void 0;
-async function requireSharp() {
-	if (sharpModule === void 0) {
-		try {
-			sharpModule = await import("sharp");
-		} catch (error) {
-			throw new AttachmentError("Image processing unavailable on this platform", "IMAGE_PROCESSING_UNAVAILABLE", { cause: error });
-		}
-	}
-	return sharpModule.default;
-}
+import { chmod, link, mkdir, open, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
+import sharp from "sharp";
 //#region lib/types/compression-limiter.js
 /** Instance-owned concurrency bound for native image transformations. */
 /** FIFO limiter for asynchronous compression work. */
@@ -57,11 +47,40 @@ var CompressionLimiter = class {
 };
 //#endregion
 //#region lib/types/encoding.js
-/** Shared lazy candidate execution for normalization and request-image encoders. */
+/** Shared quality ladder and lazy candidate execution for normalization and request-image encoders. */
+/** Shared ladder for both encoders: spaced so each step buys a real size reduction. */
+const IMAGE_ENCODING_QUALITIES = [
+	85,
+	75,
+	60
+];
+async function encode(pipeline, mediaType, quality) {
+	const { data, info } = await (mediaType === "image/webp" ? pipeline.webp({
+		quality,
+		effort: 0
+	}) : pipeline.jpeg({ quality })).toBuffer({ resolveWithObject: true });
+	return {
+		data: new Uint8Array(data),
+		mediaType,
+		width: info.width,
+		height: info.height
+	};
+}
+/**
+* Build the lazy quality ladder for one prepared pipeline: WebP keeps a source
+* alpha channel, everything else is JPEG.
+* @param prepared - sized sRGB pipeline; cloned per candidate.
+* @param hasAlpha - decoded source alpha fact selecting the codec.
+* @returns encoders ordered from highest to lowest ladder quality.
+*/
+function encodingLadder(prepared, hasAlpha) {
+	const mediaType = hasAlpha ? "image/webp" : "image/jpeg";
+	return IMAGE_ENCODING_QUALITIES.map((quality) => (() => encode(prepared.clone(), mediaType, quality)));
+}
 /**
 * Execute encoding candidates in preference order and stop after the first fitting output.
 * @param attempts - lazy encoders ordered from preferred to fallback representation.
-* @param maxBytes - positive encoded-byte cap.
+* @param maxBytes - positive encoded-byte target.
 * @returns the first fitting candidate, otherwise the smallest completed fallback.
 */
 async function encodeFirstWithinLimit(attempts, maxBytes) {
@@ -79,7 +98,7 @@ async function encodeFirstWithinLimit(attempts, maxBytes) {
 /**
 * Whether a lazy encoding result exhausted every candidate at one size.
 * @param result - first fitting candidate or exhausted result.
-* @returns whether every candidate exceeded the byte cap.
+* @returns whether every candidate exceeded the byte target.
 */
 function isExhaustedEncoding(result) {
 	return "smallest" in result;
@@ -133,7 +152,6 @@ async function imageMetadata(image) {
 * @returns verified format and dimensions.
 */
 async function probeImage(data) {
-	const sharp = await requireSharp();
 	try {
 		return await imageMetadata(sharp(data, {
 			failOn: "error",
@@ -151,7 +169,6 @@ async function probeImage(data) {
 * @returns verified format and dimensions.
 */
 async function detectImage(data, limits) {
-	const sharp = await requireSharp();
 	try {
 		const image = sharp(data, {
 			failOn: "error",
@@ -170,27 +187,6 @@ async function detectImage(data, limits) {
 //#endregion
 //#region lib/types/normalization.js
 /** Deterministic provider-independent image normalization. */
-const NORMALIZATION_QUALITIES = [
-	85,
-	80,
-	75
-];
-const LOW_COLOUR_SAMPLE_EDGE = 128;
-const LOW_COLOUR_LIMIT = 256;
-const MIN_SCALE_STEP = .9;
-/** Encode one prepared pipeline and report exact output facts. */
-async function encode(pipeline, mediaType, quality, palette = true) {
-	const { data, info } = await (mediaType === "image/png" ? pipeline.png({
-		compressionLevel: 9,
-		palette
-	}) : mediaType === "image/webp" ? pipeline.webp({ quality }) : pipeline.jpeg({ quality })).toBuffer({ resolveWithObject: true });
-	return {
-		data: new Uint8Array(data),
-		mediaType,
-		width: info.width,
-		height: info.height
-	};
-}
 /**
 * Whether bytes already satisfy the normalization requirements.
 * @param detected - fully decoded source facts.
@@ -199,33 +195,7 @@ async function encode(pipeline, mediaType, quality, palette = true) {
 * @returns whether the source can pass through byte-identically.
 */
 function canPassThroughNormalization(detected, bytes, policy) {
-	return detected.mediaType !== "image/gif" && !detected.animated && !detected.carriesMetadata && detected.depth === "uchar" && detected.space === "srgb" && bytes <= policy.maxBytes && Math.max(detected.width, detected.height) <= policy.maxDimension;
-}
-/**
-* Classify a bounded pixel sample without assuming that a PNG source is a screenshot.
-* @param pipeline - oriented sRGB source pipeline before output resizing.
-* @returns whether the nearest-neighbour sample stays within the low-color threshold.
-*/
-async function hasLowColourCount(pipeline) {
-	const sharp = await requireSharp();
-	const { data, info } = await pipeline.clone().resize({
-		width: LOW_COLOUR_SAMPLE_EDGE,
-		height: LOW_COLOUR_SAMPLE_EDGE,
-		fit: "inside",
-		withoutEnlargement: true,
-		kernel: sharp.kernel.nearest,
-		fastShrinkOnLoad: false
-	}).raw().toBuffer({ resolveWithObject: true });
-	const colours = /* @__PURE__ */ new Set();
-	for (let offset = 0; offset < data.length; offset += info.channels) {
-		const red = data.readUInt8(offset);
-		const green = data.readUInt8(offset + 1);
-		const blue = data.readUInt8(offset + 2);
-		const alpha = info.channels === 4 ? data.readUInt8(offset + 3) : 255;
-		colours.add(red >> 3 << 15 | green >> 3 << 10 | blue >> 3 << 5 | alpha >> 3);
-		if (colours.size > LOW_COLOUR_LIMIT) return false;
-	}
-	return true;
+	return detected.mediaType !== "image/gif" && !detected.animated && !detected.carriesMetadata && detected.depth === "uchar" && detected.space === "srgb" && bytes <= policy.maxBytes && detected.width * detected.height <= policy.maxPixels && Math.max(detected.width, detected.height) <= policy.maxDimension;
 }
 /** Assert that a normalized output is an 8-bit sRGB/sRGBA single-frame image with matching facts. */
 async function verifyNormalizedImage(image, expectedAlpha) {
@@ -234,8 +204,7 @@ async function verifyNormalizedImage(image, expectedAlpha) {
 	return image;
 }
 /** Build one fixed-size, oriented, metadata-free sRGB pipeline from submitted bytes. */
-async function preparedPipeline(data, width, height) {
-	const sharp = await requireSharp();
+function preparedPipeline(data, width, height) {
 	return sharp(data, {
 		failOn: "error",
 		limitInputPixels: false
@@ -246,34 +215,29 @@ async function preparedPipeline(data, width, height) {
 		withoutEnlargement: true
 	});
 }
-/** Dimensions after the long edge is capped without changing aspect ratio. */
-function initialDimensions(detected, maxDimension) {
-	const scale = Math.min(1, maxDimension / Math.max(detected.width, detected.height));
+/** Dimensions under the total-pixel budget, then the long-edge cap, without changing aspect ratio. */
+function initialDimensions(detected, policy) {
+	const budgeted = requestImageDimensions(detected.width, detected.height, policy.maxPixels);
+	const longEdge = Math.max(budgeted.width, budgeted.height);
+	if (longEdge <= policy.maxDimension) return budgeted;
+	const scale = policy.maxDimension / longEdge;
 	return {
-		width: Math.max(1, Math.round(detected.width * scale)),
-		height: Math.max(1, Math.round(detected.height * scale))
+		width: Math.max(1, Math.floor(budgeted.width * scale)),
+		height: Math.max(1, Math.floor(budgeted.height * scale))
 	};
-}
-/** Lazy encoding order for one size, separated by sampled colour complexity and alpha. */
-async function encodingAttemptsAtSize(data, width, height, hasAlpha, lowColour) {
-	const prepared = await preparedPipeline(data, width, height);
-	const webp = NORMALIZATION_QUALITIES.map((quality) => (() => encode(prepared.clone(), "image/webp", quality)));
-	if (lowColour) return [() => encode(prepared.clone(), "image/png", void 0, !hasAlpha), ...webp];
-	if (hasAlpha) return webp;
-	return NORMALIZATION_QUALITIES.map((quality) => (() => encode(prepared.clone(), "image/jpeg", quality)));
 }
 /**
 * Produce the persisted provider-independent normalized version of one fully decoded source.
 * The source is passed through only when it is already clean, single-frame, 8-bit sRGB/sRGBA,
-* and inside both normalization limits. Re-encoding never removes transparency. After the fixed
-* quality floor is reached, dimensions continue shrinking until the independent byte cap holds.
+* and inside every normalization limit. Re-encoding never removes transparency. When every
+* ladder quality exceeds the byte target, the smallest ladder output is kept; provider byte
+* caps stay enforced at the route that transmits the bytes.
 * @param data - complete admitted source bytes.
 * @param detected - fully decoded source facts.
 * @param policy - resolved independent normalization limits.
 * @returns verified provider-independent normalized bytes and metadata.
 */
 async function normalizeImage(data, detected, policy) {
-	const sharp = await requireSharp();
 	if (canPassThroughNormalization(detected, data.byteLength, policy)) return {
 		data,
 		mediaType: detected.mediaType,
@@ -281,27 +245,13 @@ async function normalizeImage(data, detected, policy) {
 		height: detected.height
 	};
 	try {
-		let { width, height } = initialDimensions(detected, policy.maxDimension);
-		const lowColour = await hasLowColourCount(sharp(data, {
-			failOn: "error",
-			limitInputPixels: false
-		}).rotate().toColourspace("srgb"));
-		for (;;) {
-			const encoded = await encodeFirstWithinLimit(await encodingAttemptsAtSize(data, width, height, detected.hasAlpha, lowColour), policy.maxBytes);
-			if (!isExhaustedEncoding(encoded)) return await verifyNormalizedImage(encoded, detected.mediaType === "image/gif" ? void 0 : detected.hasAlpha);
-			if (width === 1 && height === 1) break;
-			const sizeScale = Math.sqrt(policy.maxBytes / encoded.smallest.data.byteLength) * .95;
-			const scale = Math.min(MIN_SCALE_STEP, sizeScale);
-			const nextWidth = Math.max(1, Math.floor(width * scale));
-			const nextHeight = Math.max(1, Math.floor(height * scale));
-			width = nextWidth;
-			height = nextHeight;
-		}
+		const { width, height } = initialDimensions(detected, policy);
+		const encoded = await encodeFirstWithinLimit(encodingLadder(preparedPipeline(data, width, height), detected.hasAlpha), policy.maxBytes);
+		return await verifyNormalizedImage(isExhaustedEncoding(encoded) ? encoded.smallest : encoded, detected.mediaType === "image/gif" ? void 0 : detected.hasAlpha);
 	} catch (error) {
 		if (error instanceof AttachmentError) throw error;
 		throw new AttachmentError(`The ${detected.mediaType === "image/png" && detected.depth !== "uchar" ? `${detected.depth === "ushort" ? "16-bit" : detected.depth} PNG` : `${detected.depth} ${detected.mediaType.slice(6).toUpperCase()}`} could not be converted to the normalized 8-bit sRGB form.`, "ATTACHMENT_WRITE_FAILED", { cause: error });
 	}
-	throw new AttachmentError("Image cannot be encoded within the configured normalized-image byte cap.", "IMAGE_TOO_LARGE");
 }
 //#endregion
 //#region lib/types/store.js
@@ -316,13 +266,20 @@ function displayName(value) {
 	const clean = value.slice(Math.max(value.lastIndexOf("/"), value.lastIndexOf("\\")) + 1).replace(/[\u0000-\u001f\u007f]/g, "").trim().slice(0, 255);
 	return clean === "" ? void 0 : clean;
 }
-function objectPath(root, sha256) {
-	return join(root, "objects", sha256.slice(0, 2), sha256);
-}
 function ensureReference(ref) {
 	const match = ID_PATTERN.exec(String(ref.attachmentId));
 	if (match?.[1] === void 0) throw new AttachmentError("Attachment reference is invalid.", "INVALID_ATTACHMENT_REF");
 	return match[1];
+}
+/**
+* Derive the absolute immutable-object path for one normalized attachment.
+* @param root - absolute `DSH_HOME/attachments/v1` root.
+* @param ref - durable normalized attachment reference.
+* @returns provider-local path without reading the object.
+*/
+function normalizedImagePath(root, ref) {
+	const sha256 = ensureReference(ref);
+	return join(root, "objects", sha256.slice(0, 2), sha256);
 }
 async function inspectMetadata(data, declaredMediaType, limits) {
 	if (data.byteLength === 0) throw new AttachmentError("Image is empty.", "INVALID_IMAGE");
@@ -385,19 +342,11 @@ async function syncDirectory(path) {
 	/* v8 ignore next -- Windows cannot open directory handles; NTFS metadata journaling owns entry durability there. */
 	if (process.platform === "win32") return;
 	/* v8 ignore start -- Windows cannot exercise directory fsync; POSIX behavior tests enforce this peer. */
-	let handle;
+	const handle = await open(path, constants.O_RDONLY);
 	try {
-		handle = await open(path, constants.O_RDONLY);
 		await handle.sync();
-	} catch (error) {
-		// Android: cannot open ancestor dirs above the app data dir (EACCES/EPERM on /data/user/0).
-		// (attachment-ancestor-sync-eacces-tolerance)
-		if (error !== null && (error.code === "EACCES" || error.code === "EPERM")) return;
-		throw error;
 	} finally {
-		try {
-			await handle?.close();
-		} catch {}
+		await handle.close();
 	}
 	/* v8 ignore stop */
 }
@@ -458,7 +407,7 @@ async function commitPreparedImageFile(root, prepared) {
 	await ensureDurableDirectory(bucket, boundary);
 	await ensureDurableDirectory(staging, boundary);
 	const temporary = join(staging, randomUUID());
-	const target = objectPath(root, sha256);
+	const target = normalizedImagePath(root, prepared.ref);
 	let handle;
 	try {
 		handle = await open(temporary, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 384);
@@ -467,25 +416,16 @@ async function commitPreparedImageFile(root, prepared) {
 		await handle.close();
 		handle = void 0;
 		try {
-			await link(temporary, target);
+			await link(temporary, target).catch(function (e) { if (!(e instanceof Error && "code" in e && (e.code === "EACCES" || e.code === "EPERM" || e.code === "ENOTSUP"))) throw e; return rename(temporary, target); });
 		} catch (error) {
-			/* Android app domains forbid link(2) (sepolicy /data/user/0): fall back to an atomic
-			   rename of the same-filesystem staging file (same mechanism as fs-local /
-			   session-persistence-jsonl). EEXIST remains the only recoverable link race. */
-			if (error instanceof Error && "code" in error && (error.code === "EACCES" || error.code === "EPERM" || error.code === "ENOTSUP" || error.code === "EXDEV")) {
-				let exists;
-				try { await lstat(target); exists = true; } catch (e2) { if (e2.code === "ENOENT") exists = false; else throw e2; }
-				if (exists) throw error;
-				await rename(temporary, target);
-			} else if (!(error instanceof Error && "code" in error && error.code === "EEXIST")) {
-				throw error;
-			} else {
-				if (digest$1(new Uint8Array(await readFile(target))) !== sha256) throw new AttachmentError("Stored attachment failed integrity verification.", "ATTACHMENT_CORRUPT");
-			}
+			/* v8 ignore next -- Private same-filesystem directories make EEXIST the only recoverable link race. */
+			if (!(error instanceof Error && "code" in error && error.code === "EEXIST")) throw error;
+			if (digest$1(new Uint8Array(await readFile(target))) !== sha256) throw new AttachmentError("Stored attachment failed integrity verification.", "ATTACHMENT_CORRUPT");
 		}
+		await unlink(temporary).catch(function (e) { if (!(e instanceof Error && "code" in e && e.code === "ENOENT")) throw e; });
+		await chmod(target, 256);
 		await syncDirectory(bucket);
 		await syncDirectory(join(root, "objects"));
-		await unlink(temporary).catch(() => {});
 	} catch (error) {
 		/* v8 ignore next -- A descriptor can remain open only when the underlying write/sync/close operation fails. */
 		if (handle !== void 0) await handle.close().catch(
@@ -528,7 +468,7 @@ async function readImageFile(root, ref, signal) {
 	const sha256 = ensureReference(ref);
 	let data;
 	try {
-		data = new Uint8Array(await readFile(objectPath(root, sha256), { signal }));
+		data = new Uint8Array(await readFile(normalizedImagePath(root, ref), { signal }));
 	} catch (error) {
 		signal?.throwIfAborted();
 		if (error instanceof Error && "code" in error && error.code === "ENOENT") throw new AttachmentError("Attachment object is missing.", "ATTACHMENT_NOT_FOUND");
@@ -548,47 +488,9 @@ async function readImageFile(root, ref, signal) {
 //#region lib/types/request-image.js
 /** Deterministic cached image versions for model requests. */
 /** Transform version included in every cache and upload-index identity. */
-const REQUEST_IMAGE_TRANSFORM_VERSION = "request-image-v4";
-/** DeepSeek request versions normally fit at these two preferred qualities. */
-const REQUEST_IMAGE_QUALITIES = [85, 80];
+const REQUEST_IMAGE_TRANSFORM_VERSION = "request-image-v5";
 function digest(value) {
 	return createHash("sha256").update(value).digest("hex");
-}
-/**
-* Compute aspect-preserving integer dimensions within a hard total-pixel budget.
-* @param width - positive source width.
-* @param height - positive source height.
-* @param maxPixels - positive width-times-height cap.
-* @returns inward-rounded dimensions; small images are not enlarged.
-*/
-function requestImageDimensions(width, height, maxPixels) {
-	const scale = Math.min(1, Math.sqrt(maxPixels / (width * height)));
-	if (scale === 1) return {
-		width,
-		height
-	};
-	if (width >= height) {
-		let projectedWidth = Math.max(1, Math.floor(width * scale));
-		let projectedHeight = Math.max(1, Math.round(projectedWidth * height / width));
-		while (projectedWidth * projectedHeight > maxPixels && projectedWidth > 1) {
-			projectedWidth -= 1;
-			projectedHeight = Math.max(1, Math.round(projectedWidth * height / width));
-		}
-		return {
-			width: projectedWidth,
-			height: projectedHeight
-		};
-	}
-	let projectedHeight = Math.max(1, Math.floor(height * scale));
-	let projectedWidth = Math.max(1, Math.round(projectedHeight * width / height));
-	while (projectedWidth * projectedHeight > maxPixels && projectedHeight > 1) {
-		projectedHeight -= 1;
-		projectedWidth = Math.max(1, Math.round(projectedHeight * width / height));
-	}
-	return {
-		width: projectedWidth,
-		height: projectedHeight
-	};
 }
 function checkedInteger(value, name) {
 	if (!Number.isSafeInteger(value) || value <= 0) throw new AttachmentError(`${name} must be a positive integer.`, "INVALID_ATTACHMENT_REF");
@@ -605,17 +507,10 @@ function descriptor(attachment, policy) {
 		routePixelBudget: policy.maxPixels,
 		encodedByteBudget: policy.maxBytes,
 		encoding: {
-			png: {
-				compressionLevel: 9,
-				palette: "opaque-only"
-			},
-			webpQualities: REQUEST_IMAGE_QUALITIES,
-			jpegQualities: REQUEST_IMAGE_QUALITIES,
-			order: [
-				"low-colour:png-webp",
-				"alpha:webp",
-				"opaque:jpeg"
-			],
+			webpQualities: IMAGE_ENCODING_QUALITIES,
+			webpEffort: 0,
+			jpegQualities: IMAGE_ENCODING_QUALITIES,
+			order: ["alpha:webp", "opaque:jpeg"],
 			colourspace: "srgb"
 		}
 	});
@@ -629,60 +524,30 @@ function descriptor(attachment, policy) {
 function requestImageVariantId(attachment, policy) {
 	return ImageVariantId(`sha256:${digest(descriptor(attachment, policy))}`);
 }
-async function pipeline(attachment, width, height) {
-	return (await sourcePipeline(attachment)).resize({
+function pipeline(attachment, width, height) {
+	return sourcePipeline(attachment).resize({
 		width,
 		height,
 		fit: "inside",
 		withoutEnlargement: true
 	});
 }
-async function sourcePipeline(attachment) {
-	const sharp = await requireSharp();
+function sourcePipeline(attachment) {
 	return sharp(attachment.data, {
 		failOn: "error",
 		limitInputPixels: false
 	}).toColourspace("srgb");
 }
-async function encoded(image, mediaType, quality, palette = true) {
-	const { data, info } = await (mediaType === "image/png" ? image.png({
-		compressionLevel: 9,
-		palette
-	}) : mediaType === "image/webp" ? image.webp({ quality }) : image.jpeg({ quality })).toBuffer({ resolveWithObject: true });
-	return {
-		data: new Uint8Array(data),
-		mediaType,
-		width: info.width,
-		height: info.height
-	};
-}
-async function encodingAttempts(attachment, width, height, hasAlpha, lowColour) {
-	const prepared = await pipeline(attachment, width, height);
-	const webp = REQUEST_IMAGE_QUALITIES.map((quality) => (() => encoded(prepared.clone(), "image/webp", quality)));
-	if (lowColour) return [() => encoded(prepared.clone(), "image/png", void 0, !hasAlpha), ...webp];
-	if (hasAlpha) return webp;
-	return REQUEST_IMAGE_QUALITIES.map((quality) => (() => encoded(prepared.clone(), "image/jpeg", quality)));
-}
 async function createRequestImage(attachment, policy, hasAlpha) {
-	let dimensions = requestImageDimensions(attachment.ref.width, attachment.ref.height, policy.maxPixels);
+	const dimensions = requestImageDimensions(attachment.ref.width, attachment.ref.height, policy.maxPixels);
 	if (dimensions.width === attachment.ref.width && dimensions.height === attachment.ref.height && attachment.data.byteLength <= policy.maxBytes) return {
 		data: attachment.data,
 		mediaType: attachment.ref.mediaType,
 		width: attachment.ref.width,
 		height: attachment.ref.height
 	};
-	const lowColour = await hasLowColourCount(await sourcePipeline(attachment));
-	for (;;) {
-		const encodedVersion = await encodeFirstWithinLimit(await encodingAttempts(attachment, dimensions.width, dimensions.height, hasAlpha, lowColour), policy.maxBytes);
-		if (!isExhaustedEncoding(encodedVersion)) return encodedVersion;
-		if (dimensions.width === 1 && dimensions.height === 1) break;
-		const scale = Math.min(.9, Math.sqrt(policy.maxBytes / encodedVersion.smallest.data.byteLength) * .95);
-		dimensions = {
-			width: Math.max(1, Math.floor(dimensions.width * scale)),
-			height: Math.max(1, Math.floor(dimensions.height * scale))
-		};
-	}
-	throw new AttachmentError("Image cannot be encoded within the model-request byte budget.", "IMAGE_TOO_LARGE");
+	const encodedVersion = await encodeFirstWithinLimit(encodingLadder(pipeline(attachment, dimensions.width, dimensions.height), hasAlpha), policy.maxBytes);
+	return isExhaustedEncoding(encodedVersion) ? encodedVersion.smallest : encodedVersion;
 }
 function cachePath(root, hash) {
 	return join(root, "request-images", hash.slice(0, 2), hash);
@@ -692,7 +557,7 @@ async function readCached(path, attachment, policy, expectedAlpha, signal) {
 		const data = new Uint8Array(await readFile(path, { signal }));
 		const detected = await probeImage(data);
 		const maximum = requestImageDimensions(attachment.ref.width, attachment.ref.height, policy.maxPixels);
-		if (data.byteLength > policy.maxBytes || detected.depth !== "uchar" || detected.space !== "srgb" || detected.width > maximum.width || detected.height > maximum.height || !encodedAlphaIsCompatible(expectedAlpha, detected)) return void 0;
+		if (detected.depth !== "uchar" || detected.space !== "srgb" || detected.width > maximum.width || detected.height > maximum.height || !encodedAlphaIsCompatible(expectedAlpha, detected)) return void 0;
 		return {
 			data,
 			mediaType: detected.mediaType,
@@ -779,12 +644,16 @@ const DEFAULT_MAX_IMAGE_PIXELS = 64e6;
 /** Default per-side pixel cap for one submitted image. */
 const DEFAULT_MAX_IMAGE_DIMENSION = 8192;
 /**
-* Default long-edge target of the stored normalized image. A larger source
-* is admitted and downscaled to this edge, so admission bounds what rides
-* every later model request without refusing ordinary large sources.
+* Default total-pixel budget of the stored normalized image. A larger source
+* is admitted and downscaled proportionally, so admission bounds what rides
+* every later model request without refusing ordinary large sources; extreme
+* aspect ratios keep their short-edge resolution instead of collapsing under
+* a long-edge rule.
 */
-const DEFAULT_NORMALIZED_IMAGE_MAX_DIMENSION = 2048;
-/** Default independent safety cap for one stored normalized image. */
+const DEFAULT_NORMALIZED_IMAGE_MAX_PIXELS = 2048 * 2048;
+/** Default long-edge cap of the stored normalized image, applied after the total-pixel budget. */
+const DEFAULT_NORMALIZED_IMAGE_MAX_DIMENSION = 8192;
+/** Default encoded-byte target for one stored normalized image. */
 const DEFAULT_NORMALIZED_IMAGE_MAX_BYTES = 4 * 1024 * 1024;
 /** Conservative default number of simultaneous native image transformations per store. */
 const DEFAULT_IMAGE_COMPRESSION_CONCURRENCY = 2;
@@ -847,6 +716,7 @@ var LocalAttachmentStore = class extends AttachmentStore {
 		maxMessageImageBytes: z.number().step(1).min(1).default(DEFAULT_MAX_MESSAGE_IMAGE_BYTES),
 		maxImagePixels: z.number().step(1).min(1).default(DEFAULT_MAX_IMAGE_PIXELS),
 		maxImageDimension: z.number().step(1).min(1).default(DEFAULT_MAX_IMAGE_DIMENSION),
+		normalizedImageMaxPixels: z.number().step(1).min(1).default(DEFAULT_NORMALIZED_IMAGE_MAX_PIXELS),
 		normalizedImageMaxDimension: z.number().step(1).min(1).default(DEFAULT_NORMALIZED_IMAGE_MAX_DIMENSION),
 		normalizedImageMaxBytes: z.number().step(1).min(1).default(DEFAULT_NORMALIZED_IMAGE_MAX_BYTES),
 		imageCompressionConcurrency: z.number().step(1).min(1).max(8).default(2)
@@ -877,7 +747,8 @@ var LocalAttachmentStore = class extends AttachmentStore {
 			])
 		});
 		this.normalizationPolicy = Object.freeze({
-			maxDimension: config.normalizedImageMaxDimension ?? 2048,
+			maxPixels: config.normalizedImageMaxPixels ?? 4194304,
+			maxDimension: config.normalizedImageMaxDimension ?? 8192,
 			maxBytes: config.normalizedImageMaxBytes ?? 4194304
 		});
 		const compressionConcurrency = config.imageCompressionConcurrency ?? 2;
@@ -902,6 +773,9 @@ var LocalAttachmentStore = class extends AttachmentStore {
 	async readImage(ref, signal) {
 		return readImageFile(this.root, ref, signal);
 	}
+	imageHostPath(ref) {
+		return normalizedImagePath(this.root, ref);
+	}
 	async readImageRequest(ref, policy, signal) {
 		return this.requestVersion(ref, policy, void 0, signal);
 	}
@@ -915,7 +789,9 @@ var LocalAttachmentStore = class extends AttachmentStore {
 			operation = void 0;
 		}
 		if (operation === void 0) {
-			const shared = new SharedRequest((sharedSignal) => this.compression.run(async () => readRequestImageFile(this.root, stored ?? await this.readImage(ref, sharedSignal), policy, sharedSignal)));
+			const shared = new SharedRequest((sharedSignal) => this.compression.run(async () => {
+				return await readRequestImageFile(this.root, stored ?? await this.readImage(ref, sharedSignal), policy, sharedSignal);
+			}));
 			operation = shared;
 			this.requestInflight.set(key, shared);
 			shared.promise.finally(() => {
@@ -926,4 +802,4 @@ var LocalAttachmentStore = class extends AttachmentStore {
 	}
 };
 //#endregion
-export { DEFAULT_IMAGE_COMPRESSION_CONCURRENCY, DEFAULT_MAX_IMAGES_PER_MESSAGE, DEFAULT_MAX_IMAGE_BYTES, DEFAULT_MAX_IMAGE_DIMENSION, DEFAULT_MAX_IMAGE_PIXELS, DEFAULT_MAX_MESSAGE_IMAGE_BYTES, DEFAULT_NORMALIZED_IMAGE_MAX_BYTES, DEFAULT_NORMALIZED_IMAGE_MAX_DIMENSION, LocalAttachmentStore, LocalAttachmentStore as default, MAX_IMAGE_COMPRESSION_CONCURRENCY, canPassThroughNormalization, commitPreparedImageFile, normalizeImage, prepareImageFile, readImageFile, readRequestImageFile, requestImageDimensions, requestImageVariantId, saveImageFile, validateImageFile };
+export { DEFAULT_IMAGE_COMPRESSION_CONCURRENCY, DEFAULT_MAX_IMAGES_PER_MESSAGE, DEFAULT_MAX_IMAGE_BYTES, DEFAULT_MAX_IMAGE_DIMENSION, DEFAULT_MAX_IMAGE_PIXELS, DEFAULT_MAX_MESSAGE_IMAGE_BYTES, DEFAULT_NORMALIZED_IMAGE_MAX_BYTES, DEFAULT_NORMALIZED_IMAGE_MAX_DIMENSION, DEFAULT_NORMALIZED_IMAGE_MAX_PIXELS, LocalAttachmentStore, LocalAttachmentStore as default, MAX_IMAGE_COMPRESSION_CONCURRENCY, canPassThroughNormalization, commitPreparedImageFile, normalizeImage, prepareImageFile, readImageFile, readRequestImageFile, requestImageVariantId, saveImageFile, validateImageFile };

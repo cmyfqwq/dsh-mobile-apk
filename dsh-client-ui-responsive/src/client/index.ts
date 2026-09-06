@@ -7,7 +7,9 @@
  * with the runtime sessions service. Later effects seat the theme presenter
  * (projecting ctx.theme snapshots onto document.body) and other UI fixes.
  */
-import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
+// 0.13.3：ClientContext 迁至 cordis Context（store-rehome 后官方 client 包同款——
+// 旧 client-runtime/client 类型面在 rc.1 loader 的 module table 已不可达）。
+import type { Context as ClientContext } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-client-ui-theme/client'
 import type { BoundActions } from '@deepseek-ai/dsh-client-ui-slots'
 import type { PanelActions } from './service.ts'

@@ -407,6 +407,7 @@ class MainActivity : ComponentActivity() {
             android.content.res.Configuration.UI_MODE_NIGHT_YES
         },
         onPickImageRequest = { callbackId -> mediaPickerController.pickImageForBridge(callbackId) },
+        onPickFilePathRequest = { callbackId -> mediaPickerController.pickFilePathForBridge(callbackId) },
         onSetImmersiveRequest = { enable -> setImmersivePersisted(enable) },
         onCopyTextRequest = { text -> copyTextNative(text) },
         pickToken = pickToken,
@@ -470,6 +471,23 @@ class MainActivity : ComponentActivity() {
     } else {
       val token = EngineAuth.tokenFromLog(this)
       webView.loadUrl(if (token != null) EngineProbe.ENGINE_URL + "/?token=" + token else EngineProbe.ENGINE_URL)
+      // 全新安装首启竞态自愈（0.13.3 模拟器实测）：引擎冷启动期 token 行尚未打印，
+      // 首次 refresh/tokenFromLog 均落空 → WebView 载入 401 文案页。后台定期重试，
+      // 拿到 cookie 即注入 CookieManager 并重载一次（用户无感自愈，120s 预算封顶）。
+      Thread {
+        val deadline = System.currentTimeMillis() + 120_000L
+        while (System.currentTimeMillis() < deadline) {
+          try { Thread.sleep(5_000) } catch (_: InterruptedException) { return@Thread }
+          val cookie = try { EngineAuth.refresh(this) } catch (_: Throwable) { null }
+          if (cookie != null) {
+            try { android.webkit.CookieManager.getInstance().setCookie(EngineProbe.ENGINE_URL, cookie) } catch (_: Throwable) {}
+            runOnUiThread {
+              try { if (!isFinishing && !isDestroyed) webView.reload() } catch (_: Throwable) {}
+            }
+            return@Thread
+          }
+        }
+      }.apply { isDaemon = true; name = "engine-auth-reload" }.start()
     }
   }
 

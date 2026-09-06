@@ -23,6 +23,8 @@ class AndroidBridge(
   private val onImportConfig: () -> String = { """{"ok":false,"error":"bridge not wired"}""" },
   private val onGetSystemDark: () -> Boolean = { false },
   private val onPickImageRequest: (callbackId: String) -> Unit = {},
+  /** 0.13.3 W10：@文件引用路径选择（SAF 文档 → primary 真实路径 → 页面插 mention）。 */
+  private val onPickFilePathRequest: (callbackId: String) -> Unit = {},
   private val onSetImmersiveRequest: (enable: Boolean) -> Unit = {},
   private val onCopyTextRequest: (text: String) -> Boolean = { false },
   private val pickToken: String? = null,
@@ -85,6 +87,12 @@ class AndroidBridge(
   @JavascriptInterface
   fun pickImage(callbackId: String) {
     onPickImageRequest(callbackId)
+  }
+
+  /** 0.13.3 W10：@文件引用路径选择（SAF 文档选择器 → primary 真实路径 → onFilePicked 回调）。 */
+  @JavascriptInterface
+  fun pickFilePath(callbackId: String) {
+    onPickFilePathRequest(callbackId)
   }
 
   /** Immersive status bar toggle (true = status bar normally hidden); called by Settings → General. */

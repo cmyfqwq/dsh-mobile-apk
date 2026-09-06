@@ -1,12 +1,12 @@
 import z from "@deepseek-ai/schemastery";
 import { readdirSync } from "node:fs";
-import { link, rename, mkdir, mkdtemp, open, readFile, readdir, realpath, rm, stat, truncate } from "node:fs/promises";
+import { link, mkdir, mkdtemp, open, readFile, readdir, realpath, rename, rm, stat, truncate } from "node:fs/promises";
 import { dirname, join, parse, resolve, toNamespacedPath } from "node:path";
 import { performance } from "node:perf_hooks";
 import { scheduler } from "node:timers/promises";
 import { randomBytes } from "node:crypto";
 import { DEFAULT_PREPARED_SESSION_CACHE_SIZE, DEFAULT_WRITE_BATCH_MAX_DELAY_MS, MAX_WRITE_BATCH_DELAY_MS, PersistenceCoordinator, SessionFormatUnsupportedError, SessionPersistence, SessionPersistenceRevision, sessionFormatVersionRefusal } from "@deepseek-ai/dsh-session-persistence";
-import { SESSION_FORMAT_VERSION, decodeStorageRecord, packChunkRuns } from "@deepseek-ai/dsh-session";
+import { SESSION_FORMAT_VERSION, SessionLogOffset, decodeSeqRanges, decodeStorageRecord, encodeSeqRanges, packChunkRuns } from "@deepseek-ai/dsh-session";
 import { constants, createZstdDecompress, zstdCompress, zstdDecompress, zstdDecompressSync } from "node:zlib";
 import { promisify } from "node:util";
 import { constants as constants$1 } from "node:buffer";
@@ -31,9 +31,14 @@ function logSuffix(compression) {
 /**
 * Build the header line object from a {@link SessionHeader}.
 * @param header - the immutable session metadata to serialize.
+* @param inheritedEventCount - exact inherited prefix length; required for a
+* seeded header and omitted only for an unseeded header.
 * @returns the `type: 'session'`-tagged line object, absent optional fields omitted (never null).
 */
-function toHeaderLine(header) {
+function toHeaderLine(header, inheritedEventCount) {
+	if (header.isSeeded && inheritedEventCount === void 0) throw new Error("seeded session header requires an inherited event count");
+	const cut = SessionLogOffset(inheritedEventCount ?? 0);
+	if (!header.isSeeded && cut !== 0) throw new Error("unseeded session header inherited event count must be 0");
 	return {
 		type: "session",
 		version: header.version,
@@ -41,34 +46,37 @@ function toHeaderLine(header) {
 		createdAt: header.createdAt,
 		...header.cwd !== void 0 ? { cwd: header.cwd } : {},
 		...header.parentSession !== void 0 ? { parentSession: header.parentSession } : {},
-		...header.seedLength !== void 0 ? { seedLength: header.seedLength } : {},
+		...header.isSeeded ? { seedLength: cut } : {},
 		...header.origin !== void 0 ? { origin: header.origin } : {},
 		delegationDepth: header.delegationDepth ?? 0,
 		...header.agentPreset !== void 0 ? { agentPreset: header.agentPreset } : {}
 	};
 }
 /**
-* Parse a header line back into a {@link SessionHeader}.
+* Translate one version-0 physical header into logical metadata and its cut.
 * @param line - the shape-checked first line of a log (see the `isHeaderLine` guard).
-* @returns the header, absent optional fields omitted.
+* @returns logical Session metadata paired with the exact inherited prefix length.
 */
 function fromHeaderLine(line) {
 	if (Object.hasOwn(line, "sandboxMode") || Object.hasOwn(line, "approvalPolicy")) throw new Error("session header uses retired policy baseline fields");
 	return {
-		version: line.version,
-		id: line.id,
-		createdAt: line.createdAt,
-		...line.cwd !== void 0 ? { cwd: line.cwd } : {},
-		...line.parentSession !== void 0 ? { parentSession: line.parentSession } : {},
-		...line.seedLength !== void 0 ? { seedLength: line.seedLength } : {},
-		...line.origin !== void 0 ? { origin: line.origin } : {},
-		delegationDepth: line.delegationDepth,
-		...line.agentPreset !== void 0 ? { agentPreset: line.agentPreset } : {}
+		meta: {
+			version: line.version,
+			id: line.id,
+			createdAt: line.createdAt,
+			...line.cwd !== void 0 ? { cwd: line.cwd } : {},
+			...line.parentSession !== void 0 ? { parentSession: line.parentSession } : {},
+			isSeeded: line.seedLength !== void 0,
+			...line.origin !== void 0 ? { origin: line.origin } : {},
+			delegationDepth: line.delegationDepth,
+			...line.agentPreset !== void 0 ? { agentPreset: line.agentPreset } : {}
+		},
+		inheritedEventCount: SessionLogOffset(line.seedLength ?? 0)
 	};
 }
 /** Type guard: a parsed first line is a well-formed session header. */
 function isHeaderLine(value) {
-	return typeof value === "object" && value !== null && value.type === "session" && typeof value.version === "number" && typeof value.id === "string" && typeof value.createdAt === "number" && Number.isSafeInteger(value.createdAt) && value.createdAt >= 0 && !Object.is(value.createdAt, -0) && typeof value.delegationDepth === "number" && Number.isSafeInteger(value.delegationDepth) && value.delegationDepth >= 0 && !Object.is(value.delegationDepth, -0) && (value.origin === void 0 || value.origin === "subagent") && (value.agentPreset === void 0 || typeof value.agentPreset === "string");
+	return typeof value === "object" && value !== null && value.type === "session" && typeof value.version === "number" && typeof value.id === "string" && typeof value.createdAt === "number" && Number.isSafeInteger(value.createdAt) && value.createdAt >= 0 && !Object.is(value.createdAt, -0) && typeof value.delegationDepth === "number" && Number.isSafeInteger(value.delegationDepth) && value.delegationDepth >= 0 && !Object.is(value.delegationDepth, -0) && (value.seedLength === void 0 || typeof value.seedLength === "number" && Number.isSafeInteger(value.seedLength) && value.seedLength >= 0 && !Object.is(value.seedLength, -0)) && (value.origin === void 0 || value.origin === "subagent") && (value.agentPreset === void 0 || typeof value.agentPreset === "string");
 }
 /**
 * Encode an arbitrary string as a single safe path segment, injectively over ALL JS (UTF-16)
@@ -160,22 +168,53 @@ function logPath(root, cwd, id, compression) {
 * Serialize an event batch as JSONL lines (no trailing newline). With
 * `packChunks` on, delta-chunk runs pack into `text-chunks` /
 * `reasoning-chunks` / `tool-call-chunks` storage rows; off writes one event
-* per line, byte-identical to the pre-packing layout. Reading is layout-blind
-* either way ({@link scanLog} always decodes rows), so the switch changes only
-* newly written bytes.
+* per line. Both modes range-encode provenance at the storage boundary.
+* Reading is layout-blind either way ({@link scanLog} always decodes rows),
+* so the switch changes only newly written bytes.
 * @param events - the batch to serialize, in log order.
 * @param packChunks - whether to pack delta runs into storage rows.
 * @returns the batch's JSONL text; the writer adds the final newline.
 */
 function eventLines(events, packChunks) {
-	return (packChunks ? packChunkRuns(events) : events).map((record) => JSON.stringify(record)).join("\n");
+	return (packChunks ? packChunkRuns(events) : events).map((record) => JSON.stringify(encodeProvenanceForStorage(record))).join("\n");
+}
+/**
+* Losslessly shrink a record's `sourceEventSeqs` for the log: consecutive
+* runs of at least three seqs become `[start, end]` pairs, and any other list
+* stays verbatim.
+* @param record - one stored record (event or packed row).
+* @returns the record with its provenance in storage form (widened from the
+*   in-memory `SessionSeq[]`; {@link expandProvenanceFromStorage} restores it).
+*/
+function encodeProvenanceForStorage(record) {
+	if (!("sourceEventSeqs" in record)) return record;
+	return {
+		...record,
+		sourceEventSeqs: encodeSeqRanges(record.sourceEventSeqs)
+	};
+}
+/**
+* Expand a parsed line's storage-form provenance back to `SessionSeq[]`.
+* @param parsed - the JSON-parsed value of one stored line.
+* @returns the value with provenance expanded.
+* @throws when the record or its storage-form provenance is malformed.
+*/
+function expandProvenanceFromStorage(parsed) {
+	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) throw new TypeError("stored session records must be objects");
+	const record = parsed;
+	if (record.sourceEventSeqs === void 0) return parsed;
+	if (!Number.isSafeInteger(record.seq) || record.seq < 0) throw new TypeError("stored session event seq must be a non-negative safe integer");
+	return {
+		...record,
+		sourceEventSeqs: decodeSeqRanges(record.sourceEventSeqs, record.seq)
+	};
 }
 /** Parse one complete header record supplied independently from event rows. */
 /**
 * Refuse a header carrying a format version this build does not read BEFORE
 * validating the current header shape or decoding any event row: a future
-* format need not satisfy today's structural checks at all, and its user must
-* see "upgrade the harness", never "corrupt session log".
+* format need not satisfy this build's structural checks at all, and its user
+* must see "upgrade the harness", never "corrupt session log".
 * @param parsed - the JSON-parsed first line of a session artifact.
 */
 function refuseForeignFormatVersion(parsed) {
@@ -204,6 +243,7 @@ function parseHeaderRecord(record) {
 */
 var SessionLogScanner = class {
 	meta;
+	inheritedEventCount;
 	events = [];
 	fragments = [];
 	fragmentBytes = 0;
@@ -217,7 +257,9 @@ var SessionLogScanner = class {
 	* @param headerRecord - the complete first JSONL record, including its newline.
 	*/
 	constructor(headerRecord) {
-		this.meta = parseHeaderRecord(headerRecord);
+		const parsed = parseHeaderRecord(headerRecord);
+		this.meta = parsed.meta;
+		this.inheritedEventCount = parsed.inheritedEventCount;
 		this.inputBytes = headerRecord.length;
 		this.committedBytes = headerRecord.length;
 	}
@@ -256,7 +298,7 @@ var SessionLogScanner = class {
 		return {
 			inputBytes: this.inputBytes,
 			committedBytes: this.committedBytes,
-			eventCount: this.events.length
+			eventCount: SessionLogOffset(this.events.length)
 		};
 	}
 	/**
@@ -267,6 +309,7 @@ var SessionLogScanner = class {
 		this.finished = true;
 		return {
 			meta: this.meta,
+			inheritedEventCount: this.inheritedEventCount,
 			events: this.events,
 			committedBytes: this.committedBytes
 		};
@@ -276,7 +319,7 @@ var SessionLogScanner = class {
 		this.eventLine += 1;
 		let decoded;
 		try {
-			decoded = decodeStorageRecord(JSON.parse(line.toString("utf8")));
+			decoded = decodeStorageRecord(expandProvenanceFromStorage(JSON.parse(line.toString("utf8"))));
 		} catch {
 			this.issue ??= /* @__PURE__ */ new Error(`corrupt session log: unparsable committed event at line ${this.eventLine}`);
 			return;
@@ -315,22 +358,29 @@ function scanLog(buffer) {
 	return scanner.finish();
 }
 /**
-* Parse just the header line of a log into a {@link SessionHeader}, or
-* `undefined` if it is missing/not a header. Used by `list()` to read session
-* metadata WITHOUT parsing the whole log: a session picker scales with the
-* number of sessions, not the total size of every conversation.
+* Parse just the header line of a log into logical metadata plus its exact
+* inherited cut, or `undefined` if it is missing/not a header.
 * @param firstLine - the first line of a log file (without its trailing newline).
-* @returns the parsed header, or `undefined` when the line is not a well-formed session header.
+* @returns parsed storage metadata, or `undefined` for a malformed header.
 */
-function parseHeaderMeta(firstLine) {
+function parseHeader(firstLine) {
 	let parsed;
 	try {
 		parsed = JSON.parse(firstLine);
 	} catch {
 		return;
 	}
+	refuseForeignFormatVersion(parsed);
 	if (!isHeaderLine(parsed)) return void 0;
 	return fromHeaderLine(parsed);
+}
+/**
+* Parse only the logical header fields needed by lightweight listing.
+* @param firstLine - first JSONL line without its trailing newline.
+* @returns the logical Session header, or `undefined` for a malformed line.
+*/
+function parseHeaderMeta(firstLine) {
+	return parseHeader(firstLine)?.meta;
 }
 //#endregion
 //#region lib/types/zstd-private-decoder.js
@@ -806,8 +856,11 @@ var JsonlSessionPersistence = class extends SessionPersistence {
 			path: logPath(this.root, meta.cwd, meta.id, this.compression)
 		};
 	}
-	create(meta) {
-		return this.coordinator.create(meta);
+	create(meta, inheritedEventCount) {
+		return this.coordinator.create(meta, inheritedEventCount);
+	}
+	ensureMaterialized(session) {
+		return this.coordinator.ensureMaterialized(session);
 	}
 	append(id, events) {
 		return this.coordinator.append(id, events);
@@ -820,6 +873,9 @@ var JsonlSessionPersistence = class extends SessionPersistence {
 	}
 	inspect(id, signal) {
 		return this.coordinator.inspect(id, signal);
+	}
+	borrowSession(id, signal) {
+		return this.coordinator.borrowSession(id, signal);
 	}
 	readFrom(id, fromSeq, signal) {
 		return this.coordinator.readFrom(id, fromSeq, signal);
@@ -885,10 +941,10 @@ var JsonlSessionPersistence = class extends SessionPersistence {
 			}
 			content = Buffer.concat(plaintexts).toString("utf8");
 		} else content = buffer.toString("utf8");
-		const meta = parseHeaderMeta(content.split("\n", 1)[0]);
-		if (meta === void 0 || meta.id !== id) throw new Error(`corrupt session log: invalid header line in "${path}"`);
+		const storage = parseHeader(content.split("\n", 1)[0]);
+		if (storage === void 0 || storage.meta.id !== id) throw new Error(`corrupt session log: invalid header line in "${path}"`);
 		return {
-			meta,
+			...storage,
 			filename: "session.jsonl",
 			content
 		};
@@ -925,10 +981,11 @@ var JsonlSessionPersistence = class extends SessionPersistence {
 			if (this.compression === "zstd") prefix = await this.readZstdPrefix(buffer, signal);
 			else {
 				signal?.throwIfAborted();
-				const { meta, events, committedBytes } = scanLog(buffer);
+				const { meta, inheritedEventCount, events, committedBytes } = scanLog(buffer);
 				signal?.throwIfAborted();
 				prefix = {
 					meta,
+					inheritedEventCount,
 					events,
 					...committedBytes < buffer.byteLength ? { tornMarker: {
 						truncateTo: committedBytes,
@@ -986,6 +1043,7 @@ var JsonlSessionPersistence = class extends SessionPersistence {
 				const prefix = scanner.finish();
 				return {
 					meta: prefix.meta,
+					inheritedEventCount: prefix.inheritedEventCount,
 					events: prefix.events
 				};
 			}
@@ -1003,6 +1061,7 @@ var JsonlSessionPersistence = class extends SessionPersistence {
 			signal?.throwIfAborted();
 			return {
 				meta: recoveredPrefix.meta,
+				inheritedEventCount: recoveredPrefix.inheritedEventCount,
 				events: recoveredPrefix.events,
 				tornMarker: {
 					truncateTo: tornStart,
@@ -1018,20 +1077,26 @@ var JsonlSessionPersistence = class extends SessionPersistence {
 		}
 	}
 	/** Durably append a batch, lazily materializing the file when not yet present. */
-	async appendBatch(meta, events, isMaterialized) {
+	async appendBatch(storage, events, isMaterialized) {
 		await this.ensureRootEncoding();
-		if (isMaterialized) await this.appendLines(meta, events);
-		else await this.materialize(meta, events);
+		if (isMaterialized) await this.appendLines(storage.meta, events);
+		else await this.materialize(storage, events);
+	}
+	/** Materialize a header-only JSONL artifact for an explicitly durable empty session. */
+	async materializeHeader(storage) {
+		await this.materialize(storage, []);
 	}
 	/**
 	* Make a crash repair durable: truncate a torn tail, restore complete events
 	* decoded from it, then append synthetic closers. Two fsync'd steps — the seam
 	* does not require this to be atomic.
 	*/
-	async commitRepair(meta, tornMarker, closers) {
+	async commitRepair(storage, tornMarker, closers) {
+		const { meta } = storage;
 		if (tornMarker !== void 0) await this.repair(meta, tornMarker.truncateTo);
 		const repairedEvents = [...tornMarker?.recoveredEvents ?? [], ...closers];
 		if (repairedEvents.length > 0) await this.appendLines(meta, repairedEvents);
+		if (tornMarker !== void 0) this.ctx.logger.warn(`${this.name}: session "${meta.id}" recovered from a torn tail; incomplete tail bytes were discarded`);
 	}
 	/** List valid unique stored sessions' metadata (header line only — no full-log parse). */
 	async list(signal) {
@@ -1094,12 +1159,13 @@ var JsonlSessionPersistence = class extends SessionPersistence {
 		return artifacts;
 	}
 	/** Atomically write the header line + first batch (temp-write, fsync, publish). */
-	async materialize(meta, events) {
+	async materialize(storage, events) {
+		const { meta } = storage;
 		const project = projectDir(this.root, meta.cwd);
 		const dir = sessionDir(this.root, meta.cwd, meta.id);
 		const finalPath = logPath(this.root, meta.cwd, meta.id, this.compression);
 		await this.rejectOppositeArtifact(meta.cwd, meta.id);
-		const content = await this.encodeMaterialization(meta, events);
+		const content = await this.encodeMaterialization(storage, events);
 		/* v8 ignore next -- native Windows coverage exercises this platform dispatch; Linux covers the POSIX peer */
 		if (process.platform === "win32") await this.materializeWin32(project, dir, finalPath, meta.id, content);
 		else await this.materializePosix(project, dir, finalPath, meta.id, content);
@@ -1168,8 +1234,9 @@ var JsonlSessionPersistence = class extends SessionPersistence {
 		return tmp;
 	}
 	/** Encode the header and first batch without combining their frame boundaries. */
-	async encodeMaterialization(meta, events) {
-		const header = JSON.stringify(toHeaderLine(meta)) + "\n";
+	async encodeMaterialization(storage, events) {
+		const header = JSON.stringify(toHeaderLine(storage.meta, storage.inheritedEventCount)) + "\n";
+		if (events.length === 0) return this.compression === "none" ? header : compressZstdFrame(header);
 		const body = eventLines(events, this.packChunks) + "\n";
 		if (this.compression === "none") return header + body;
 		const headerFrame = await compressZstdFrame(header);
@@ -1435,7 +1502,8 @@ var JsonlSessionPersistence = class extends SessionPersistence {
 		} catch (error) {
 			/* v8 ignore else -- Windows reports file-valued parents as ENOENT; POSIX covers direct ENOTDIR. */
 			if (isENOENT(error)) {
-				await this.assertLogParentAllowsAbsence(path);
+				/* v8 ignore next -- native Windows coverage exercises this platform dispatch; POSIX reports ENOTDIR from open */
+				if (process.platform === "win32") await this.assertLogParentAllowsAbsence(path);
 				return false;
 			}
 			/* v8 ignore next -- Windows repairs ENOTDIR from ENOENT above; POSIX covers direct ENOTDIR. */

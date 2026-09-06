@@ -485,11 +485,15 @@ class OverlayService : Service() {
     Thread {
       var code = -1; var body = ""
       try {
+        // 0.13.3 W9 对账：0.1.2-rc.1 网关 wire = POST /api/<ns>/<method>（斜杠式端点）+
+        // payload = {args:{<wire 参数名>:<值>}}（Typert 描述符强校验，缺 args 即
+        // "Remote payload must contain exactly one plain-object args field"）。
+        // 调用方传的 payload = 参数值对象（session/list={_request:{…}}、其余={request:{…}}）。
         val envelope = JSONObject()
           .put("type", "client-request")
           .put("rpcId", "overlay-" + System.currentTimeMillis())
           .put("method", method)
-          .put("payload", payload)
+          .put("payload", JSONObject().put("args", payload))
         code = -1
         // 0.13.3 W2: one cookie round-trip — on 401 refresh the cookie and retry once.
         for (attempt in 0..1) {
@@ -525,7 +529,7 @@ class OverlayService : Service() {
     if (!engineRunning) { flashStatus("引擎离线，无法停止"); return }
     if (activeSessionId.isEmpty()) { flashStatus("无活动会话"); return }
     setHalo(Halo.WORKING)
-    postRpc("session.cancel", JSONObject().put("sessionId", activeSessionId)) { code, body ->
+    postRpc("session/cancel", JSONObject().put("request", JSONObject().put("sessionId", activeSessionId))) { code, body ->
       if (code == 200) flashStatus("已发送停止指令") else flashStatus("停止失败（HTTP $code）")
     }
   }
@@ -537,13 +541,15 @@ class OverlayService : Service() {
     if (!engineRunning) { flashStatus("引擎离线"); return }
     panel.inputBox?.setText("")
     val steer = sessionBusy   // 发送前的忙态决定模式与提示语（成功回调里已被乐观置忙覆盖）
+    // 0.1.2-rc.1 SessionPromptRequest：requestId 必填（幂等键）+ sessionId/mode/content
     val payload = JSONObject()
+      .put("requestId", "overlay-" + System.currentTimeMillis() + "-" + (0..999).random())
       .put("sessionId", activeSessionId)
       .put("mode", if (steer) "steer" else "queue")
       .put("content", org.json.JSONArray().put(
         JSONObject().put("type", "text").put("text", text)))
     val send = Runnable {
-      postRpc("session.prompt", payload) { code, body ->
+      postRpc("session/prompt", JSONObject().put("request", payload)) { code, body ->
         if (code == 200) {
           // 发送成功：立即亮工作态（乐观忙态）——live 事件（turn_start/tool_call）到来前
           // 原本显示「空闲」，实测被用户点名（2026-09-05）；45s 无 live 确认由探活兜底回退。
@@ -558,7 +564,7 @@ class OverlayService : Service() {
     }
     if (activeSessionId.isEmpty()) {
       // 目标=「新会话」：先 create 再 prompt（用户拍板项：自动建会话为默认）。
-      postRpc("session.create", JSONObject()) { code, body ->
+      postRpc("session/create", JSONObject().put("request", JSONObject())) { code, body ->
         if (code == 200) {
           val sid = extractSessionId(body)
           if (sid.isNotEmpty()) {

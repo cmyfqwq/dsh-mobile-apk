@@ -763,7 +763,7 @@ class OverlayPanel(private val svc: OverlayService) {
 
   /** 拉取 session.list → 刷新「目标会话」下拉（第一项恒为「新会话」）。 */
   internal fun refreshSessionPicker() {
-    svc.postRpc("session.list", JSONObject()) { code, body ->
+    svc.postRpc("session/list", JSONObject().put("_request", JSONObject())) { code, body ->
       val sp = sessionPicker ?: return@postRpc
       val ad = pickerAdapter ?: return@postRpc
       pickerLabels.clear(); pickerIds.clear()

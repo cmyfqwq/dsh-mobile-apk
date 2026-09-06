@@ -156,8 +156,55 @@ document.dispatchEvent(new DragEvent('drop',{dataTransfer:dt}));
 }catch(e){console.error('dsh image pick drop failed',e)}
 }).catch(function(e){console.error('dsh image pick decode failed',e)});
 }catch(e){console.error('dsh image pick bridge failed',e)}
+},
+// 0.13.3 W10：文件路径选择回调（@文件引用重构）——壳 SAF 选文档解析出 primary 真实路径，
+// 页面把 @"<path>" mention 插入 composer（普通 prompt 文本，内容零拷贝），模型用 read
+// 工具按原路径读。payload={path,name,size,mediaType} | {refused:reason} | null（用户取消）。
+onFilePicked:function(callbackId,payload){
+try{
+if(!payload){return}
+var info=typeof payload==='string'?JSON.parse(payload):payload;
+if(info.refused){
+var msg=info.refused==='android-10'
+?'当前系统（Android 10）不支持按路径引用文件：请升级到 Android 11+，或用系统分享把文件发到应用（文件直达）。'
+:info.refused==='not-local-storage'
+?'请选择本机存储（内部存储/SD 卡）中的文件——云端文档或第三方应用内的文件没有可引用的本地路径。'
+:'无法引用该文件（'+info.refused+'）。';
+try{alert(msg)}catch(e){}
+return;
+}
+if(!info.path){return}
+insertFileMention(info.path);
+}catch(e){console.error('dsh file pick bridge failed',e)}
 }
 };
+// 把 @"<path>" mention 写入 composer：textarea（受控组件走原生 setter + input 事件）或
+// 0.1.2-rc.1 Lexical contenteditable（focus + insertText）。mention 是普通文本，模型收到
+// 后调 read 工具读原路径。
+function insertFileMention(path){
+var mention='@"'+path+'"';
+var ta=document.querySelector('textarea');
+if(ta){
+try{
+var setter=Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype,'value').set;
+var cur=ta.value||'';
+var piece=(cur.length>0&&!/[\\s]$/.test(cur)?' ':'')+mention+' ';
+setter.call(ta,cur+piece);
+ta.dispatchEvent(new Event('input',{bubbles:true}));
+ta.focus();
+return;
+}catch(e){console.error('dsh mention textarea insert failed',e)}
+}
+var ce=document.querySelector('[contenteditable="true"]');
+if(ce){
+ce.focus();
+var base=(ce.textContent||'');
+var piece2=(base.length>0&&!/[\\s]$/.test(base)?' ':'')+mention+' ';
+try{document.execCommand('insertText',false,piece2)}catch(e){console.error('dsh mention insert failed',e)}
+return;
+}
+try{alert('未找到输入框：请先打开或新建一个会话')}catch(e){}
+}
 var requestedIds={};
 function pickHeaders(){
 var h={};
@@ -204,10 +251,20 @@ added=true;
 var item=document.createElement('button');
 item.type='button';
 item.setAttribute('data-dsh-file-pick','1');
-item.textContent='上传文件';
+item.textContent='引用文件';
 item.style.cssText='display:flex;align-items:center;gap:8px;width:100%;min-height:40px;padding:8px 10px;border:none;border-radius:10px;background:transparent;cursor:pointer;font-size:14px;line-height:22px;color:var(--dsw-alias-label-primary,#333);text-align:left';
+item.title='选择本机文件，以 @路径 引用（内容不上传，模型直接读取原文件）';
 item.onclick=function(){
 dismissMenu();
+try{
+if(window.androidBridge&&window.androidBridge.pickFilePath){
+// 0.13.3 W10 @文件引用：壳 SAF 选文档 → 真实路径 → onFilePicked 插 mention（零拷贝）
+var cb='dshfp'+Date.now().toString(36)+Math.random().toString(36).slice(2,8);
+window.androidBridge.pickFilePath(cb);
+return;
+}
+}catch(e){console.error('dsh file reference failed',e)}
+// 桥缺失（非壳宿主）：回退 input file 上传链
 var input=document.createElement('input');
 input.type='file';
 input.multiple=true;
