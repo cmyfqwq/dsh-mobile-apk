@@ -48,3 +48,20 @@
 40. **npm arborist 对复杂 peer 树 + 精确 pin 会崩（spec undefined）**：ui-responsive 升 cordis 4.0.2 + client-store rc.1 后，npm install 带包参数崩（Cannot read properties of undefined (reading 'spec')）；且半装 node_modules 会让 "up to date" 谎报。**处置**：删 node_modules + package-lock 全新 install --legacy-peer-deps；peer cordis 从精确 4.0.1 放宽到 ^4.0.2；装完必须回读 node_modules/<pkg>/package.json 验证版本（npm "up to date" 不代表真装）。grep `legacy-peer-deps`。
 41. **overlay 登记表漏项（primitives 缺席 rc.1 升级）**：engine-overlay.json 生成以 research 的 196 包清单为主循环——@deepseek-ai/dsh-client-ui-primitives 在旧树但不在清单 → 未覆盖留在 rc.2。**修复/约定**：登记表必须与基座树全量对账（.tmp-upgrade/audit-manifest.mjs：base-nm-paths 逐包 vs manifest ∪ keepUnpublished，未覆盖即查 npm）；发现 npm 有新版即补登记+拉 tgz。grep `audit-manifest`。
 42. **run-as 的权限视图不代表引擎运行时**（Android 15 模拟器实测）：appops MANAGE_EXTERNAL_STORAGE allow 后 run-as cat /storage/emulated/0 仍 Permission denied（run-as/FUSE 评估差异）——引擎进程（同 uid 真实运行）实测可读（AI 轮 read 工具逐字读回）。验证权限问题必须走引擎运行时（会话轮/工具），不能只信 run-as。grep `run-as`。
+# 坑 43 修复记录（追加 gotchas.md）
+
+## 43 续：白屏静默挂起的真因与修复（第二轮定位）
+
+首轮定位到「create 循环静默挂起」后，用 **Runtime.enable + dist 插桩**（设备侧 python 给 index-Df-65__b.js 的 boot await 链插 console.log）拿到完整时序：**50 个 entries 全部 created、r5-pluginboot-done、mount-effect、r6-mounted 全部触达——boot 管线本身是通的**。真因在 mount 后的 **React 渲染错误**：`Error: strict session slot 'details' rendered without a scope binding`（console error，0.13.2 时代无此强制）。
+
+**根因**：rc.1 对 session-scope 槽（details 等）加了**严格 scope binding 强制**——session-scope 槽必须包在框架注入的 `<SessionProvider>` 里渲染（官方 ui-layout AppFrame 的写法：`jsx(SessionProvider, { children: renderSlot("details", {}) })`，SessionProvider 从 AppFrameProps 解构）。我们 rc.2 时代的 AppFrame 直接裸渲染 `renderSlot('details')` → 渲染期 throw → React 卸载整树 → root 空、且 React 渲染错误不进 Runtime.consoleAPICalled（error boundary 前抛出）→ **零 console 静默白屏**。
+
+**修复**：AppFrame.tsx 三处——① 解构加 `SessionProvider`；② 桌面形态 `DetailsColumn` 内包 `<SessionProvider>{renderSlot('details')}</SessionProvider>`；③ 移动形态 bottom sheet 同款。conversation 是 session-maybe scope（无需 binding）；sidebar 是 root scope。
+
+**定位方法论（可复用）**：
+1. `Runtime.consoleAPICalled` 事件**必须先发 `Runtime.enable`** 才投递——没 enable 时「零 console」是探针假象（本坑第一轮误判「静默」的根因之一）。
+2. 设备侧 python 给 minified bundle 插桩（boot await 链插 console.log）+ push + run-as（带全套引擎 env，坑 22）+ 重启引擎（内存中的旧 bundle 不会自动换）→ CDP reload 读日志——黑盒时序一步到位。
+3. 服务器内存 serve：combo bundle 从 flush 时内存 responses 出（非磁盘直读），**改 dist 文件后必须重启引擎**才生效。
+
+**验证**：SessionProvider 修复 + 第 6 次装机解压后——rootLen=411682、零 error、composer（contenteditable）在场、截图实证完整 UI（Hy3 选择器/会话历史/悬浮球全部在场）、session/create+list+prompt 新 wire 全 PASS。
+
