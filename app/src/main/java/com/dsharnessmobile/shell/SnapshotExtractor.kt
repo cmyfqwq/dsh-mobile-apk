@@ -13,11 +13,11 @@ import org.apache.commons.compress.compressors.xz.XZCompressorInputStream
  * symlink preservation. Used by both the bundled snapshot (assets) and the
  * online update path (downloaded file).
  *
- * After extraction, every executable file gets the Android exec attribute
- * (security.android.exec): Android 15+ apps targeting SDK 35+ may only exec
- * app-data ELF binaries that carry it. The tar does not preserve xattrs
- * through the Java path, so it is stamped via the system setfattr (best
- * effort — kernels that do not enforce it accept the no-op).
+ * Regular files are owner-readable/writable. Their executable bit is based on
+ * their payload signature rather than the tar mode: WSL-mounted archives can
+ * flatten ordinary files to 0777, while Android app processes cannot set the
+ * `security.android.exec` xattr anyway. Engine execution uses linker64 and the
+ * Termux exec hook supplied by EngineManager.
  */
 object SnapshotExtractor {
 
@@ -25,14 +25,29 @@ object SnapshotExtractor {
    * Extract an xz-compressed tar stream.
    * @param input raw xz stream.
    * @param totalBytes expected stream size (for progress; 0 = unknown).
-   * @param dest destination root (filesDir; the archive holds usr/ + home/).
+   * @param dest destination root (the archive holds usr/ + home/).
    * @param onProgress bytesDone, bytesTotal.
+   * @param runtimeRoot absolute link targets are allowed only inside this root. The
+   *   bundled snapshot ships absolute applets (vim/busybox …) that point at the
+   *   *live* runtime path (`files/usr/...`), so extraction into a staging directory
+   *   must still accept them; after the atomic swap they resolve correctly. Defaults
+   *   to [dest] for in-place extraction.
    */
-  fun extract(input: InputStream, totalBytes: Long, dest: File, onProgress: (Long, Long) -> Unit) {
+  fun extract(
+    input: InputStream,
+    totalBytes: Long,
+    dest: File,
+    onProgress: (Long, Long) -> Unit,
+    runtimeRoot: File = dest,
+  ) {
     val xz = XZCompressorInputStream(input)
     val tar = TarArchiveInputStream(xz)
-    val execFiles = mutableListOf<String>()
     val destCanon = dest.canonicalPath
+    val runtimeCanon = try {
+      runtimeRoot.canonicalPath
+    } catch (_: Exception) {
+      destCanon
+    }
     var done = 0L
     var entry: TarArchiveEntry? = tar.nextEntry
     while (entry != null) {
@@ -48,9 +63,8 @@ object SnapshotExtractor {
         entry.isDirectory -> target.mkdirs()
         entry.isSymbolicLink -> {
           target.parentFile?.mkdirs()
-          // 符号链接目标必须也落在解压根内（不解析绝对链接/越界相对链接）。
-          val linkCanon = java.io.File(target.parentFile, entry.linkName).canonicalPath
-          if (!linkCanon.startsWith(destCanon + File.separator)) {
+          val linkPath = java.nio.file.Paths.get(entry.linkName)
+          if (!isLinkTargetAllowed(entry.linkName, target.parentFile, destCanon, runtimeCanon)) {
             Log.w("dsh-snap", "skipping unsafe symlink: " + entry.name + " -> " + entry.linkName)
             entry = tar.nextEntry
             continue
@@ -60,7 +74,7 @@ object SnapshotExtractor {
           // link would survive and createSymbolicLink would throw FileAlreadyExistsException —
           // measured on the v0.10.7 upgrade re-extract). Also safe for regular files/dirs.
           java.nio.file.Files.deleteIfExists(target.toPath())
-          java.nio.file.Files.createSymbolicLink(target.toPath(), java.nio.file.Paths.get(entry.linkName))
+          java.nio.file.Files.createSymbolicLink(target.toPath(), linkPath)
         }
         else -> {
           target.parentFile?.mkdirs()
@@ -70,10 +84,17 @@ object SnapshotExtractor {
           // links, so stale/dangling files are cleared before the new copy is written,
           // mirroring the symlink branch above.
           java.nio.file.Files.deleteIfExists(target.toPath())
+          val prefix = ByteArray(4)
+          var prefixLength = 0
           target.outputStream().use { out ->
             val buf = ByteArray(64 * 1024)
             var n = tar.read(buf)
             while (n >= 0) {
+              if (prefixLength < prefix.size) {
+                val copied = minOf(prefix.size - prefixLength, n)
+                System.arraycopy(buf, 0, prefix, prefixLength, copied)
+                prefixLength += copied
+              }
               out.write(buf, 0, n)
               n = tar.read(buf)
             }
@@ -81,8 +102,7 @@ object SnapshotExtractor {
           target.setReadable(false, false)
           target.setReadable(true, true)
           target.setWritable(true, true)
-          target.setExecutable(entry.mode and 0x40 != 0, true)
-          if (entry.mode and 0x40 != 0) execFiles.add(target.absolutePath)
+          target.setExecutable(SnapshotFileMode.isDirectlyExecutable(prefix, prefixLength), true)
         }
       }
       done += entry.size
@@ -90,7 +110,38 @@ object SnapshotExtractor {
       entry = tar.nextEntry
     }
     tar.close()
-    stampExecAttribute(execFiles)
+  }
+
+  /**
+   * Symlink target policy (sandbox boundary for archives fetched over plain HTTP).
+   *
+   * A relative target must resolve inside [destCanon] (the extraction root). An
+   * absolute target is accepted only inside [runtimeCanon] — the app's live runtime
+   * root — because the bundled snapshot ships absolute applet links
+   * (`files/usr/libexec/busybox/vi`) that must survive staging and resolve after the
+   * atomic swap. Termux residue (`/data/data/com.termux/...`) and escaping targets
+   * stay rejected.
+   */
+  internal fun isLinkTargetAllowed(
+    linkName: String,
+    linkParent: File?,
+    destCanon: String,
+    runtimeCanon: String,
+  ): Boolean {
+    val linkPath = try {
+      java.nio.file.Paths.get(linkName)
+    } catch (_: Exception) {
+      return false
+    }
+    val resolved = if (linkPath.isAbsolute) linkPath else java.io.File(linkParent, linkName).toPath()
+    val linkCanon = try {
+      resolved.normalize().toFile().canonicalPath
+    } catch (_: Exception) {
+      return false
+    }
+    val insideDest = linkCanon == destCanon || linkCanon.startsWith(destCanon + File.separator)
+    val insideRuntime = linkCanon == runtimeCanon || linkCanon.startsWith(runtimeCanon + File.separator)
+    return insideDest || insideRuntime
   }
 
   /** 解析 tar 条目到解压根内目标：拒绝绝对路径、../ 越界；返回 null 表示应跳过该条目。 */
@@ -104,26 +155,6 @@ object SnapshotExtractor {
       if (parentCanon.startsWith(destCanon + File.separator) || parentCanon == destCanon) target else null
     } catch (_: Exception) {
       null
-    }
-  }
-
-  /** Stamp the Android exec attribute on all extracted executables. */
-  private fun stampExecAttribute(files: List<String>) {
-    if (files.isEmpty()) return
-    try {
-      // Args pass straight through (no shell), so quotes/metacharacters in filenames are not interpreted.
-      val base = listOf("/system/bin/setfattr", "-n", "security.android.exec", "-v", "1")
-      // Concurrent batches (max 64 per batch) avoid spawning too many processes at once.
-      files.chunked(64).forEach { batch ->
-        val procs = batch.map { f -> ProcessBuilder(base + f).redirectErrorStream(true).start() }
-        for (p in procs) {
-          val finished = p.waitFor(30, java.util.concurrent.TimeUnit.SECONDS)
-          if (!finished) p.destroyForcibly()
-        }
-      }
-    } catch (_: Throwable) {
-      // Kernels without the exec-attribute check (emulators, older Android)
-      // do not need it; ignore failures here.
     }
   }
 }

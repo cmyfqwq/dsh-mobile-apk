@@ -101,8 +101,19 @@ foreach ($abi in @('arm64', 'x86_64')) {
         $snapIn = $snap
     }
 
-    # 2. 门禁（关键工具存在性 + ELF 架构 + 🔒 机密 + GPL 合规）
+    # 2. 门禁（关键工具存在性 + ELF 架构 + 权限模式 + 🔒 机密 + GPL 合规）
     Write-Host "== 门禁（$abi）=="
+    Write-Host "== 快照权限模式校验（$abi）=="
+    node (Join-Path $Root "scripts\check-snapshot-file-modes.mjs") $snapIn 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        if ($SkipInject) {
+            # -SkipInject 直接打包 build-snapshot 原始产物；WSL 9p 挂载 chmod 无效，模式归一化只
+            # 发生在 inject-all.py 重打包时（dev 专档，禁止用于发布资产）。
+            Write-Host "警告：-SkipInject 档快照未做权限归一化（dev 专档，禁止发布）"
+        } else {
+            Write-Host "快照权限模式校验失败，拒绝打包（$abi）"; continue
+        }
+    }
     # 第三方许可合规（GPL 义务 A1/A2 门禁 2026-08-23）：copyleft 包许可证全文须随快照分发，
     # 矩阵须覆盖 dpkg status 全部包；缺失直接拒绝打包（--- tar 视图：9p 权限不影响判定）。
     node (Join-Path $Root "scripts\check-third-party.mjs") (Join-Path $work "x") --tar $snapIn 2>&1 | Select-Object -First 4

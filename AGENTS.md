@@ -11,7 +11,7 @@
 - **角色**：DeepSeek Harness 安卓壳应用（`com.dsharnessmobile.shell`）。职责边界 = 只保留安卓平台权能与桥（前台服务/看门狗/WebView/SAF 桥/快照解压/UndoGate/ADB 授权/审计/控制台/日志）；**AI 可见能力全部来自插件**。
 - **运行时形态**：内嵌 Termux 快照（`assets/snapshot.tar.xz` → files/usr + files/home）；引擎 `@deepseek-ai/dsh` **0.1.2-rc.1**（0.13.3 起构建期 overlay；/api 全前缀浏览器鉴权——壳侧 EngineAuth 带 Cookie）监听 127.0.0.1:3080；WebView 加载引擎 Web UI。
 - **构建链**：minSdk 26 / targetSdk 34 / compileSdk 36；Kotlin 2.0.21；AGP 8.8.2；Java 17。
-- **版本状态**：**0.13.3 开发中（vc30；引擎升级/鉴权/MuxClient 重做/文件引用重构/W1-W10 代码面全绿；回归与 push/PR 待用户口令）**。0.13.2 已发布（vc29，悬浮球 v2.1 全套）。当前开放跟踪：#115（市场 Phase2）、#108（数据备份）。
+- **版本状态**：**0.13.3 开发中（vc30；引擎升级/鉴权/MuxClient 重做/文件引用重构/W1-W10 代码面全绿；2026-09-08 追加运行时替换事务化（SnapshotTransaction）+ 解压权限/绝对符号链接修复，见坑 44-45；回归与 push/PR 待用户口令）**。0.13.2 已发布（vc29，悬浮球 v2.1 全套）。当前开放跟踪：#115（市场 Phase2）、#108（数据备份）。
 - **兄弟仓库**（协调仓子目录，本仓内含自包含副本——**坑 36 同步铁律**：协调仓改子仓源码/bump 版本后必须 robocopy 镜像到本仓，lib/ 产物一并拷）：`dsh-shell-termux`、`dsh-client-ui-responsive`（0.1.13）、`dsh-host-web-compat`（0.1.9）、`plugins/`（bridge 0.1.4 / manage / linux-env / file-open）、`vendor/`（marketplace、undo-savepoint、dsh-model-sync + PATCHES.md）。
 - **上游** deepseek-ai/deepseek-harness（协调仓 `dsh/` 只读 checkout）：**零改动**；一切适配走补丁/插件/壳侧。
 
@@ -27,13 +27,15 @@ adb -s <serial> install -r -t out\v<版本>\...apk    # 装机（同签名 debug
 
 门禁链：统一补丁 → 引擎 overlay 抽验（check-engine-overlay）→ 单 pass 注入 → 挂载集 → 机密 → third-party → elf-check → gradle。云端自包含构建：`.github/workflows/build-apk.yml`。
 
-## 3. 高频雷点 TOP（一行一条；全量 42 坑 grep docs/AGENTS/gotchas.md）
+## 3. 高频雷点 TOP（一行一条；全量 45 坑 grep docs/AGENTS/gotchas.md）
 
-- **坑 37**：快照重解压中（~8-12 分钟）**禁 force-stop/杀进程**——唯一完成标志 = `.snapshot-fingerprint` 翻转 + `.dsh-backup` 消失；中途杀 → 看门狗拉半解压运行时剪掉用户配置。
+- **坑 37**：快照重解压中（~8-12 分钟）**禁 force-stop/杀进程**——唯一完成标志 = `.snapshot-fingerprint` 翻转 + `.snapshot-transaction` 消失（0.13.3 事务化后不再用 `.dsh-backup`）；中途杀 → 事务恢复会自动回滚，但仍建议等完成。
 - **坑 18/30**：debug 包默认 x86_64 快照装 arm64 必崩；真机安装只用 ps1 对应 ABI 命名产物。
 - **坑 19**：真机改 cordis.patch.yml 后必须冷启动 app（force-stop + start）才重装配。
 - **坑 33**：壳侧所有本地引擎调用一律 `Proxy.NO_PROXY`（系统代理劫持探针）。
 - **坑 38**：运行时补丁升级引擎时必须逐个核对（rc.2 锁定 asset 会抹掉新引擎代码——0.13.3 prompt 阻断实锤）。
+- **坑 44**：WSL 9p 挂载 chmod 无效——归档权限归一化只在 `inject-all.py` 重打包层做（门禁校验注入后快照）。
+- **坑 45**：快照含 9 个指向 `files/usr/...` 的绝对符号链接（vi/vim/nc/editor/pager 等 applet）——暂存解压必须传 `runtimeRoot=filesDir` 放行，否则静默丢链。
 
 ## 4. 详档路由表（grep 形式查询）
 
@@ -55,6 +57,6 @@ adb -s <serial> install -r -t out\v<版本>\...apk    # 装机（同签名 debug
 
 | 时间 | 版本 | 更新内容 | 更新者 |
 |---|---|---|---|
+| 2026-09-08 | 0.13.3 | **运行时替换事务化 + 解压面两处实锤修复（接续 HANDOVER-0.13.3-ISSUES-PERF）**：① `SnapshotTransaction.kt`（新）——`refreshSnapshot` 改为「暂存解压 → 原子交换 → 指纹提交」，标记 `.snapshot-transaction`（STAGED/SWAPPING/SWAPPED + moved 记账）；**用户数据从不移动/复制/删除**（旧 backup/restore 语义退役，`.dsh-backup` 仅作 ≤0.13.2 遗留一次性补写）；`recoverInterruptedRefresh()` 每次启动解析中断事务（前滚/回滚/丢弃）；② `SnapshotFs.kt`（新）NOFOLLOW 原语；③ `SnapshotExtractor` 新增 `runtimeRoot` 参数——放行指向 `files/usr/...` 的绝对符号链接（坑 45，否则暂存解压静默丢 9 条 applet 链），Termux 残留/`../` 逃逸仍拒；④ 权限归一化改在 `inject-all.py` 重打包层（坑 44：WSL 9p chmod 无效）；⑤ 看门狗 ProbeState/UndoGate 单飞/onDestroy 不杀引擎/engine.log 尾部读取（前轮未提交改动）；⑥ 单测 16 项（事务 9 + 解压策略 1 + 用户数据 5 + 文件模式 1）；manage 0.1.3（ui-tree 祖先回退修公开 id/原路径混用，3 项回归） | AI 开发助手 |
 | 2026-09-06 | 0.13.3 | **0.13.3 开发批落地（W1-W10）**：壳侧 EngineAuth（P0/P1）/MuxClient remote.mux/setTextZoom 退役/vc30；构建链 overlay+抽验门禁+pi-drift-F1+model-sync；ui-responsive 0.1.13（store-rehome 适配：client-store 内联 + slots-augment + RUNTIME_STORE_EXEMPTION 退役——rc.1 loader module table 不再应答 client-runtime require 的 boot 硬阻断修复）；host-web-compat 0.1.9（withResolvers + 引用文件按钮）；运行时补丁重出（SPJ/ATT rename 回退）与退役（fs-local/primitives）；AI 实测 read 工作目录外文件 PASS | AI 开发助手 |
 | 2026-09-06 | 0.13.3 | **AGENTS 结构改造（用户拍板）**：主文件瘦身索引 + docs/AGENTS/ 详档（gotchas/modules/build-and-env/bridge-api/gpl-compliance/known-gaps/changelog-archive + Phase 4 五文档迁入）；grep 形式查询路由表；新坑 38-42 登记 | AI 开发助手 |
-| 2026-09-06 | 0.13.2-fix | **Phase 5 终包回归收官**：双模拟器终包探活双 200、零 FATAL；F8 dumpsys 实证球窗 z 序/中心重合；F9 任务移除=完整关闭；报告 docs/PHASE5-REGRESSION-2026-09-05.md | AI 开发助手 |

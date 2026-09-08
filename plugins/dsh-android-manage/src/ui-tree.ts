@@ -111,12 +111,17 @@ export function pruneNodes(
   rawCount: number
   byId: Map<string, { n: UiNode; parentOrig: string }>
   byOrig: Map<string, { n: UiNode; parentOrig: string }>
+  /** 原始 XML 路径 id → 父路径 id（**含被剪掉的中间层**，祖先回退用）。 */
+  parentByOrig: Map<string, string>
 } {
   const seen = new Set<string>()
   const nodes: UiNode[] = []
+  // 全量父链（含剪掉的节点）：祖先回退要能跳过被剪的中间层。
+  const parentByOrig = new Map<string, string>()
   let rawCount = 0
   for (const r of raw) {
     rawCount++
+    parentByOrig.set(r.id, r.parentId)
     const at = r.attrs
     const bounds = parseBounds(at.bounds)
     if (!bounds) continue
@@ -162,7 +167,7 @@ export function pruneNodes(
     byId.set('n' + i, entry)
     byOrig.set(n.id, entry)
   })
-  return { nodes: kept.map((n, i) => ({ ...n, id: 'n' + i, parentId: '' })), rawCount, byId, byOrig }
+  return { nodes: kept.map((n, i) => ({ ...n, id: 'n' + i, parentId: '' })), rawCount, byId, byOrig, parentByOrig }
 }
 
 /** 解析语义引用（"id:n3" / "text:设置" / "desc:搜索" / "rid:..."；裸数字按 id）。
@@ -201,19 +206,25 @@ export function resolveRef(
     : { ok: true, node: pick, matches: cands.slice(0, 5) }
 }
 
-/** 沿父链（原始 XML 路径）找第一个可点击/可编辑祖先——目标节点不可点时的回退。 */
+/** 沿父链（原始 XML 路径）找第一个可点击/可编辑祖先——目标节点不可点时的回退。
+ *
+ *  注意两套 id 的边界：模型看到/引用的是重编号后的公开 id（n0/n1…），而 byOrig 以
+ *  **原始 XML 路径 id**（"0.2.1"）为键。旧实现用 `byOrig.get(node.id)` 查公开 id，
+ *  永远查不到 → 祖先回退静默失效（2026-09-08 修复）。入口必须走 byId（公开 id → 条目），
+ *  再沿 parentByOrig 的全量父链上溯，跳过被剪枝的中间层。 */
 export function findActionableAncestor(
+  byId: Map<string, { n: UiNode; parentOrig: string }>,
   byOrig: Map<string, { n: UiNode; parentOrig: string }>,
+  parentByOrig: Map<string, string>,
   node: UiNode,
 ): UiNode | null {
-  const entry = byOrig.get(node.id)
+  const entry = byId.get(node.id) ?? byOrig.get(node.id)
   if (!entry) return null
   let cur = entry.parentOrig
-  for (let i = 0; i < 16 && cur !== ''; i++) {
+  for (let i = 0; i < 32 && cur !== ''; i++) {
     const hit = byOrig.get(cur)
-    if (!hit) break
-    if (hit.n.clickable || hit.n.editable || hit.n.scrollable) return hit.n
-    cur = hit.parentOrig
+    if (hit && (hit.n.clickable || hit.n.editable || hit.n.scrollable)) return hit.n
+    cur = parentByOrig.get(cur) ?? ''
   }
   return null
 }

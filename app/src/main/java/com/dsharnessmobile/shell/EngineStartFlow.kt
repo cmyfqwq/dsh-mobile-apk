@@ -13,6 +13,11 @@ import java.io.File
  */
 internal class EngineStartFlow(private val activity: MainActivity) {
 
+  private val UI_DEAD_CONFIRMATIONS = 2
+
+  /** Minimum spacing between retries of a failed engine page (see the monitor below). */
+  private val ENGINE_PAGE_RELOAD_INTERVAL_MS = 30_000L
+
   private val flowRunning = java.util.concurrent.atomic.AtomicBoolean(false)
   /** Invalidates stale startup work when the user closes or explicitly restarts the engine. */
   private val flowGeneration = java.util.concurrent.atomic.AtomicLong(0)
@@ -23,24 +28,46 @@ internal class EngineStartFlow(private val activity: MainActivity) {
    *  失败不永远停在 Error 引导页等手动操作。手动重试（onStartEngine）归零计数。 */
   internal var engineRetryCount = 0
 
-  /** 前台引擎监控：3s 轮询探测，down→测试界面、up→恢复 WebUI
-   *  （"设置里杀进程/引擎崩溃回退测试界面"的落地；watchdog 负责恢复）。 */
+  /** Foreground liveness is deliberately conservative: a slow HTTP response is
+   * not proof that the local Node process died. Only consecutive probe misses
+   * with a closed local port replace the active WebView with recovery UI. */
+  private var engineMonitorFailures = 0
+  /** Throttles retries of an engine page that failed while the engine was still booting. */
+  private var lastEnginePageReloadAt = 0L
   private val engineMonitorHandler = android.os.Handler(android.os.Looper.getMainLooper())
   private val engineMonitorRunnable = object : Runnable {
     override fun run() {
       val monitor = this
       Thread {
-        val running = try { EngineProbe.check(500).optBoolean("running", false) } catch (_: Exception) { false }
+        val probe = try { EngineProbe.check(1_500) } catch (_: Exception) { null }
+        val httpAlive = probe?.optBoolean("running", false) == true
+        val portAlive = EngineProbe.portReachable(500)
         activity.runOnUiThread {
           if (activity.webViewReady && activity.guideViewReady && !activity.userClosedEngine) {
-            if (!running && activity.webView.visibility == View.VISIBLE) {
-              activity.applyGuidePhase(GuidePhase.Recovering, "引擎未运行，正在自动恢复…")
-              activity.showGuide()
-            } else if (running && activity.guideView.visibility == View.VISIBLE) {
-              activity.showWeb()
+            if (httpAlive || portAlive) {
+              engineMonitorFailures = 0
+              if (httpAlive) {
+                if (activity.guideView.visibility == View.VISIBLE) {
+                  activity.showWeb()
+                } else if (activity.enginePageFailed &&
+                  System.currentTimeMillis() - lastEnginePageReloadAt > ENGINE_PAGE_RELOAD_INTERVAL_MS
+                ) {
+                  // The engine answered only after the WebView had already shown its
+                  // error page (long snapshot refresh): retry that navigation instead
+                  // of leaving the user on ERR_CONNECTION_REFUSED.
+                  lastEnginePageReloadAt = System.currentTimeMillis()
+                  try { activity.webView.reload() } catch (_: Exception) { }
+                }
+              }
+            } else if (activity.webView.visibility == View.VISIBLE) {
+              engineMonitorFailures++
+              if (engineMonitorFailures >= UI_DEAD_CONFIRMATIONS) {
+                activity.applyGuidePhase(GuidePhase.Recovering, "引擎未运行，正在自动恢复…")
+                activity.showGuide()
+              }
             }
           }
-          if (!activity.userClosedEngine) engineMonitorHandler.postDelayed(monitor, 3000)
+          if (!activity.userClosedEngine) engineMonitorHandler.postDelayed(monitor, 3_000)
         }
       }.start()
     }
@@ -240,6 +267,10 @@ internal class EngineStartFlow(private val activity: MainActivity) {
         activity.applyGuidePhase(GuidePhase.Starting, "正在启动引擎…")
         activity.showGuide()
       }
+      // Resolve a runtime transaction interrupted by a kill, an OEM cleaner or a
+      // low-memory restart before deciding whether the snapshot is current.
+      activity.engineManager.recoverInterruptedRefresh()
+      if (!isCurrentEngineFlow(generation)) return@Thread
       if (!activity.engineManager.snapshotFresh()) {
         if (!isCurrentEngineFlow(generation)) return@Thread
         activity.runOnUiThread {
@@ -248,18 +279,28 @@ internal class EngineStartFlow(private val activity: MainActivity) {
           activity.guideRenderer.progressText.visibility = View.VISIBLE
           activity.guideRenderer.progressText.text = "准备写入内嵌环境…"
         }
-        val ok = activity.engineManager.refreshSnapshot { done, _ ->
-          activity.runOnUiThread {
-            if (!isCurrentEngineFlow(generation)) return@runOnUiThread
-            // done 是解压后字节数，total 是压缩包字节数，口径不一致；只显示已解压量。
-            val mb = done / 1024 / 1024
-            activity.guideRenderer.progressText.visibility = View.VISIBLE
-            activity.guideRenderer.progressText.text = "已写入 " + mb + " MB"
-            if (activity.guideRenderer.lastGuidePhase != GuidePhase.Extracting) {
-              activity.applyGuidePhase(GuidePhase.Extracting, "正在解压运行时")
+        val ok = activity.engineManager.refreshSnapshot(
+          onProgress = { done, _ ->
+            activity.runOnUiThread {
+              if (!isCurrentEngineFlow(generation)) return@runOnUiThread
+              // done 是解压后字节数，total 是压缩包字节数，口径不一致；只显示已解压量。
+              val mb = done / 1024 / 1024
+              activity.guideRenderer.progressText.visibility = View.VISIBLE
+              activity.guideRenderer.progressText.text = "已写入 " + mb + " MB"
+              if (activity.guideRenderer.lastGuidePhase != GuidePhase.Extracting) {
+                activity.applyGuidePhase(GuidePhase.Extracting, "正在解压运行时")
+              }
             }
-          }
-        }
+          },
+          onStage = { stage ->
+            activity.runOnUiThread {
+              if (!isCurrentEngineFlow(generation)) return@runOnUiThread
+              activity.applyGuidePhase(GuidePhase.Extracting, "正在更新运行时")
+              activity.guideRenderer.progressText.visibility = View.VISIBLE
+              activity.guideRenderer.progressText.text = stage
+            }
+          },
+        )
         if (!ok) {
           activity.runOnUiThread {
             if (!isCurrentEngineFlow(generation)) return@runOnUiThread

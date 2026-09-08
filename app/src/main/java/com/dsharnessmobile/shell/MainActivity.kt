@@ -48,6 +48,9 @@ class MainActivity : ComponentActivity() {
     private set
   internal lateinit var guideView: LinearLayout
     private set
+  /** True only after WebView reported a load error for the local engine origin. */
+  @Volatile
+  internal var enginePageFailed = false
   /** Bottom insets in CSS px, cached until the engine page is ready to receive them. */
   private var webSystemBottomInset = 0
   private var webImeBottomInset = 0
@@ -299,7 +302,9 @@ class MainActivity : ComponentActivity() {
       themeRetryRunnable?.let { webView.removeCallbacks(it) }
       webView.destroy()
     }
-    engineManager.stopEngine()
+    // EngineService owns the child lifecycle. An Activity can be recreated by
+    // rotation, OEM memory policy, or a WebView transition without meaning that
+    // the user asked to interrupt an active agent turn.
   }
 
   override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
@@ -355,7 +360,22 @@ class MainActivity : ComponentActivity() {
       }
 
       override fun onReceivedError(view: WebView, errorCode: Int, description: String, failingUrl: String) {
-        if (isEngineSource(failingUrl)) showGuide()
+        if (isEngineSource(failingUrl)) {
+          enginePageFailed = true
+          showGuide()
+        }
+      }
+
+      /**
+       * A failed navigation fires onReceivedError and *then* onPageFinished, so the
+       * error state must be cleared when the next load starts — clearing it in
+       * onPageFinished would erase the evidence of the error page that is still on
+       * screen, and showWeb() would then never reload it (measured 2026-09-08: after
+       * a multi-minute snapshot refresh the WebView stayed on ERR_CONNECTION_REFUSED).
+       */
+      override fun onPageStarted(view: WebView, url: String, favicon: android.graphics.Bitmap?) {
+        super.onPageStarted(view, url, favicon)
+        if (isEngineSource(url)) enginePageFailed = false
       }
 
       override fun onPageFinished(view: WebView, url: String) {

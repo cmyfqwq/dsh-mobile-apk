@@ -18,7 +18,6 @@ import lzma
 import os
 import sys
 import tarfile
-import time
 
 PROFILES = ("web", "headless")
 DSH_ANDROID_NS = "node_modules/@dsh-android/"
@@ -159,16 +158,23 @@ def main():
     with tarfile.open(fileobj=io.BytesIO(raw), mode="r:*") as tin, \
             tarfile.open(fileobj=outbuf, mode="w", format=tarfile.PAX_FORMAT) as tout:
 
-        def push(data, name, mtime, mode):
+        def mode_for(data):
+            # 权限归一化（0.13.3）：快照源树在 WSL 9p 挂载上恒为 0777（chmod 无效），
+            # 归档权限只能在重打包时按内容判定——ELF/shebang 可执行，其余数据文件不可执行。
+            # Android 侧解压器同样按内容赋权，此处让归档本身可审计、可门禁校验。
+            return 0o700 if data.startswith(b'\x7fELF') or data.startswith(b'#!') else 0o600
+
+        def push(data, name, mtime):
             newm = tarfile.TarInfo(name)
             newm.size = len(data)
             newm.mtime = mtime
-            newm.mode = mode
+            newm.mode = mode_for(data)
             tout.addfile(newm, io.BytesIO(data))
 
         for member in tin:
             name = member.name
             if member.isfile():
+                data = None
                 hit = match_dsh_android(name, dsh_names) or match_ext(name, ext_names)
                 if hit is not None:
                     pkg, rel = hit
@@ -176,44 +182,48 @@ def main():
                     data = pool[pkg].get(rel)
                     if data is not None:
                         (seen_dsh if pkg in dsh_names else seen_ext).add(pkg)
-                        push(data, name, int(member.mtime), member.mode)
+                        push(data, name, int(member.mtime))
                         replaced += 1
                         continue
                 if name.startswith("home/.dsh/profiles/") and name.endswith("/cordis.patch.yml") \
                         and "/node_modules/" not in name:
                     prof = name.split("/")[3]
                     if prof == "web" or all_profiles:
-                        push(patch_bytes, name, int(member.mtime), member.mode)
+                        push(patch_bytes, name, int(member.mtime))
                         replaced += 1
                         print("  patch replaced:", name)
-                    else:
-                        print("  skip (non-web profile):", name)
-                        tout.addfile(member, tin.extractfile(member))
-                    continue
-                tout.addfile(member, tin.extractfile(member))
+                        continue
+                    print("  skip (non-web profile):", name)
+                if data is None:
+                    data = tin.extractfile(member).read()
+                member.mode = mode_for(data)
+                tout.addfile(member, io.BytesIO(data))
             else:
+                if member.isdir():
+                    member.mode = 0o700
                 # symlink/dir/hardlink：无内容，元数据原样复制
                 tout.addfile(member)
 
         # 追加模式：快照内不存在的包 → 全部文件落到 web profile（目录项一并生成）
-        now = int(time.time())
+        # 可复现性（2026-09-08）：新增文件用固定 mtime（SOURCE_DATE_EPOCH 可覆写），
+        # 否则同一输入的两次构建 sha256 不同 → 设备每次装机都判定「快照变了」重解压。
+        now = int(os.environ.get("SOURCE_DATE_EPOCH", "1704067200"))
         for pkg in sorted(dsh_names - seen_dsh):
             base = f"home/.dsh/profiles/web/node_modules/@dsh-android/{pkg}"
             for dirpath in [base, base + "/lib"]:
                 ti = tarfile.TarInfo(dirpath)
                 ti.type = tarfile.DIRTYPE
-                ti.mode = 0o755
+                ti.mode = 0o700
                 ti.mtime = now
                 tout.addfile(ti)
             for rel, data in sorted(dsh_repl[pkg].items()):
-                push(data, base + "/" + rel, now, 0o644)
+                push(data, base + "/" + rel, now)
                 added_files += 1
             print(f"  [add] @dsh-android/{pkg} ({len(dsh_repl[pkg])} files)")
         for pkg in sorted(ext_names - seen_ext):
             base = f"home/.dsh/profiles/web/node_modules/{pkg}"
             for rel, data in sorted(ext_repl[pkg].items()):
-                mode = 0o755 if rel.endswith(".sh") or (rel.startswith("lib/") and data[:2] == b"#!") else 0o644
-                push(data, base + "/" + rel, now, mode)
+                push(data, base + "/" + rel, now)
                 added_files += 1
             print(f"  [add] {pkg} ({len(ext_repl[pkg])} files)")
 

@@ -25,18 +25,22 @@ object WatchdogV2 {
   private const val TAG = "dsh-watchdog"
   const val MAX_CONSEC_FAILURES = 12
 
+  /** A slow HTTP response is distinct from a process that no longer accepts TCP. */
+  enum class ProbeState { HEALTHY, DEGRADED, DEAD }
+
   @Volatile
   var consecutiveFailures = 0
     private set
 
-  /** 指数退避：5s * 2^n，封顶 80s。返回下次探测延迟（ms）。 */
+  /** Exponential delay for destructive recovery attempts after confirmed death. */
   fun nextDelayMs(): Long {
-    val n = consecutiveFailures.coerceAtMost(4)
+    val n = (consecutiveFailures - 1).coerceAtLeast(0).coerceAtMost(4)
     return (5_000L shl n).coerceAtMost(80_000L)
   }
 
-  fun recordProbe(healthy: Boolean) {
-    consecutiveFailures = if (healthy) 0 else consecutiveFailures + 1
+  /** Only a confirmed dead process contributes to the restart/undo circuit breaker. */
+  fun recordProbe(state: ProbeState) {
+    consecutiveFailures = if (state == ProbeState.DEAD) consecutiveFailures + 1 else 0
   }
 
   fun tripped(): Boolean = consecutiveFailures >= MAX_CONSEC_FAILURES
@@ -45,20 +49,24 @@ object WatchdogV2 {
     consecutiveFailures = 0
   }
 
-  /** 深度探活：EngineProbe + 插件/权限端点 + 引擎日志尾部异常扫描。 */
-  fun deepProbe(context: Context): Boolean {
-    val base = EngineProbe.check().optBoolean("running", false)
-    if (!base) return false
-    // 插件树/桥端点（bridge 插件注册；未注册时 404=false 但引擎健康仍算通过——以 base 为准）
-    // 2026-08-23 修复：旧代码 (pluginHealth || true) 恒真 —— 白跑一次 HTTP 且死代码。
-    // 桥端点仅用于对时状态采样；日志异常扫描才是探活退出面的信号（插件树近期变化
-    // 由 engine.log 的 "plugin tree failed to load" 捕获）。
-    val logOk = !engineLogShowsFailure(context)
-    // F0.3 事件桥消费（2026-08-24）：引擎任务完成标记 → 系统通知（探活成功才消费，避免引擎
-    // 挂死时误弹；消费幂等——读完即清）。
-    if (logOk) consumeTaskDoneMarkers(context)
-    return base && logOk
+  /**
+   * Classifies liveness without treating a temporary HTTP stall or a historical
+   * log line as proof of process death. A live port is degraded because the UI
+   * may be slow, but restarting it would interrupt the active turn.
+   */
+  fun assessProbe(context: Context): ProbeState {
+    val base = EngineProbe.check(2_500).optBoolean("running", false)
+    if (!base) return if (EngineProbe.portReachable(1_000)) ProbeState.DEGRADED else ProbeState.DEAD
+    if (engineLogShowsFailure(context)) {
+      LogCollector.log(TAG, "engine log reports a recoverable warning while HTTP remains alive")
+      return ProbeState.DEGRADED
+    }
+    consumeTaskDoneMarkers(context)
+    return ProbeState.HEALTHY
   }
+
+  /** Compatibility projection for callers that only need a strict HTTP health bit. */
+  fun deepProbe(context: Context): Boolean = assessProbe(context) == ProbeState.HEALTHY
 
   /** 引擎事件桥标记文件（dsh-android-bridge 写入 home/.dsh/.task-done.ndjson；经 context 推导）。 */
   private fun taskMarkerFile(context: Context): java.io.File =

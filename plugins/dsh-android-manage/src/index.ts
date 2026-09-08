@@ -358,7 +358,7 @@ function tools(priv: PrivilegeFace) {
   // 引擎单进程内模块级缓存（n 值 ≤60，内存代价可忽略）。
   const UI_CACHE_TTL = 30_000
   let uiCache:
-    | { nodes: UiNode[]; byId: ReturnType<typeof pruneNodes>['byId']; byOrig: ReturnType<typeof pruneNodes>['byOrig']; screen: { w: number; h: number }; rotation: number; ts: number }
+    | { nodes: UiNode[]; byId: ReturnType<typeof pruneNodes>['byId']; byOrig: ReturnType<typeof pruneNodes>['byOrig']; parentByOrig: ReturnType<typeof pruneNodes>['parentByOrig']; screen: { w: number; h: number }; rotation: number; ts: number }
     | null = null
 
   /** F2 统一坐标系锚点：屏幕物理尺寸（wm size）。uiDump 缓存优先，否则现场查。 */
@@ -438,6 +438,7 @@ function tools(priv: PrivilegeFace) {
           nodes: pruned.nodes,
           byId: pruned.byId,
           byOrig: pruned.byOrig,
+          parentByOrig: pruned.parentByOrig,
           screen,
           rotation: parsed.rotation,
           ts: Date.now(),
@@ -510,7 +511,7 @@ function tools(priv: PrivilegeFace) {
         if (!hit.ok) return { ok: false, denied: false, text: hit.error }
         let node = hit.node
         if (!node.clickable && !node.editable && !node.scrollable) {
-          const anc = findActionableAncestor(uiCache.byOrig, node)
+          const anc = findActionableAncestor(uiCache.byId, uiCache.byOrig, uiCache.parentByOrig, node)
           if (!anc) return { ok: false, denied: false, text: `目标「${(node.text || node.desc).slice(0, 20)}」不可点击且无可用祖先——考虑滚动或重新 dump` }
           node = anc
         }

@@ -179,9 +179,12 @@ internal class GuidePageRenderer(private val activity: MainActivity) {
   fun showWeb() {
     activity.guideView.visibility = View.GONE
     activity.webView.visibility = View.VISIBLE
-    // The WebView may have rendered an error page before the engine was
-    // ready (engine boot takes seconds); reload now that it answers.
-    activity.webView.reload()
+    // Preserve the existing WebView session across a liveness transition. Only
+    // a documented engine-origin load error requires a fresh navigation.
+    if (activity.enginePageFailed) {
+      activity.enginePageFailed = false
+      activity.webView.reload()
+    }
   }
 
   /** 进入测试界面（引擎失败/未就绪回退）：状态 + 崩溃横幅 + engine.log 摘要。 */
@@ -212,7 +215,18 @@ internal class GuidePageRenderer(private val activity: MainActivity) {
     val f = File(activity.filesDir, "engine.log")
     if (!f.exists()) return ""
     return try {
-      f.readLines().takeLast(lines).joinToString("\n")
+      java.io.RandomAccessFile(f, "r").use { file ->
+        val start = (file.length() - 16 * 1024).coerceAtLeast(0)
+        file.seek(start)
+        val bytes = ByteArray((file.length() - start).toInt())
+        file.readFully(bytes)
+        val tail = java.util.ArrayDeque<String>(lines)
+        String(bytes, Charsets.UTF_8).lineSequence().forEach { line ->
+          if (tail.size == lines) tail.removeFirst()
+          tail.addLast(line)
+        }
+        tail.joinToString("\n")
+      }
     } catch (_: Exception) {
       ""
     }

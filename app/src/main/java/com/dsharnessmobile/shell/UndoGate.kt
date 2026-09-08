@@ -24,6 +24,7 @@ import java.io.File
 object UndoGate {
 
   private const val TAG = "dsh-undo"
+  private val autoUndoRunning = java.util.concurrent.atomic.AtomicBoolean(false)
 
   /** 看门狗连续失败触发阈值（与 WatchdogV2.MAX_CONSEC_FAILURES 对齐但更保守：熔断即触发）。 */
   const val TRIGGER_CONSEC_FAILURES = 6
@@ -34,16 +35,30 @@ object UndoGate {
   /** 崩溃纪元间隔：距上次自动 undo 完成 < 该间隔时不再自动执行（防循环）。 */
   const val RETRY_WINDOW_MS = 30 * 60 * 1000L
 
-  /** 记录一次探测失败（带时间戳）；返回是否应该触发自动 undo。 */
+  /**
+   * Records the first confirmed-dead observation, then grants exactly one caller
+   * the right to execute after [WATCH_MS]. A healthy probe disarms the wait.
+   */
   fun onProbeFailure(context: Context, consecutiveFailures: Int): Boolean {
     if (consecutiveFailures < TRIGGER_CONSEC_FAILURES) return false
+    val now = System.currentTimeMillis()
     val last = lastUndoAt(context)
-    if (last != null && System.currentTimeMillis() - last < RETRY_WINDOW_MS) {
+    if (last != null && now - last < RETRY_WINDOW_MS) {
       Log.i(TAG, "auto-undo suppressed: last undo at $last (within retry window)")
       return false
     }
     val armedAt = armFile(context).takeIf { it.exists() }?.readText()?.trim()?.toLongOrNull()
-    if (armedAt != null && System.currentTimeMillis() - armedAt < WATCH_MS) {
+    if (armedAt == null) {
+      try {
+        armFile(context).writeText(now.toString())
+      } catch (t: Throwable) {
+        Log.e(TAG, "auto-undo arm failed", t)
+        return false
+      }
+      Log.i(TAG, "auto-undo armed at $now; waiting $WATCH_MS ms")
+      return false
+    }
+    if (now - armedAt < WATCH_MS) {
       Log.i(TAG, "auto-undo delay: armed at $armedAt, waiting watch window")
       return false
     }
@@ -57,30 +72,36 @@ object UndoGate {
    * 3. 返回是否执行了回滚（+ 摘要）
    */
   fun execute(context: Context, engine: EngineManager): UndoResult {
-    val dsh = File(engine.homeDir, ".dsh")
-    val cli = File(context.filesDir, "undo-emergency.mjs")
-    if (!cli.exists()) {
-      Log.e(TAG, "auto-undo aborted: emergency CLI not deployed at " + cli.absolutePath)
-      return UndoResult(false, "急救 CLI 未部署", null)
+    if (!autoUndoRunning.compareAndSet(false, true)) return UndoResult(false, "自动回撤已在执行", null)
+    try {
+      val dsh = File(engine.homeDir, ".dsh")
+      val cli = File(context.filesDir, "undo-emergency.mjs")
+      if (!cli.exists()) {
+        Log.e(TAG, "auto-undo aborted: emergency CLI not deployed at " + cli.absolutePath)
+        return UndoResult(false, "急救 CLI 未部署", null)
+      }
+      // 先确认有快照（空库不执行，避免空转）
+      val list = runCli(context, engine, cli, dsh, listOf("list"))
+      if (!list.any { it.startsWith("2026") || it.startsWith("20") } && !list.any { it.contains("[auto]") }) {
+        Log.i(TAG, "auto-undo skipped: no snapshots found")
+        return UndoResult(false, "无快照可回滚", null)
+      }
+      val out = runCli(context, engine, cli, dsh, listOf("restore-last-good"))
+      val ok = out.any { it.contains("完成：还原") }
+      val summary = out.joinToString("\n")
+      if (ok) {
+        markerFile(context).writeText(System.currentTimeMillis().toString())
+        LogCollector.log(TAG, "auto-undo executed: restore-last-good ok")
+      } else {
+        Log.e(TAG, "auto-undo failed: " + summary)
+      }
+      // 0.13.1 W3：急救触发即镜像现场到共享目录（引擎循环崩溃导致用户完全无法取日志的场景）。
+      engine.mirrorDiagnosticsToShared("undo-gate")
+      return UndoResult(ok, summary, if (ok) restoreTarget(out) else null)
+    } finally {
+      armFile(context).delete()
+      autoUndoRunning.set(false)
     }
-    // 先确认有快照（空库不执行，避免空转）
-    val list = runCli(context, engine, cli, dsh, listOf("list"))
-    if (!list.any { it.startsWith("2026") || it.startsWith("20") } && !list.any { it.contains("[auto]") }) {
-      Log.i(TAG, "auto-undo skipped: no snapshots found")
-      return UndoResult(false, "无快照可回滚", null)
-    }
-    val out = runCli(context, engine, cli, dsh, listOf("restore-last-good"))
-    val ok = out.any { it.contains("完成：还原") }
-    val summary = out.joinToString("\n")
-    if (ok) {
-      markerFile(context).writeText(System.currentTimeMillis().toString())
-      LogCollector.log(TAG, "auto-undo executed: restore-last-good ok")
-    } else {
-      Log.e(TAG, "auto-undo failed: " + summary)
-    }
-    // 0.13.1 W3：急救触发即镜像现场到共享目录（引擎循环崩溃导致用户完全无法取日志的场景）。
-    engine.mirrorDiagnosticsToShared("undo-gate")
-    return UndoResult(ok, summary, if (ok) restoreTarget(out) else null)
   }
 
   /** 从 CLI 输出提取恢复目标快照 id；解析失败返回 null（不阻断）。 */
@@ -137,6 +158,11 @@ object UndoGate {
       Log.e(TAG, "emergency CLI run failed", t)
       listOf("emergency CLI failed: " + (t.message ?: t.javaClass.simpleName))
     }
+  }
+
+  /** Clears a pending observation window after the engine becomes reachable. */
+  fun disarm(context: Context) {
+    armFile(context).delete()
   }
 
   /** 清除自动 undo 标记（引擎健康确认/用户手动操作后调用）。 */

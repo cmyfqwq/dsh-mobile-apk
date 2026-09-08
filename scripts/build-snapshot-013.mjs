@@ -65,12 +65,14 @@ if (existsSync(STAGE)) {
 }
 mkdirSync(join(STAGE, 'root'), { recursive: true })
 // WSL 解压保 symlink（Windows bsdtar 需特权）
+// 多线程优先铁律（2026-09-08）：基座 tar.xz 是多块流（xz --list 实证 21/5 块），
+// `xz -dT0 | tar -x` 并行解码，替代 `tar -xJf` 的单线程解码路径。
 log('解压基座（WSL）…')
-wsl(`mkdir -p "${wslPath(join(STAGE, 'root'))}" && tar -xJf "${wslPath(baseTar)}" -C "${wslPath(join(STAGE, 'root'))}" && du -sh ${wslPath(join(STAGE, 'root', 'usr'))} | cut -f1`)
+wsl(`set -o pipefail; mkdir -p "${wslPath(join(STAGE, 'root'))}" && xz -dT0 -c "${wslPath(baseTar)}" | tar -x -C "${wslPath(join(STAGE, 'root'))}" && du -sh ${wslPath(join(STAGE, 'root', 'usr'))} | cut -f1`)
 // home/.dsh 配置层在独立基座包（架构无关），一并合并
 const baseDsh = join(BASE_DIR, 'base-dsh.tar.xz')
 if (existsSync(baseDsh)) {
-  wsl(`tar -xJf "${wslPath(baseDsh)}" -C "${wslPath(join(STAGE, 'root'))}"`)
+  wsl(`set -o pipefail; xz -dT0 -c "${wslPath(baseDsh)}" | tar -x -C "${wslPath(join(STAGE, 'root'))}"`)
   log('合并 base-dsh（home/.dsh 配置层）')
 }
 // 🔒 机密剥离（安全审计 C1，2026-08-23）：base-dsh 是从运行中设备提取的配置层，
@@ -673,6 +675,34 @@ const pnpmDist = join(U, 'lib', 'node_modules', 'pnpm', 'dist')
 }
 log('瘦身扩展完成（pnpm reflink.win32/darwin .node 已剔除）')
 
+// ── 8a2b. 全局 Node 重复包：引擎内副本保留，孤儿 global 副本删除 ───────────
+// @img/sharp-wasm32 在 global node_modules 没有消费者（global 无 sharp 本体），
+// 而 dsh 引擎树内有解析副本；仅当引擎内副本在场时才删 global，否则保留（它可能
+// 是唯一可解析的副本，删了会让 sharp 的 wasm 兜底失效）。@emnapi/runtime 不删：
+// 引擎内无副本，global 那份可能正是引擎树的解析目标。
+log('瘦身扩展：global node_modules 孤儿重复包…')
+{
+  const globalNodeModules = join(U, 'lib', 'node_modules')
+  for (const pkg of SLIM.orphanGlobalNodePackages ?? []) {
+    const globalDir = overlayPkgDir(pkg, globalNodeModules)
+    const engineDir = overlayPkgDir(pkg)
+    if (!existsSync(join(globalDir, 'package.json'))) continue
+    if (!existsSync(join(engineDir, 'package.json'))) {
+      log(`  保留 global ${pkg}：引擎内解析副本不在场（可能是唯一副本）`)
+      continue
+    }
+    wsl(`rm -rf "${wslPath(globalDir)}"`)
+    log(`  删除 global 重复包 ${pkg}（引擎内副本在场）`)
+  }
+}
+log('瘦身扩展完成（global 孤儿重复包已剔除）')
+
+// ── 8a3. 权限归一化：不在本步做 ───────────────────────────────────────────
+// 实测（2026-09-08）：WSL 的 /mnt/d 9p 挂载未启用 metadata，chmod 恒被忽略（stat 仍 777），
+// 因此「归档前 chmod 整棵树」在 Windows 侧是无效步骤，只会白走 6 万文件。归档权限的唯一
+// 权威落点是 inject-all.py 重打包时按内容判定（ELF/shebang=0700，数据文件=0600，目录=0700），
+// 门禁 scripts/check-snapshot-file-modes.mjs 校验的正是注入后快照（APK 内嵌 + 发布资产同源）。
+
 // ── 8. 归档 ────────────────────────────────────────────────────────────
 log('归档 snapshot.tar.xz…')
 const archive = join(OUT_DIR, 'snapshot.tar.xz')
@@ -680,9 +710,14 @@ rmSync(archive, { force: true })
 // 输出结构对齐既有快照：usr/ + home/.dsh/ + home/.gitconfig（home 其余目录不随快照）
 // 2c 提速（2026-09-05 实测）：tar -cJf 单线程 xz → tar -c | xz -T0 -6 多线程（同 preset 档，
 // 743MB tar 380s 级 → 48s；产物字节因分块并行而不同，sha256 由下游重算，一致性门禁不受影响）。
+// 可复现性（2026-09-08）：tar 记录的是 stage 树的 mtime（= 每次构建的解压时刻），会让**内容
+// 完全相同的两次构建**产出不同 sha256 → 设备每次都判定「快照变了」并重解压（模拟器实测每次
+// 多花 3-5 分钟）。统一 `--mtime=@<固定纪元>`（GNU tar）后，同一输入的产物字节稳定；inject-all.py
+// 新增文件同样取固定 mtime（SOURCE_DATE_EPOCH 可覆写）。
+const SOURCE_DATE_EPOCH = process.env.SOURCE_DATE_EPOCH ?? '1704067200'
 wsl(`
   cd "${wslPath(join(STAGE, 'root'))}" && \
-  tar -c usr home/.dsh home/.gitconfig 2>/dev/null | xz -T0 -6 > "${wslPath(archive)}" && \
+  tar -c --mtime=@${SOURCE_DATE_EPOCH} usr home/.dsh home/.gitconfig 2>/dev/null | xz -T0 -6 > "${wslPath(archive)}" && \
   ls -lh "${wslPath(archive)}"
 `)
 const sha = createHash('sha256').update(readFileSync(archive)).digest('hex')

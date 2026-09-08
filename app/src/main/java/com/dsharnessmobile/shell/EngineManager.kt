@@ -6,9 +6,6 @@ import android.os.Environment
 import android.util.Log
 import java.io.File
 import java.nio.file.Files
-import org.apache.commons.compress.archivers.tar.TarArchiveEntry
-import org.apache.commons.compress.archivers.tar.TarArchiveInputStream
-import org.apache.commons.compress.compressors.xz.XZCompressorInputStream
 
 /**
  * Owns the embedded Termux environment snapshot: first-launch extraction into
@@ -33,7 +30,13 @@ class EngineManager(private val context: Context, private val pickToken: String?
     }
   private val nodeBin = File(usrDir, "bin/node")
   private val dshBin = File(usrDir, "lib/node_modules/@deepseek-ai/dsh/lib/bin.js")
-  private var engineProcess: Process? = null
+  /** The engine Process is process-owned, not Activity-owned: MainActivity and
+   * EngineService create separate managers but must observe the same child. */
+  private var engineProcess: Process?
+    get() = sharedEngineProcess
+    set(value) {
+      sharedEngineProcess = value
+    }
 
   /** Consecutive healthy probe ticks since the last update swap (update-v2 confirmation state). */
   private var updateHealthTicks = 0
@@ -83,66 +86,190 @@ class EngineManager(private val context: Context, private val pickToken: String?
   }
 
   /**
-   * Upgrade/snapshot change: back up user data → fully re-extract the embedded snapshot → restore user
-   * data → write the fingerprint. The snapshot strips sessions/storages/attachments/credentials/settings
-   * (see make-snapshot.sh), so a plain re-extract would "lose" that private data — backup first, restore
-   * after; factory profiles (cordis*.yml/node_modules) follow the snapshot (manual patches must be
-   * re-applied on top of the new baseline). On any failure: restore the backup and keep the old runtime
-   * (retried on next start).
+   * Upgrade/snapshot change: extract the embedded snapshot into a staging directory, then
+   * activate it as one transaction. The live runtime is untouched while the archive is being
+   * extracted, so an interruption cannot leave a half-old/half-new tree; the swap itself only
+   * renames factory-owned entries and never touches user data (sessions, attachments, settings,
+   * credentials, workspaces, undo history, model metadata, compile cache).
+   *
+   * The transaction marker makes the next start deterministic: a staged-only run is discarded,
+   * an interrupted swap is rolled back to the previous factory tree, and a swap whose commit
+   * write was lost is rolled forward. See [SnapshotTransaction].
    */
-  fun refreshSnapshot(onProgress: (Long, Long) -> Unit): Boolean {
-    val backup = File(context.filesDir, ".dsh-backup")
-    val dsh = File(homeDir, ".dsh")
+  fun refreshSnapshot(
+    onProgress: (Long, Long) -> Unit,
+    onStage: (String) -> Unit = {},
+  ): Boolean {
+    val filesDir = context.filesDir
+    val fingerprint = bundledFingerprint()
+    val startedAt = System.currentTimeMillis()
+    val stage = SnapshotTransaction.stageRoot(filesDir)
     EngineManager.snapshotRefreshing = true
     try {
-      if (dsh.exists()) {
-        backup.deleteRecursively()
-        // Upgrade-residue tolerance (v0.12.4): profile node_modules may carry dangling symlinks
-        // pointing at packages that no longer exist (npm layout changes) — copyRecursively's
-        // exists() check on a dangling link throws NoSuchFileException and fails the whole refresh.
-        // Drop broken links before backing up (profiles follow the snapshot; the backup omits them).
-        dsh.walkTopDown().forEach { if (java.nio.file.Files.isSymbolicLink(it.toPath()) && !it.exists()) it.delete() }
-        dsh.copyRecursively(backup)
+      onStage("正在检查上次更新…")
+      applyRecovery(SnapshotTransaction.recover(filesDir, stage, usrDir, homeDir, liveFingerprint()))
+      if (snapshotFresh()) {
+        // A rolled-forward transaction already activated this snapshot.
+        return true
       }
-      val ok = extractSnapshot(onProgress)
-      if (!ok) {
-        restoreUserData(backup, dsh)
-        Log.e(TAG, "snapshot refresh: extract failed, kept old runtime")
+
+      onStage("正在解压运行时…")
+      SnapshotFs.deletePath(stage)
+      SnapshotFs.createDirectories(stage)
+      if (!extractSnapshotTo(stage, onProgress)) {
+        SnapshotFs.deletePath(stage)
+        Log.e(TAG, "snapshot refresh: extract failed; live runtime untouched")
         return false
       }
-      restoreUserData(backup, dsh)
-      backup.deleteRecursively()
-      fingerprintFile().writeText(bundledFingerprint())
-      Log.i(TAG, "snapshot refreshed (fingerprint " + bundledFingerprint().take(12) + ")")
+      if (!stagedRuntimeComplete(stage)) {
+        SnapshotFs.deletePath(stage)
+        Log.e(TAG, "snapshot refresh: staged runtime incomplete; live runtime untouched")
+        return false
+      }
+
+      onStage("正在恢复用户数据…")
+      restoreLegacyUserData(File(homeDir, ".dsh"))
+
+      onStage("正在完成运行时更新…")
+      SnapshotTransaction.writeMarker(
+        filesDir,
+        SnapshotTransaction.Marker(SnapshotTransaction.Phase.STAGED, fingerprint, startedAt),
+      )
+      SnapshotTransaction.swap(
+        filesDir = filesDir,
+        stagedRoot = stage,
+        usrDir = usrDir,
+        homeDir = homeDir,
+        preservedNames = SnapshotUserData.preservedNames.toSet(),
+        fingerprint = fingerprint,
+        startedAt = startedAt,
+        onEntry = { onStage("正在更新 " + it) },
+      )
+      // Commit point: the fingerprint is durable only after the swap completed.
+      writeFingerprint(fingerprint)
+      SnapshotTransaction.finish(filesDir)
+      Log.i(TAG, "snapshot refreshed (fingerprint " + fingerprint.take(12) + ")")
       return true
     } catch (t: Throwable) {
-      restoreUserData(backup, dsh)
-      Log.e(TAG, "snapshot refresh failed; kept old runtime", t)
+      Log.e(TAG, "snapshot refresh failed; rolling back", t)
+      onStage("运行时更新失败，正在回滚…")
+      try {
+        val marker = SnapshotTransaction.readMarker(filesDir)
+        if (marker != null) {
+          SnapshotTransaction.rollback(filesDir, stage, usrDir, homeDir, marker)
+          SnapshotTransaction.clearMarker(filesDir)
+        } else {
+          SnapshotFs.deletePath(stage)
+        }
+      } catch (rollbackError: Throwable) {
+        // Keep the marker: the next start retries the rollback before anything else.
+        Log.e(TAG, "snapshot refresh rollback failed; recovery marker retained", rollbackError)
+      }
       return false
     } finally {
       EngineManager.snapshotRefreshing = false
     }
   }
 
-  /** Restore the snapshot-stripped user data dirs/files (copied back from the backup into private .dsh).
-   *  Never throws (Review 2026-08-18 R2): refreshSnapshot's failure branch calls this on a background
-   *  thread, so a restore failure must not escape — otherwise the exception kills the thread and the UI
-   *  hangs on "Updating runtime…" with no message. Failures only log; the backup is kept for a retry. */
-  private fun restoreUserData(backup: File, dsh: File) {
-    if (!backup.exists()) return
-    for (name in listOf(
-      "sessions", "storages", "attachments",
-      ".credentials.yaml", "settings.yaml", ".anonymous-user-id", ".private-layout",
-    )) {
-      try {
-        val src = File(backup, name)
-        if (!src.exists()) continue
-        val dst = File(dsh, name)
-        if (dst.exists()) dst.deleteRecursively()
-        src.copyRecursively(dst)
-      } catch (t: Throwable) {
-        Log.e(TAG, "restore user data failed for $name; backup kept at " + backup.absolutePath, t)
+  /**
+   * Resolves a transaction interrupted by a kill, an OEM cleaner or a low-memory restart.
+   * Cheap when nothing is pending (one stat) and safe to call on every start.
+   */
+  fun recoverInterruptedRefresh() {
+    // Another refresh owns the stage/previous trees right now: never race it.
+    if (EngineManager.snapshotRefreshing) return
+    val filesDir = context.filesDir
+    val marker = SnapshotTransaction.readMarker(filesDir)
+    if (marker == null) {
+      // No marker: only a stale stage directory can survive (a rollback that was
+      // interrupted before it deleted the stage).
+      SnapshotFs.deletePath(SnapshotTransaction.stageRoot(filesDir))
+      return
+    }
+    EngineManager.snapshotRefreshing = true
+    try {
+      applyRecovery(
+        SnapshotTransaction.recover(filesDir, SnapshotTransaction.stageRoot(filesDir), usrDir, homeDir, liveFingerprint()),
+      )
+    } catch (t: Throwable) {
+      Log.e(TAG, "snapshot transaction recovery failed; marker retained", t)
+    } finally {
+      EngineManager.snapshotRefreshing = false
+    }
+  }
+
+  private fun applyRecovery(recovery: SnapshotTransaction.Recovery) {
+    when (recovery.outcome) {
+      SnapshotTransaction.Outcome.NONE -> return
+      SnapshotTransaction.Outcome.DISCARDED_STAGE -> {
+        Log.w(TAG, "interrupted refresh discarded (staged runtime was never activated)")
       }
+      SnapshotTransaction.Outcome.ROLLED_BACK -> {
+        Log.w(TAG, "interrupted refresh rolled back to the previous factory runtime")
+      }
+      SnapshotTransaction.Outcome.ROLLED_FORWARD -> {
+        val fingerprint = recovery.fingerprintToCommit
+        if (!fingerprint.isNullOrEmpty()) writeFingerprint(fingerprint)
+        SnapshotTransaction.finish(context.filesDir)
+        Log.w(TAG, "interrupted refresh completed (runtime was already activated)")
+      }
+    }
+  }
+
+  private fun liveFingerprint(): String = try {
+    fingerprintFile().takeIf { it.exists() }?.readText()?.trim() ?: ""
+  } catch (_: Throwable) {
+    ""
+  }
+
+  /** The fingerprint is the transaction commit point, so it is written atomically. */
+  private fun writeFingerprint(fingerprint: String) {
+    val target = fingerprintFile()
+    val tmp = File(target.parentFile, target.name + ".tmp")
+    tmp.writeText(fingerprint)
+    SnapshotFs.deletePath(target)
+    if (!tmp.renameTo(target)) {
+      target.writeText(fingerprint)
+      SnapshotFs.deletePath(tmp)
+    }
+  }
+
+  /** A stage that lacks the engine entry points must never be activated. */
+  private fun stagedRuntimeComplete(stage: File): Boolean {
+    val node = File(stage, "usr/bin/node")
+    val bin = File(stage, "usr/lib/node_modules/@deepseek-ai/dsh/lib/bin.js")
+    val profile = File(stage, "home/.dsh/profiles/web")
+    val complete = SnapshotFs.exists(node) && SnapshotFs.exists(bin) && SnapshotFs.exists(profile)
+    if (!complete) {
+      Log.e(
+        TAG,
+        "staged runtime incomplete: node=" + SnapshotFs.exists(node) +
+          " bin=" + SnapshotFs.exists(bin) + " profile=" + SnapshotFs.exists(profile),
+      )
+    }
+    return complete
+  }
+
+  /**
+   * One-time migration for a `.dsh-backup` left by a pre-transaction refresh (<= 0.13.2).
+   * Additive: the backup can only add missing entries, never roll back newer data.
+   */
+  private fun restoreLegacyUserData(dsh: File) {
+    val backup = File(context.filesDir, ".dsh-backup")
+    if (!SnapshotFs.exists(backup)) return
+    try {
+      val result = SnapshotUserData.restoreLegacyBackup(backup, dsh) { link ->
+        Log.w(TAG, "legacy user-data restore skipped broken symbolic link: " + link.absolutePath)
+      }
+      Log.w(
+        TAG,
+        "legacy user-data backup restored (copied=" + result.copiedEntries +
+          " kept=" + result.skippedExisting + " broken=" + result.skippedBrokenLinks + ")",
+      )
+      SnapshotFs.deletePath(backup)
+    } catch (t: Throwable) {
+      // Keep the backup for the next attempt; a failed migration must not block the refresh.
+      Log.e(TAG, "legacy user-data restore failed; backup retained at " + backup.absolutePath, t)
     }
   }
 
@@ -152,16 +279,17 @@ class EngineManager(private val context: Context, private val pickToken: String?
     get() = STARTING.get()
 
   /**
-   * Extract the bundled snapshot archive into filesDir. Runs on any thread;
-   * callers own the progress UI.
+   * Extract the bundled snapshot archive into [stage]. The live tree is never a
+   * destination: extraction is only ever performed inside the transaction stage.
    * @param onProgress bytesDone, bytesTotal.
    * @returns true on success.
    */
-  fun extractSnapshot(onProgress: (Long, Long) -> Unit): Boolean {
+  private fun extractSnapshotTo(stage: File, onProgress: (Long, Long) -> Unit): Boolean {
     return try {
       val fd = context.assets.openFd("snapshot.tar.xz")
-      SnapshotExtractor.extract(context.assets.open("snapshot.tar.xz"), fd.length, usrDir.parentFile, onProgress)
-      homeDir.mkdirs()
+      SnapshotExtractor.extract(
+        context.assets.open("snapshot.tar.xz"), fd.length, stage, onProgress, runtimeRoot = context.filesDir,
+      )
       true
     } catch (t: Throwable) {
       Log.e(TAG, "snapshot extract failed", t)
@@ -494,8 +622,9 @@ class EngineManager(private val context: Context, private val pickToken: String?
     }
   }
 
-  /** Start the dsh web engine from the embedded snapshot. */
-  fun startEngine(port: Int = 3080): Boolean {
+  /** Starts the embedded engine. [force] is reserved for a confirmed hung boot
+   * after its full cold-start deadline; routine probes must never force-restart. */
+  fun startEngine(port: Int = 3080, force: Boolean = false): Boolean {
     // 快照刷新进行中禁止拉起（看门狗旁路闸门）：主流程刷新完成后自会启动；期间拉起只会
     // 起在半新半旧的运行时上。返回 true = 「无需再启动」（与冷却窗语义一致，5s 后看门狗复检）。
     if (EngineManager.snapshotRefreshing) {
@@ -513,26 +642,19 @@ class EngineManager(private val context: Context, private val pickToken: String?
     val now = System.currentTimeMillis()
     // Process-level CAS: only one concurrent call really starts (device-measured EADDRINUSE double-start).
     if (!STARTING.compareAndSet(false, true)) return true
-    // Cooldown window: no re-start within 90s of the last attempt (a cold boot takes 20-45s).
-    // Review 2026-08-18 (L2 semantics): returning true here means "no further start needed"
-    // (the engine is most likely already starting), not "this call started it successfully" — callers
-    // poll engine reachability themselves, so this never causes a wrong wait, but it must not be
-    // read as proof of success.
-    // 2026-08-23 修复（审核 CRITICAL#1，用户实测"重试不 kill 旧引擎进程"）：冷却窗内若引擎
-    // 实际不可达（探活 down），冷却窗不应阻止重试——旧实现让挂死进程占着 3080 直到 EADDRINUSE。
-    // 同时 startEngine 前必须先终结残留进程：destroy() 仅 SIGTERM，引擎挂死时需 destroyForcibly。
+    // A tracked child proves exactly whether another manager is cold-booting.
+    // If it has exited, a caller may retry immediately; deferring on a timestamp
+    // alone turns a real early crash into a 90-second outage.
     val withinCooldown = now - EngineManager.lastStartAttemptAt < START_COOLDOWN_MS
-    // #118 根因3（2026-09）：冷却窗判定改端口级可达（TCP connect），不再用 HTTP 探活——
-    // 冷启动期 HTTP 必超时（800ms→5s 均复现），300ms 探活必然假 down → 冷却窗被绕过 →
-    // killExistingEngine 杀掉正在冷启动的引擎 → 重启循环（用户每 5-7s 观察到一个新 linker64）。
-    val engineReachable = EngineProbe.portReachable(1000)
-    if (withinCooldown && engineReachable) {
+    val engineReachable = EngineProbe.portReachable(1_000)
+    val managedProcessAlive = engineProcess?.isAlive == true
+    if (!force && (engineReachable || managedProcessAlive)) {
       STARTING.set(false)
-      LogCollector.log(TAG, "engine start skipped (cooldown window; engine reachable)")
+      LogCollector.log(TAG, "engine start skipped (existing engine reachable or alive)")
       return true
     }
-    if (withinCooldown && !engineReachable) {
-      LogCollector.log(TAG, "engine start: cooldown bypassed (engine unreachable after " + (now - EngineManager.lastStartAttemptAt) + "ms)")
+    if (withinCooldown) {
+      LogCollector.log(TAG, "engine start retrying after the tracked child exited during cooldown")
     }
     return try {
       // 旧进程清理：无论句柄是否还在，先终结残留（引擎挂死/内存里 fork 掉的孤儿）。
@@ -923,6 +1045,10 @@ class EngineManager(private val context: Context, private val pickToken: String?
      *  double-start the engine (device-observed EADDRINUSE). 90s covers the
      *  slowest observed boot with margin. */
     const val START_COOLDOWN_MS = 90_000L
+
+    /** Process handle shared by every EngineManager in the application process. */
+    @Volatile
+    private var sharedEngineProcess: Process? = null
 
     /** Process-level start CAS: visible across EngineManager instances (double-start race guard). */
     val STARTING = java.util.concurrent.atomic.AtomicBoolean(false)

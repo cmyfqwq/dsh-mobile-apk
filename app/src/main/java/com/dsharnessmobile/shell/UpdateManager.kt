@@ -53,7 +53,7 @@ class UpdateManager(private val context: Context) {
         val stage = File(context.filesDir, "update-stage")
         deleteRecursively(stage)
         SnapshotExtractor.extract(
-          tmp.inputStream(), manifest.optLong("size", 0), stage, { _, _ -> },
+          tmp.inputStream(), manifest.optLong("size", 0), stage, { _, _ -> }, runtimeRoot = context.filesDir,
         )
         tmp.delete()
         val newUsr = File(stage, "usr")

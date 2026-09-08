@@ -63,6 +63,12 @@ android {
     abortOnError = false
   }
 
+  testOptions {
+    // Snapshot extraction/tests touch android.util.Log; default stubs keep the JVM
+    // unit tests runnable without Robolectric.
+    unitTests.isReturnDefaultValues = true
+  }
+
   compileOptions {
     sourceCompatibility = JavaVersion.VERSION_17
     targetCompatibility = JavaVersion.VERSION_17
@@ -96,4 +102,5 @@ dependencies {
   implementation("androidx.dynamicanimation:dynamicanimation:1.1.0")
   implementation("org.apache.commons:commons-compress:1.28.0")
   implementation("org.tukaani:xz:1.10")
+  testImplementation("junit:junit:4.13.2")
 }

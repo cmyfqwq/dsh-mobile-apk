@@ -1,7 +1,8 @@
 {
-  "$comment": "快照瘦身清单（体积审计 2026-08-23/08-25）。node-pty prebuilds：win32/darwin 纯死重（Android 永不加载，含 ~52MB .pdb）；reflinkGlobs：pnpm standalone 跨平台 reflink .node（glob 在双引号内不被 shell 展开——删除必须走 find -name）；misplacedDirs：relocate-snapshot 错位产物（usr/data/data/com.termux 子树，PATH 不会搜到）；sourcemapDelete：全树 .map（上游包 35.2MB raw，生产不调试源码）。",
+  "$comment": "快照瘦身清单（体积审计 2026-08-23/09-07）。node-pty prebuilds：win32/darwin 纯死重（Android 永不加载，含 ~52MB .pdb）；reflinkGlobs：pnpm standalone 跨平台 reflink .node（glob 在双引号内不被 shell 展开——删除必须走 find -name）；misplacedDirs：relocate-snapshot 错位产物（usr/data/data/com.termux 子树，PATH 不会搜到）；orphanGlobalNodePackages：global node_modules 中没有任何消费者、而引擎内嵌副本仍保留的重复包；sourcemapDelete：全树 .map（上游包 35.2MB raw，生产不调试源码）。",
   "nodePtyPrebuilds": ["win32-arm64", "win32-x64", "darwin-arm64", "darwin-x64"],
   "reflinkGlobs": ["reflink.win32-*.node", "reflink.darwin-*.node"],
   "misplacedDirs": ["data/data/com.termux"],
+  "orphanGlobalNodePackages": ["@img/sharp-wasm32"],
   "sourcemapDelete": true
 }

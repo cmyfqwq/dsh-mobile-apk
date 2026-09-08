@@ -7,6 +7,7 @@ import android.app.Service
 import android.content.Intent
 import android.os.Build
 import android.os.IBinder
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
@@ -21,6 +22,8 @@ class EngineService : Service() {
 
   private lateinit var engineManager: EngineManager
   private var watchdog: ScheduledExecutorService? = null
+  private var nextRestartAllowedAt = 0L
+  private val restartDeadConfirmations = 2
 
   override fun onCreate() {
     super.onCreate()
@@ -95,23 +98,40 @@ class EngineService : Service() {
       WatchdogV2.acquireWakeLock(this)
       watchdog = Executors.newSingleThreadScheduledExecutor().also { exec ->
         exec.scheduleWithFixedDelay({
-          // 深度探活（PRD F2-5）：HTTP + 插件端点 + 引擎日志异常；熔断退避（F2-6/7）。
-          if (WatchdogV2.tripped()) {
-            // 熔断：暂停重启尝试（界面提示由 GuideChrome 状态区显示）；用户交互复位。
-            LogCollector.log("dsh-watchdog", "watchdog tripped: consecutive failure burst; paused")
-            return@scheduleWithFixedDelay
-          }
-          val healthy = WatchdogV2.deepProbe(this)
-          engineManager.onEngineProbe(healthy)
-          WatchdogV2.recordProbe(healthy)
-          // 唤醒锁续期：engine 常驻超过 30min 后半段无锁（acquire 定时释放）
-          WatchdogV2.refreshWakeLock(this)
-          if (!healthy && engineManager.engineReady) {
-            engineManager.startEngine()
-            // F3 自动回撤（D6 方案 a）：看门狗连续失败达到阈值（熔断前）时，
-            // 触发急救 CLI 恢复最后良好快照；UndoGate 幂等 + 防循环。
+          try {
+            val state = WatchdogV2.assessProbe(this)
+            val alive = state != WatchdogV2.ProbeState.DEAD
+            if (state != WatchdogV2.ProbeState.DEGRADED) {
+              engineManager.onEngineProbe(state == WatchdogV2.ProbeState.HEALTHY)
+            }
+            WatchdogV2.recordProbe(state)
+            WatchdogV2.refreshWakeLock(this)
+
+            if (alive) {
+              nextRestartAllowedAt = 0L
+              UndoGate.disarm(this)
+              return@scheduleWithFixedDelay
+            }
+            if (!engineManager.engineReady) return@scheduleWithFixedDelay
+            if (WatchdogV2.consecutiveFailures < restartDeadConfirmations) {
+              LogCollector.log("dsh-watchdog", "confirmed-dead sample " + WatchdogV2.consecutiveFailures + "/" + restartDeadConfirmations + "; observing before restart")
+              return@scheduleWithFixedDelay
+            }
+            if (WatchdogV2.tripped()) {
+              LogCollector.log("dsh-watchdog", "watchdog circuit open after confirmed-dead failures; destructive recovery paused")
+              return@scheduleWithFixedDelay
+            }
+
+            val now = System.currentTimeMillis()
+            val managedChildAlive = engineManager.engineProcessAlive()
+            val bootAge = now - EngineManager.lastStartAttemptAt
+            if (managedChildAlive && bootAge in 0 until EngineManager.START_COOLDOWN_MS) {
+              LogCollector.log("dsh-watchdog", "dead probe deferred while the tracked child remains inside its boot window")
+              return@scheduleWithFixedDelay
+            }
             if (UndoGate.onProbeFailure(this, WatchdogV2.consecutiveFailures)) {
-              LogCollector.log("dsh-watchdog", "auto-undo trigger: cons_fail=" + WatchdogV2.consecutiveFailures)
+              nextRestartAllowedAt = now + WatchdogV2.nextDelayMs()
+              LogCollector.log("dsh-watchdog", "auto-undo trigger after confirmed-dead failures=" + WatchdogV2.consecutiveFailures)
               Thread {
                 val result = UndoGate.execute(this, engineManager)
                 if (result.executed) {
@@ -122,8 +142,29 @@ class EngineService : Service() {
                   LogCollector.log("dsh-watchdog", "auto-undo not executed: " + result.summary.take(160))
                 }
               }.start()
+              return@scheduleWithFixedDelay
             }
-            LogCollector.log("dsh-watchdog", "restart attempt after failure #" + WatchdogV2.consecutiveFailures + " (backoff: " + WatchdogV2.nextDelayMs() + "ms advisory)")
+            if (now < nextRestartAllowedAt) {
+              LogCollector.log("dsh-watchdog", "restart deferred for " + (nextRestartAllowedAt - now) + "ms")
+              return@scheduleWithFixedDelay
+            }
+
+            if (managedChildAlive) {
+              engineManager.mirrorDiagnosticsToShared("engine-boot-hung")
+              LogCollector.log("dsh-watchdog", "tracked child exceeded boot deadline; forcing one controlled restart")
+            }
+            val requested = engineManager.startEngine(force = managedChildAlive)
+            val delayMs = WatchdogV2.nextDelayMs()
+            nextRestartAllowedAt = now + delayMs
+            LogCollector.log(
+              "dsh-watchdog",
+              "restart requested after confirmed-dead failure #" + WatchdogV2.consecutiveFailures +
+                " (accepted=" + requested + ", next eligible in " + delayMs + "ms)",
+            )
+          } catch (t: Throwable) {
+            Log.e("dsh-watchdog", "watchdog tick failed", t)
+            LogCollector.log("dsh-watchdog", "watchdog tick failed: " + (t.message ?: t.javaClass.simpleName))
+            WatchdogV2.refreshWakeLock(this)
           }
         }, 5, 5, TimeUnit.SECONDS)
       }
