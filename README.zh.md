@@ -144,7 +144,7 @@ MIT。第三方组件按各自许可（见依赖声明）。GPL 合规：copylef
 
 ## 致谢与邀请
 
-**感谢全体社区成员的反馈与贡献！** 特别致谢：cdwlll（环境问题反馈）、haitunlang（MIUI12 兼容）、
+**感谢全体社区成员的反馈与贡献！** 特别致谢：**cmyfqwq（双机深度排障：覆盖安装数据丢失、snapshot refresh 容错、web boot 插件隔离、温控/GPU 诊断）**、cdwlll（环境问题反馈）、haitunlang（MIUI12 兼容）、
 TACONailoong（老 WebView 兼容方案）、X-SCI-TECH（PR 贡献）、Yangerwei（文件竞态反馈）、
 gr12-cmd（armv7l 需求）。
 
