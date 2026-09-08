@@ -9,6 +9,10 @@ export const ADB_AUTH_CSS = `
 .adb-auth-tier-ok { background: rgba(50, 160, 110, 0.12); color: #2f9e68 }
 .adb-auth-tier-bad { background: rgba(200, 120, 50, 0.12); color: #b96a2a }
 .adb-auth-tier-sub { font-weight: 400; color: var(--gray-5, #8a8f98) }
+/* 0.13.5 W4：ADB 高级通道折叠区（无障碍为主入口后，ADB 内容默认收起） */
+.adb-auth-details { margin: 0.5rem 0 0.75rem; border-top: 1px solid var(--border-color, rgba(128,128,128,.18)); padding-top: 0.5rem }
+.adb-auth-details > summary { cursor: pointer; font-size: 0.85rem; font-weight: 600; color: var(--gray-5, #8a8f98); padding: 0.25rem 0 }
+.adb-auth-details[open] > summary { margin-bottom: 0.5rem }
 .adb-auth-gate {
   display: flex; align-items: center; justify-content: space-between; gap: 0.75rem;
   padding: 0.6rem 0.75rem; border-top: 1px solid var(--border-color, rgba(128,128,128,.18));

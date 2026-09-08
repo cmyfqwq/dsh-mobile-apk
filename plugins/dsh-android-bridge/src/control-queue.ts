@@ -1,0 +1,238 @@
+/**
+ * 无障碍控制队列（0.13.5 W4，PRD-0.13.2 §3.3 B2）。
+ *
+ * 方向：**引擎侧是服务端**（本模块注册两条 exact 路由），**壳侧是客户端**（轮询取活、
+ * 执行、回填结果）。这样壳不需要开任何监听端口，且复用 file-incoming 已验证的通道形态。
+ *
+ * 轻载原则：
+ *   - 队列空时壳侧**不轮询**（`waiting=false` 就是停轮信号）；
+ *   - 一次只允许一个在途请求（壳侧单线程执行）；
+ *   - 请求带 `gen`（树代次）：壳侧发现页面已变化时直接失败关闭，不做猜测性点击。
+ *
+ * 安全：exact 路由不经 /api 浏览器鉴权（0.13.3 实证），因此**必须**自带共享令牌；
+ * 令牌由壳写入 shared_prefs（dsh-adb.xml → controlToken），引擎侧读取比对；
+ * 未配置令牌时两条路由一律拒绝（fail-closed）。
+ */
+
+export interface ControlRequest {
+  reqId: string
+  op: string
+  args: Record<string, unknown>
+  /** 树代次（snapshot 返回；非 snapshot 操作必须带上，壳侧校验）。 */
+  gen?: number
+  createdAt: number
+}
+
+export type ControlResult = { ok: true; data: unknown } | { ok: false; error: string }
+
+interface PendingEntry {
+  req: ControlRequest
+  resolve: (result: ControlResult) => void
+  timer: ReturnType<typeof setTimeout>
+}
+
+let seq = 0
+
+export class ControlQueue {
+  private pending?: PendingEntry
+  private waiter?: () => void
+  private lastTakeAt = 0
+  private lastResultAt = 0
+  private served = 0
+  private failed = 0
+
+  /** 是否有壳侧未取走的活（false = 壳侧应停轮）。 */
+  get waiting(): boolean {
+    return this.pending !== undefined
+  }
+
+  /** 下一次轮询建议间隔：无活时给一个较大的空闲间隔，有活时 250ms。 */
+  get pollHintMs(): number {
+    return this.pending ? 250 : 2000
+  }
+
+  stats(): { waiting: boolean; served: number; failed: number; lastTakeAt: number; lastResultAt: number } {
+    return { waiting: this.waiting, served: this.served, failed: this.failed, lastTakeAt: this.lastTakeAt, lastResultAt: this.lastResultAt }
+  }
+
+  /**
+   * 提交一个操作并等待壳侧回填。超时/被新请求挤掉都返回失败（fail-closed），
+   * 绝不返回「可能成功」的模糊结果。
+   */
+  enqueue(op: string, args: Record<string, unknown>, timeoutMs = 8000): Promise<ControlResult> {
+    if (this.pending) {
+      return Promise.resolve({ ok: false, error: '已有在途的设备控制请求——壳侧单线程，请串行调用' })
+    }
+    const reqId = `c${++seq}-${Date.now().toString(36)}`
+    const gen = typeof args.gen === 'number' ? args.gen : undefined
+    const req: ControlRequest = { reqId, op, args, gen, createdAt: Date.now() }
+    return new Promise<ControlResult>((resolve) => {
+      const timer = setTimeout(() => {
+        if (this.pending?.req.reqId === reqId) this.pending = undefined
+        this.failed++
+        resolve({ ok: false, error: `设备控制超时（${timeoutMs}ms 内壳侧未回填结果）——检查无障碍服务是否在运行` })
+      }, Math.max(500, timeoutMs))
+      this.pending = { req, resolve, timer }
+      // 唤醒挂起的长轮询（有活立即回，壳侧不必短轮询空转）
+      this.waiter?.()
+    })
+  }
+
+  /**
+   * 长轮询：有活立即返回；无活则挂起至多 [timeoutMs]。
+   * 这是「轻载」的关键——空闲时壳侧每 timeoutMs 才发一次请求，且延迟为 0。
+   * 同时这次调用本身就是**存活心跳**：lastTakeAt 每次轮询都刷新，
+   * 引擎据此判断壳侧轮询是否真的在跑（防 force-stop 后的僵尸 a11yEnabled）。
+   */
+  waitForWork(timeoutMs: number): Promise<ControlRequest | null> {
+    this.lastTakeAt = Date.now()
+    if (this.pending) return Promise.resolve(this.take())
+    return new Promise<ControlRequest | null>((resolve) => {
+      const timer = setTimeout(() => {
+        this.waiter = undefined
+        resolve(null)
+      }, Math.max(0, timeoutMs))
+      this.waiter = () => {
+        clearTimeout(timer)
+        this.waiter = undefined
+        resolve(this.take())
+      }
+    })
+  }
+
+  /** 最近一次轮询距今毫秒数（Infinity = 从未轮询）。 */
+  pollAgeMs(): number {
+    return this.lastTakeAt === 0 ? Number.POSITIVE_INFINITY : Date.now() - this.lastTakeAt
+  }
+
+  /** 壳侧取活；没有活时返回 null（并记录取活时间用于诊断）。 */
+  take(): ControlRequest | null {
+    this.lastTakeAt = Date.now()
+    const entry = this.pending
+    if (!entry) return null
+    // 取走后仍在等待回填；回填或超时才会清空。
+    return entry.req
+  }
+
+  /** 壳侧回填结果。未知/过期 reqId 返回 false（不覆盖在途请求）。 */
+  settle(reqId: string, result: ControlResult): boolean {
+    const entry = this.pending
+    if (!entry || entry.req.reqId !== reqId) return false
+    clearTimeout(entry.timer)
+    this.pending = undefined
+    this.lastResultAt = Date.now()
+    if (result.ok) this.served++
+    else this.failed++
+    entry.resolve(result)
+    return true
+  }
+
+  /** 引擎侧主动取消（例如会话中断）。 */
+  cancel(reason = 'cancelled'): void {
+    const entry = this.pending
+    if (!entry) return
+    clearTimeout(entry.timer)
+    this.pending = undefined
+    entry.resolve({ ok: false, error: reason })
+  }
+}
+
+/** 令牌比对（常数时间不必要：本地回环 + 仅防同机其它应用误触）。 */
+export function tokenMatches(expected: string | undefined, provided: unknown): boolean {
+  if (typeof expected !== 'string' || expected.length < 8) return false
+  return typeof provided === 'string' && provided === expected
+}
+
+export type RouteRequest = {
+  method?: string
+  url?: string
+  headers?: Record<string, string | string[] | undefined>
+  on(event: string, cb: (chunk?: Buffer) => void): void
+}
+
+export type RouteResponse = {
+  writeHead(code: number, headers: Record<string, string>): void
+  end(body?: string): void
+}
+
+function readBody(req: RouteRequest, limit = 64 * 1024): Promise<Record<string, unknown>> {
+  return new Promise((resolve) => {
+    const chunks: Buffer[] = []
+    let size = 0
+    req.on('data', (chunk) => {
+      if (!chunk) return
+      size += chunk.length
+      if (size > limit) return
+      chunks.push(chunk)
+    })
+    req.on('end', () => {
+      try {
+        resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')) as Record<string, unknown>)
+      } catch {
+        resolve({})
+      }
+    })
+    req.on('error', () => resolve({}))
+  })
+}
+
+function sendJson(res: RouteResponse, code: number, payload: unknown): void {
+  res.writeHead(code, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+  res.end(JSON.stringify(payload))
+}
+
+/** 令牌来源：环境变量（测试）→ 壳侧 prefs（生产）。 */
+export function controlTokenFrom(
+  env: NodeJS.ProcessEnv,
+  prefs: { controlToken?: string } | undefined,
+): string | undefined {
+  const fromEnv = env.DSH_CONTROL_TOKEN
+  if (typeof fromEnv === 'string' && fromEnv.length >= 8) return fromEnv
+  const fromPrefs = prefs?.controlToken
+  return typeof fromPrefs === 'string' && fromPrefs.length >= 8 ? fromPrefs : undefined
+}
+
+export interface RegisterOptions {
+  queue: ControlQueue
+  /** 每次请求实时读取令牌（壳侧写入 prefs 后即时生效）。 */
+  token: () => string | undefined
+  logger?: { warn?: (msg: string) => void }
+}
+
+/** 注册两条 exact 路由：取活（POST，带令牌）与回填（POST，带令牌）。 */
+export function registerControlRoutes(webServer: { register(route: unknown): void }, options: RegisterOptions): void {
+  const { queue, token, logger } = options
+  webServer.register({
+    kind: 'exact',
+    path: '/api/android/ui/pending',
+    handler: async (req: RouteRequest, res: RouteResponse) => {
+      const body = await readBody(req)
+      if (!tokenMatches(token(), body.token)) {
+        logger?.warn?.('control/pending: 令牌不匹配或未配置，拒绝')
+        sendJson(res, 403, { ok: false, error: 'control token missing or mismatched' })
+        return
+      }
+      const request = await queue.waitForWork(Number.isFinite(Number(body.waitMs)) ? Math.min(Math.max(Number(body.waitMs), 0), 30_000) : 5000)
+      sendJson(res, 200, { ok: true, req: request, pollHintMs: queue.pollHintMs })
+    },
+  })
+  webServer.register({
+    kind: 'exact',
+    path: '/api/android/ui/result',
+    handler: async (req: RouteRequest, res: RouteResponse) => {
+      const body = await readBody(req)
+      if (!tokenMatches(token(), body.token)) {
+        logger?.warn?.('control/result: 令牌不匹配或未配置，拒绝')
+        sendJson(res, 403, { ok: false, error: 'control token missing or mismatched' })
+        return
+      }
+      const reqId = typeof body.reqId === 'string' ? body.reqId : ''
+      const ok = body.ok === true
+      const result: ControlResult = ok
+        ? { ok: true, data: body.data }
+        : { ok: false, error: typeof body.error === 'string' ? body.error : '设备控制失败（壳侧未给出原因）' }
+      const accepted = queue.settle(reqId, result)
+      sendJson(res, accepted ? 200 : 409, { ok: accepted, reason: accepted ? 'settled' : 'unknown-or-stale-reqId' })
+    },
+  })
+}

@@ -49,7 +49,7 @@ print('SNAPSHOT_MODE_CHECK_PASSED files={files} dirs={dirs} symlinks={symlinks} 
 `
 
 try {
-  const output = execFileSync('python', ['-c', checker, path], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 })
+  const output = execFileSync(process.platform === 'win32' ? 'python' : 'python3', ['-c', checker, path], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 })
   process.stdout.write(output)
 } catch (error) {
   if (error.stdout) process.stdout.write(String(error.stdout))

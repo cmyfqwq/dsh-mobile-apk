@@ -15,10 +15,55 @@ import { execFileSync, execSync } from 'node:child_process'
 
 export const IS_WSL_HOST = process.platform === 'win32'
 
-/** 主机路径 -> 命令内路径：Windows 盘符 -> /mnt/<drive>/...；原生 Linux 直接透传。 */
+let cachedDistro
+/**
+ * WSL 发行版名（用于 \\wsl.localhost\<distro>\... 映射）。
+ * 来源：环境变量 WSL_DISTRO_NAME（WSL 内）→ wsl.exe -l -q（UTF-16LE 输出，默认发行版）。
+ * 取不到返回 undefined（调用方应回退到 D: 上的工作目录）。
+ */
+export function wslDistro() {
+  if (!IS_WSL_HOST) return undefined
+  if (cachedDistro !== undefined) return cachedDistro
+  const fromEnv = process.env.WSL_DISTRO_NAME
+  if (fromEnv) { cachedDistro = fromEnv; return cachedDistro }
+  try {
+    const raw = execSync('wsl.exe -l -q')
+    const text = Buffer.isBuffer(raw) ? raw.toString('utf16le') : String(raw)
+    const first = text.split(/\r?\n/).map((s) => s.replace(/\0/g, '').trim()).filter(Boolean)[0]
+    cachedDistro = first || undefined
+  } catch {
+    cachedDistro = undefined
+  }
+  return cachedDistro
+}
+
+/**
+ * Linux 绝对路径 -> Windows 侧可访问的 UNC 路径（\\wsl.localhost\<distro>\root\x）。
+ * 目的：把构建工作区放到 WSL ext4（9p /mnt/d 的 25 倍写入差距，2026-09-08 实测），
+ * 同时让 Windows 上的 node 仍能直接读写该目录。非 Windows 或拿不到发行版名时返回 undefined。
+ */
+export function wslHostPath(linuxPath) {
+  if (!IS_WSL_HOST) return undefined
+  const distro = wslDistro()
+  if (!distro) return undefined
+  const p = String(linuxPath)
+  if (!p.startsWith('/')) return undefined
+  return '\\\\wsl.localhost\\' + distro + p.replace(/\//g, '\\')
+}
+
+/** UNC WSL 路径 -> Linux 路径；不是 UNC 形态返回 undefined。 */
+export function linuxFromWslHostPath(p) {
+  const m = String(p).match(/^\\\\wsl(?:\.localhost|\$)\\[^\\]+\\(.*)$/)
+  if (!m) return undefined
+  return '/' + m[1].replace(/\\/g, '/')
+}
+
+/** 主机路径 -> 命令内路径：Windows 盘符 -> /mnt/<drive>/...；UNC WSL -> Linux 原路径；原生 Linux 透传。 */
 export function wslPath(p) {
   if (!p) return p
   if (!IS_WSL_HOST) return p
+  const unc = linuxFromWslHostPath(p)
+  if (unc) return unc
   const m = String(p).match(/^([A-Za-z]):(.*)$/)
   if (!m) return String(p).replace(/\\/g, '/')
   return '/mnt/' + m[1].toLowerCase() + m[2].replace(/\\/g, '/')

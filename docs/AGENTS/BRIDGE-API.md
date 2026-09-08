@@ -148,3 +148,10 @@ cd ..\plugins\dsh-android-<pkg> && npm run build
 - `pickFilePath(callbackId)`：@文件引用路径选择（SAF 文档 → primary 真实路径 → `onFilePicked(cb, {path,name,size,mediaType} | {refused} | null)`）——grep `pickFilePath` in BRIDGE-API.md
 - MuxClient：`/api/remote.mux` + `$events` 流（waterfall/emit/ready 帧）——grep `remote.mux`
 - EngineAuth：`/api` 全前缀浏览器 Cookie（P0 token 交换 / P1 自 mint）——grep `EngineAuth`
+
+## 0.13.5 W4 桥协议增量（设备控制授权面）
+
+- `a11yStatus()`：无障碍控制通道状态 JSON `{enabled,label,sdk,restrictedSettingsApplies,hint,tokenConfigured}`（壳侧 `DeviceControlService.statusJson`）。
+- `openA11ySettings()`：官方 Intent `Settings.ACTION_ACCESSIBILITY_SETTINGS` 跳系统无障碍页（失败回退 `ACTION_SETTINGS` + Toast 引导）。
+- `unlockRestrictedSettings()`：Android 13+ 一键解锁受限设置（`appops set <pkg> ACCESS_RESTRICTED_SETTINGS allow`，走壳侧 ADB 通道；未授权/未配对失败关闭，返回 `{ok,message}`）。
+- 引擎侧只读状态端点 `/api/android/privilege/status` 新增 `control:{a11yEnabled,queue,tokenConfigured}` 与工具 `android_privilege_status` 的 `gates`/`control` 字段。

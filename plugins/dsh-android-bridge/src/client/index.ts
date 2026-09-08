@@ -45,7 +45,7 @@ export function apply(ctx: ClientContext): void {
     name: 'settings.dev.item',
     id: 'android-adb',
     order: 0,
-    label: () => '安卓调试授权',
+    label: () => '设备控制授权',
     // list entry 的 props 由 inject 提供（本块不用 owner share → 空对象）
     inject: () => ({}),
   }, AdbAuthSection))

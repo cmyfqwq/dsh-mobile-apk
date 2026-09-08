@@ -77,3 +77,54 @@ test('walks up through an intermediate pruned node via the original path chain',
   assert.equal(ancestor.scrollable, true)
   assert.equal(ancestor.rid, 'com.android.settings:id/list')
 })
+
+// ── 0.13.5：同名节点消歧（用户指出的误判风险）───────────────────────────────
+test('同名节点保留且歧义时拒绝静默挑选，列出候选', () => {
+  const xml = hierarchy(
+    `<node index="0" text="" class="android.widget.FrameLayout" ${ATTRS} clickable="false" scrollable="false" bounds="[0,0][1080,1920]">` +
+      `<node index="0" text="新建会话" class="android.widget.Button" ${ATTRS} clickable="true" scrollable="false" bounds="[0,100][400,200]" />` +
+      `<node index="1" text="新建会话" class="android.widget.Button" ${ATTRS} clickable="true" scrollable="false" bounds="[500,100][900,200]" />` +
+    `</node>`,
+  )
+  const { raw } = parseUiTreeXml(xml)
+  const { nodes, byId } = pruneNodes(raw)
+  const dup = nodes.filter((n) => n.text === '新建会话')
+  assert.equal(dup.length, 2, '同名节点必须都保留')
+
+  const ambiguous = resolveRef(byId, nodes, 'text:新建会话')
+  assert.equal(ambiguous.ok, false, '多候选不得静默挑一个')
+  assert.match(ambiguous.error, /匹配 2 个节点/)
+  assert.match(ambiguous.error, /id:nN/)
+  assert.equal(ambiguous.matches.length, 2)
+
+  const byOccurrence = resolveRef(byId, nodes, 'text:新建会话#2')
+  assert.equal(byOccurrence.ok, true)
+  assert.equal(byOccurrence.node.id, dup[1].id)
+
+  const outOfRange = resolveRef(byId, nodes, 'text:新建会话#3')
+  assert.equal(outOfRange.ok, false)
+
+  const byIdRef = resolveRef(byId, nodes, 'id:' + dup[0].id)
+  assert.equal(byIdRef.ok, true)
+  assert.equal(byIdRef.node.id, dup[0].id)
+})
+
+test('作用域引用 @nX 只在子树内匹配，避免侧边栏/主区同名互相污染', () => {
+  const xml = hierarchy(
+    `<node index="0" text="" class="android.widget.FrameLayout" ${ATTRS} clickable="false" scrollable="false" bounds="[0,0][1080,1920]">` +
+      `<node index="0" text="" class="android.widget.LinearLayout" ${ATTRS} clickable="false" scrollable="false" bounds="[0,0][300,1920]">` +
+        `<node index="0" text="确定" class="android.widget.Button" ${ATTRS} clickable="true" scrollable="false" bounds="[10,10][290,90]" />` +
+      `</node>` +
+      `<node index="1" text="" class="android.widget.LinearLayout" ${ATTRS} clickable="false" scrollable="false" bounds="[300,0][1080,1920]">` +
+        `<node index="0" text="确定" class="android.widget.Button" ${ATTRS} clickable="true" scrollable="false" bounds="[320,10][600,90]" />` +
+      `</node>` +
+    `</node>`,
+  )
+  const { raw } = parseUiTreeXml(xml)
+  const { nodes, byId } = pruneNodes(raw)
+  const scopes = nodes.filter((n) => n.type === 'LinearLayout')
+  assert.equal(scopes.length, 2)
+  const right = resolveRef(byId, nodes, `text:确定@${scopes[1].id}`)
+  assert.equal(right.ok, true)
+  assert.equal(right.node.cx > 300, true, '应命中右半区那个「确定」')
+})

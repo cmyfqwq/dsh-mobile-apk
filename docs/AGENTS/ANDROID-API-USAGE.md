@@ -63,3 +63,10 @@ MainActivity 31 / OverlayService 20 / OverlayPanel 15 / ConsoleActivity 15 / Gui
 - `androidResources.noCompress += "xz"`（build.gradle.kts 注释：snapshot.tar.xz 已 xz 压缩，AAPT 二次压缩会破坏 openFd/流式读取）——SnapshotExtractor 依赖拿到原始 xz 字节流。
 - `usesCleartextTraffic="true"`（AndroidManifest.xml application 节点）：引擎是 http://127.0.0.1:3080 明文回环，WebView 与直连 RPC 均依赖。
 - targetSdk 34 下前台服务启动须声明 foregroundServiceType（dataSync，EngineService/开机自启路径）。
+
+## 7. 无障碍 API（0.13.5 W4 新增，全量参考见 ACCESSIBILITY-API.md）
+
+- 服务级能力：`canRetrieveWindowContent`(18) / `canPerformGestures`(24) / **`canTakeScreenshot`(30)** / `flagRetrieveInteractiveWindows`(21) / `flagReportViewIds`(18) —— 全部在 `res/xml/accessibility_service_config.xml` 声明。
+- 代码级 API 守卫：`takeScreenshot()`（API 30，`Build.VERSION_CODES.R` 分支，低于则明确报错引导 ADB）；`getSoftKeyboardController().switchToInputMethod()`（API 24）；`onCreateInputMethod()`（API 33，未接）。
+- 无需额外运行时权限：截屏/手势/读树都靠服务能力声明 + 用户在系统设置开启一次；`FLAG_SECURE` 窗口系统直接拒绝截屏。
+- Android 13+ 侧载受限设置：`appops set <pkg> ACCESS_RESTRICTED_SETTINGS allow`（`AdbState.unlockRestrictedSettings`）。

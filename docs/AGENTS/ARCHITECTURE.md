@@ -86,3 +86,19 @@
 | androidx FileProvider | provider（${applicationId}.fileprovider） | （框架类） | 路径白名单 @xml/file_paths：仅 Documents/dshdata + workspaces/home/tmp/usr/bin，不映射 .credentials.yaml 等机密区 |
 
 权限 12 项（INTERNET / MANAGE_EXTERNAL_STORAGE / READ_EXTERNAL_STORAGE maxSdk32 / WRITE_EXTERNAL_STORAGE maxSdk29 / POST_NOTIFICATIONS / FOREGROUND_SERVICE(+DATA_SYNC) / RECEIVE_BOOT_COMPLETED / WAKE_LOCK / REQUEST_IGNORE_BATTERY_OPTIMIZATIONS / QUERY_ALL_PACKAGES / SYSTEM_ALERT_WINDOW），逐条理由见 AndroidManifest.xml 注释。
+
+## 0.13.5 设备控制面（双通道）
+
+```
+AI 工具（dsh-android-manage）
+   └─ androidPrivilege.gateFor(session)   ← 会话档位 danger-full-access 恒需
+        ├─ 无障碍通道在线（prefs a11yEnabled + 队列心跳 <20s）
+        └─ 或 ADB 三道人门齐备（完全访问 + 允许访问 + 配对）
+   └─ ControlPolicy.decideControl(op)     ← 后端选择（a11y 优先，ADB 回退，fail-closed）
+        ├─ a11y → ControlQueue（引擎侧 exact 路由 /api/android/ui/{pending,result}，共享令牌）
+        │        ↕ 长轮询（壳侧 ControlPoller，空闲 5s/有活即时，轮询即心跳）
+        │        DeviceControlService（AccessibilityService：树快照 + performAction + takeScreenshot）
+        └─ adb  → execAdbLine/execAdbShell（shell 执行、原图截图、pm/dumpsys 等系统面）
+```
+
+两条通道**等价且无障碍优先**（PRD-0.13.2 §3.3 B3）；授权面在设置页「设备控制授权」：无障碍为主入口，ADB 折叠为高级/脚本面。

@@ -129,6 +129,10 @@ class EngineManager(private val context: Context, private val pickToken: String?
 
       onStage("正在恢复用户数据…")
       restoreLegacyUserData(File(homeDir, ".dsh"))
+      // 0.13.5 W1a（issue #126 P1 的兜底诉求）：换树前留一份 settings.yaml 快照。
+      // 事务化本身从不触碰用户数据，这份副本是「万一」时的取证/回滚来源——
+      // 只保留最近 3 代，写失败仅告警（不阻断刷新）。
+      snapshotSettingsBackup()
 
       onStage("正在完成运行时更新…")
       SnapshotTransaction.writeMarker(
@@ -270,6 +274,31 @@ class EngineManager(private val context: Context, private val pickToken: String?
     } catch (t: Throwable) {
       // Keep the backup for the next attempt; a failed migration must not block the refresh.
       Log.e(TAG, "legacy user-data restore failed; backup retained at " + backup.absolutePath, t)
+    }
+  }
+
+  /**
+   * 0.13.5 W1a：换树前把用户 settings.yaml 复制到 `files/.snapshot-settings-backup/`（保留最近 3 代）。
+   *
+   * 事务化刷新本身从不移动/覆盖用户数据（[SnapshotTransaction] 跳过 preservedNames），
+   * 这份副本回应 issue #126 P1 的诉求：升级出意外时至少有一份「升级前」的配置可取证/回滚。
+   * 写入失败只告警——备份不是刷新的前置条件。
+   */
+  private fun snapshotSettingsBackup() {
+    val source = File(File(homeDir, ".dsh"), "settings.yaml")
+    if (!SnapshotFs.exists(source)) return
+    try {
+      val dir = File(context.filesDir, ".snapshot-settings-backup")
+      SnapshotFs.createDirectories(dir)
+      val stamp = java.text.SimpleDateFormat("yyyyMMdd-HHmmss", java.util.Locale.US).format(java.util.Date())
+      val target = File(dir, "settings-$stamp.yaml")
+      source.copyTo(target, overwrite = true)
+      // 只保留最近 3 代（按文件名时间戳排序，删旧留新）
+      val all = dir.listFiles { f -> f.isFile && f.name.startsWith("settings-") }?.sortedBy { it.name } ?: emptyList()
+      for (stale in all.dropLast(3)) SnapshotFs.deletePath(stale)
+      Log.i(TAG, "settings backup written: " + target.name + " (kept " + minOf(all.size, 3) + ")")
+    } catch (t: Throwable) {
+      Log.w(TAG, "settings backup failed (non-fatal)", t)
     }
   }
 

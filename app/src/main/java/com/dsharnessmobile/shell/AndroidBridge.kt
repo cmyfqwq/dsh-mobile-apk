@@ -56,6 +56,12 @@ class AndroidBridge(
   private val onGetOverlayEnabled: () -> Boolean = { false },
   /** 0.13.2 W7：悬浮球开关（未授 overlay 权限时由控制器发起系统授权引导）。返回是否已启动。 */
   private val onSetOverlayEnabled: (Boolean) -> Boolean = { _ -> false },
+  /** 0.13.5 W4：无障碍控制通道状态 JSON {enabled, label, restrictedHint}。 */
+  private val onA11yStatus: () -> String = { """{"enabled":false}""" },
+  /** 0.13.5 W4：跳系统无障碍设置页（用户手动开启「DSH 设备控制」）。 */
+  private val onOpenA11ySettings: () -> Unit = {},
+  /** 0.13.5 W4：一键解锁受限设置（Android 13+ 侧载应用默认禁止开启无障碍）。返回 JSON {ok, message}。 */
+  private val onUnlockRestrictedSettings: () -> String = { """{"ok":false,"message":"未接线"}""" },
 ) {
 
   @JavascriptInterface
@@ -233,6 +239,20 @@ class AndroidBridge(
   /** 悬浮球开关（控制器负责权限引导）；返回当前是否已启动。 */
   @JavascriptInterface
   fun setOverlayEnabled(enable: Boolean): Boolean = onSetOverlayEnabled(enable)
+
+  /** 0.13.5 W4：无障碍控制通道状态（设置页展示 + 引导）。 */
+  @JavascriptInterface
+  fun a11yStatus(): String = onA11yStatus()
+
+  /** 0.13.5 W4：跳系统无障碍设置页（开启「DSH 设备控制」）。 */
+  @JavascriptInterface
+  fun openA11ySettings() {
+    onOpenA11ySettings()
+  }
+
+  /** 0.13.5 W4：一键解锁受限设置（appops set … ACCESS_RESTRICTED_SETTINGS allow，走 ADB 通道）。 */
+  @JavascriptInterface
+  fun unlockRestrictedSettings(): String = onUnlockRestrictedSettings()
 
   companion object {
     /**

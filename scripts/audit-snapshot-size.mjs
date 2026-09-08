@@ -80,7 +80,7 @@ print(json.dumps(report, ensure_ascii=False, indent=2))
 `
 
 try {
-  const json = execFileSync('python', ['-c', analyzer, snapshot], { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 })
+  const json = execFileSync(process.platform === 'win32' ? 'python' : 'python3', ['-c', analyzer, snapshot], { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 })
   if (outputPath) writeFileSync(resolve(outputPath), json)
   process.stdout.write(json)
 } catch (error) {

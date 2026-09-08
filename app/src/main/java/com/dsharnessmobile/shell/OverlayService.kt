@@ -76,6 +76,8 @@ class OverlayService : Service() {
 
   // ── 引擎维/会话维状态（协作类经 internal 共享） ──────────────────
   internal var activeSessionId = ""              // 展开态目标会话（空 = 新会话）
+  /** 用户是否显式钉住目标会话（0.13.5）：钉住后不自动跟随；面板关闭时解除。 */
+  internal var userPinnedSession = false
   internal var engineRunning = false             // 引擎维（应用级）
   internal var sessionBusy = false               // 会话维（工作中）
   internal var toolCount = 0                     // 当前轮次工具调用数
@@ -281,6 +283,8 @@ class OverlayService : Service() {
   internal fun hidePanel() {
     if (!expanded) return
     expanded = false
+    // 0.13.5：关闭面板解除「钉住」——下次展开重新跟随正在工作的会话
+    userPinnedSession = false
     val unit = panel.unitView ?: return
     unit.visibility = View.GONE
     try { if (unit.parent != null) wm.removeView(unit) } catch (_: Exception) {}
@@ -429,12 +433,40 @@ class OverlayService : Service() {
   // ── 官方忙态锚点（0.13.3 D6/W3） ─────────────────────────────────
 
   /**
+   * 临时工作区 workspaceId（0.13.5）：读 `home/.dsh/storages/workspace.json`，取 title=临时工作区 的条目
+   * （读不到则退回第一个工作区；再读不到返回 null → 走引擎默认）。用途：悬浮球「新会话」必须落临时工作区，
+   * 否则在侧边栏显示为「未分组」（用户 2026-09-10 实测点名）。
+   */
+  internal fun tempWorkspaceId(): String? {
+    return try {
+      val file = java.io.File(filesDir, "home/.dsh/storages/workspace.json")
+      if (!file.isFile) return null
+      val tables = JSONObject(file.readText()).optJSONObject("tables")?.optJSONObject("workspaces") ?: return null
+      var fallback: String? = null
+      for (key in tables.keys()) {
+        val entry = tables.optJSONObject(key) ?: continue
+        if (fallback == null) fallback = key
+        if (entry.optString("title") == "临时工作区") return key
+      }
+      fallback
+    } catch (_: Throwable) {
+      null
+    }
+  }
+
+  /**
    * api-session/status emit（$events 流，args=[agentId, running]）——引擎 agent 运行态
    * 官方信号，取代旧 bridge turn_start 专门行（0.1.4 起退役）。running=true 即确认
    * 乐观忙态（optimisticBusyAt 清零）；running=false 等价 turn_end 回空闲。
    * 会话感知与 live 流一致：无目标会话=全部接受，有目标=仅该会话。
    */
   internal fun applyAgentStatus(agentId: String, running: Boolean) {
+    // 0.13.5：未钉住目标时**自动跟踪正在工作的会话**（用户诉求：悬浮球要跟得上别的对话）。
+    // 钉住 = 用户在选择器里显式选过；面板关闭时解除钉住，下次展开重新跟随。
+    if (running && !userPinnedSession && agentId.isNotEmpty() && agentId != activeSessionId) {
+      activeSessionId = agentId
+      if (expanded) panel.refreshSessionPicker()
+    }
     val targeted = activeSessionId.isEmpty() || agentId == activeSessionId
     if (!targeted) return
     if (running) {
@@ -564,11 +596,15 @@ class OverlayService : Service() {
     }
     if (activeSessionId.isEmpty()) {
       // 目标=「新会话」：先 create 再 prompt（用户拍板项：自动建会话为默认）。
-      postRpc("session/create", JSONObject().put("request", JSONObject())) { code, body ->
+      // 0.13.5：显式带 workspaceId=临时工作区（否则新会话落「未分组」，用户实测点名）。
+      val createReq = JSONObject()
+      tempWorkspaceId()?.let { createReq.put("workspaceId", it) }
+      postRpc("session/create", JSONObject().put("request", createReq)) { code, body ->
         if (code == 200) {
           val sid = extractSessionId(body)
           if (sid.isNotEmpty()) {
             activeSessionId = sid
+            userPinnedSession = false
             panel.refreshSessionPicker()
             send.run()
           } else {

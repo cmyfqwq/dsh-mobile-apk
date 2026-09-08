@@ -10,3 +10,12 @@
 - **provider 命名混淆（0.13.0 C3 实锤）**：默认 pin 曾为 `opencode-go`（OpenCode Zen Go 网关，`opencode.ai/zen/go/v1`，实测 404）——用户误以为配了 OpenRouter。0.13.0 默认 pin 改 `deepseek-official`（壳注 DEEPSEEK_API_KEY），opencode-go/OpenRouter 需在「添加自定义供应商」显式配置；设置页文案与文档需持续提醒区分。
 
 ---
+
+## 无障碍通道待办（0.13.5 W4 未完项）
+
+- **无障碍输入法**（API 33+，`FLAG_INPUT_METHOD_EDITOR` + `InputMethod`）：可替代 ADBKeyboard，中文输入不再依赖 IME 切换（当前 `ACTION_SET_TEXT` 已覆盖可编辑节点，非编辑节点仍需 ADBKeyboard）。
+- **`getSystemActions()` 驱动全局动作面**：当前只暴露 back/home/recents/notifications，设备实际支持的动作集合未枚举给模型。
+- **节点动作面**：长按（`ACTION_LONG_CLICK`）/展开折叠/复制粘贴/翻页/拖拽尚未暴露为工具参数。
+- **单窗口截屏**（API 34 `takeScreenshotOfWindow`）与多窗口选择（`getWindows()`）未接。
+- **API <30 设备**：无障碍截屏不可用（`takeScreenshot` 需要 API 30），仍需 ADB `screencap`；`GLOBAL_ACTION_TAKE_SCREENSHOT`(28) 只存相册不回传数据。
+- **arm64 真机验证**：无障碍通道目前仅在 x86_64 模拟器验证（无 arm64 设备在线）。

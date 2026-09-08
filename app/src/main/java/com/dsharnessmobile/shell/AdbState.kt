@@ -367,6 +367,47 @@ object AdbState {
       .toString()
   }
 
+  /**
+   * 0.13.5 W4：Android 13+ 侧载应用默认禁止开启无障碍（restricted settings）。
+   * 用自带 ADB 通道一键解锁：`appops set <pkg> ACCESS_RESTRICTED_SETTINGS allow`。
+   * 与其它 ADB 动作同一道门（完全访问 + 允许访问开关 + 已配对）；失败关闭。
+   */
+  fun unlockRestrictedSettings(context: Context, engine: EngineManager): String {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+      return JSONObject()
+        .put("ok", true)
+        .put("message", "Android 13 以下没有受限设置限制——直接到系统设置 → 无障碍开启「DSH 设备控制」即可")
+        .toString()
+    }
+    if (!authorized(context)) {
+      return JSONObject()
+        .put("ok", false)
+        .put("message", "需要先完成 ADB 授权（完全访问 → 允许访问开关 → 配对）才能一键解锁受限设置")
+        .toString()
+    }
+    val pkg = context.packageName
+    val raw = adbShellExecute(context, engine, "appops set $pkg ACCESS_RESTRICTED_SETTINGS allow")
+    val json = try {
+      JSONObject(raw)
+    } catch (_: Exception) {
+      JSONObject().put("ok", false).put("guidance", raw)
+    }
+    val ok = json.optBoolean("ok", false)
+    AdbAudit.log(
+      context,
+      "a11y-unlock-restricted",
+      mapOf("tool" to "shell-native", "pkg" to pkg, "result" to if (ok) "ok" else "failed"),
+    )
+    return JSONObject()
+      .put("ok", ok)
+      .put(
+        "message",
+        if (ok) "已解锁受限设置——请到系统设置 → 无障碍 → 已下载的服务，开启「DSH 设备控制」"
+        else json.optString("guidance", "解锁失败（可稍后重试，或在系统设置里手动允许）"),
+      )
+      .toString()
+  }
+
   /** 状态 JSON（桥 getAdbState / 探活消费；不泄露端口/密钥路径）。 */
   fun stateJson(context: Context): String {
     val allow = allowSwitch(context)

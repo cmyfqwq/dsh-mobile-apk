@@ -27,6 +27,8 @@ if (!snap) { console.error('用法: node scripts/check-engine-overlay.mjs <snaps
 const M = JSON.parse(readFileSync(manifestPath, 'utf8'))
 // W8 合规核验：overlay 新引 npm 依赖的许可证登记（非 copyleft 面，漂移即拒）
 const LICENSES = JSON.parse(readFileSync(join(HERE, 'snapshot-config', 'engine-overlay-licenses.json'), 'utf8')).licenses
+// 引擎树补丁登记表（marker 抽验来源，0.13.5 起）
+const PATCH_REGISTRY = JSON.parse(readFileSync(join(HERE, 'patches', 'registry.json'), 'utf8'))
 
 const NM = 'usr/lib/node_modules/@deepseek-ai/dsh/'
 const want = new Map() // tarPath -> { kind, name, version, host }
@@ -45,10 +47,14 @@ for (const entry of M.keepUnpublished ?? []) {
 put('node_modules/@deepseek-ai/dsh-agent-presets/package.json', 'presets-carrier', '@deepseek-ai/dsh-agent-presets', null)
 const presetsPrefix = NM + 'node_modules/@deepseek-ai/dsh-agent-presets/presets/'
 let presetsEntries = 0
-// W4 引擎树补丁 marker（pi-drift-F1）随门禁抽验——快照内 lib/index.js 必须带降级标记
-const PATCH_TARGET = NM + 'node_modules/@deepseek-ai/dsh-llm-pi-ai/lib/index.js'
-const PATCH_MARKER = 'dsh-mobile drift guard'
-want.set(PATCH_TARGET, { kind: 'patch-marker', name: 'pi-drift-F1', version: null })
+// 引擎树补丁 marker 随门禁抽验（0.13.5 起登记表驱动）：scripts/patches/registry.json
+// 内每个 scope=engine 补丁，其 target 文件必须带该补丁的 marker——防「补丁未施加/版本漂移」
+// 的静默半成品（新增补丁自动纳入，无需再手改本文件）。
+for (const patch of PATCH_REGISTRY.patches.filter((p) => p.scope === 'engine')) {
+  const marker = String(patch.marker ?? '').replace(/（.*$/, '').trim()
+  if (marker.length === 0) continue
+  want.set(patch.target, { kind: 'patch-marker', name: patch.id, version: null, marker })
+}
 
 const py = `
 import tarfile, json, sys
@@ -73,7 +79,7 @@ try {
   writeFileSync(wantFile, JSON.stringify([...want.keys(), presetsPrefix]))
   try {
     const snapWin = snap.replace(/\\/g, '/')
-    res = JSON.parse(execSync(`python ${JSON.stringify(tmpPy)} ${JSON.stringify(snapWin)} ${JSON.stringify(wantFile)} ${JSON.stringify(presetsPrefix)}`, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }))
+    res = JSON.parse(execSync(`${process.platform === 'win32' ? 'python' : 'python3'} ${JSON.stringify(tmpPy)} ${JSON.stringify(snapWin)} ${JSON.stringify(wantFile)} ${JSON.stringify(presetsPrefix)}`, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }))
   } finally {
     rmSync(tmpPy, { force: true })
     rmSync(wantFile, { force: true })
@@ -98,7 +104,7 @@ for (const [path, meta] of want) {
     if (ver !== meta.version) fails.push(`[${meta.kind}] 版本不符: ${meta.name} 期望 ${meta.version} 实得 ${ver}`)
     checked++
   } else if (meta.kind === 'patch-marker') {
-    if (!content.includes(PATCH_MARKER)) fails.push('[patch-marker] pi-drift-F1 降级标记缺席（补丁未施加或版本漂移）')
+    if (!content.includes(meta.marker)) fails.push(`[patch-marker] ${meta.name} 标记「${meta.marker}」缺席（补丁未施加或版本漂移）`)
     checked++
   } else if (meta.kind === 'vendor' || meta.kind === 'nested' || meta.kind === 'pin') {
     // W8：登记清单内的包顺带核验 license 字段（比对 engine-overlay-licenses.json）

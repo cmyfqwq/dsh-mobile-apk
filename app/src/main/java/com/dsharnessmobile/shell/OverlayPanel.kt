@@ -194,6 +194,8 @@ class OverlayPanel(private val svc: OverlayService) {
           // pickerInit 防首帧误触发；用户切换时更新发送目标（空 = 新会话）
           if (pickerInit && pos >= 0 && pos < pickerIds.size) {
             svc.activeSessionId = pickerIds[pos]
+            // 0.13.5：用户显式选择 = 钉住（此后不再自动跟随其它会话）
+            svc.userPinnedSession = true
             if (svc.activeSessionId.isEmpty()) svc.sessionBusy = false
             svc.renderPanelOnly()
           }
@@ -768,6 +770,10 @@ class OverlayPanel(private val svc: OverlayService) {
       val ad = pickerAdapter ?: return@postRpc
       pickerLabels.clear(); pickerIds.clear()
       pickerLabels.add("＋ 新会话"); pickerIds.add("")
+      // 0.13.5：未钉住时，默认选「正在工作的会话」；没有则选最近更新的非空会话（用户诉求：
+      // 打开悬浮球就该对着当前在跑的对话，而不是默认新建）。running 来自 session/list 官方字段。
+      var runningId = ""
+      var recentId = ""
       if (code == 200) {
         try {
           val arr = JSONObject(body).optJSONObject("result")
@@ -783,15 +789,24 @@ class OverlayPanel(private val svc: OverlayService) {
               // 已选当前目标：置顶展示，便于核对
               val label = if (sid == svc.activeSessionId) "$title（当前）" else title
               pickerLabels.add(label); pickerIds.add(sid)
+              if (runningId.isEmpty() && it.optBoolean("running", false)) runningId = sid
+              if (recentId.isEmpty() && !it.optBoolean("blank", false)) recentId = sid
             }
           }
         } catch (_: Exception) {}
       }
       ad.notifyDataSetChanged()
-      // 回填当前目标会话在列表中的位置（找不到则回到「新会话」）
-      val idx = pickerIds.indexOf(svc.activeSessionId).let { if (it >= 0) it else 0 }
+      // 回填当前目标会话在列表中的位置；未钉住且当前目标为空/失效时自动跟随正在工作的会话
+      var idx = pickerIds.indexOf(svc.activeSessionId)
+      if (idx < 0 && !svc.userPinnedSession) {
+        val follow = if (runningId.isNotEmpty()) runningId else recentId
+        if (follow.isNotEmpty()) {
+          svc.activeSessionId = follow
+          idx = pickerIds.indexOf(follow)
+        }
+      }
       pickerInit = false
-      try { sp.setSelection(idx, false) } catch (_: Exception) {}
+      try { sp.setSelection(if (idx >= 0) idx else 0, false) } catch (_: Exception) {}
       pickerInit = true
     }
   }

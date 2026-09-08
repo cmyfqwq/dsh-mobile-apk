@@ -58,7 +58,7 @@ jobs:
         shell: bash
         run: |
           set -e
-          for d in plugins/dsh-android-bridge plugins/dsh-android-manage plugins/dsh-android-linux-env plugins/dsh-android-file-open dsh-shell-termux dsh-client-ui-responsive; do
+          for d in plugins/dsh-android-bridge plugins/dsh-android-manage plugins/dsh-android-linux-env plugins/dsh-android-file-open plugins/dsh-model-capability dsh-shell-termux dsh-client-ui-responsive; do
             echo "== npm build $d =="
             (cd "$d" && npm install --no-audit --no-fund && npm run build)
           done

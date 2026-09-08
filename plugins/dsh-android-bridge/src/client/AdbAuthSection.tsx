@@ -28,6 +28,22 @@ interface AndroidShellBridge {
   hasAllFilesAccess?: () => boolean
   /** 自动扫描系统无线调试端口（issue #80）：返回配对端口候选 JSON 数组文本（端序）。 */
   discoverAdbPorts?: () => string
+  /** 0.13.5 W4：无障碍控制通道状态 JSON {enabled,label,sdk,restrictedSettingsApplies,hint,tokenConfigured}。 */
+  a11yStatus?: () => string
+  /** 0.13.5 W4：走官方 Intent 唤起系统无障碍设置页（ACTION_ACCESSIBILITY_SETTINGS）。 */
+  openA11ySettings?: () => void
+  /** 0.13.5 W4：Android 13+ 受限设置一键解锁（appops set … ACCESS_RESTRICTED_SETTINGS allow，走 ADB 通道）。 */
+  unlockRestrictedSettings?: () => string
+}
+
+/** 无障碍控制通道状态（壳侧 DeviceControlService.statusJson）。 */
+interface A11yStatus {
+  enabled?: boolean
+  label?: string
+  sdk?: number
+  restrictedSettingsApplies?: boolean
+  hint?: string
+  tokenConfigured?: boolean
 }
 
 /** 配对结构化结果（F3；reason 取值见壳侧 AdbState.classifyFailure / PairResult 注释）。 */
@@ -118,6 +134,8 @@ function nativeBridge(): AndroidShellBridge | undefined {
  */
 export function AdbAuthSection(_props: AdbAuthSectionProps) {
   const [status, setStatus] = useState<AdbStatusView | null>(null)
+  // 0.13.5 W4：无障碍通道状态（主入口；与 ADB 状态同轮询刷新）
+  const [a11y, setA11y] = useState<A11yStatus | null>(null)
   // F4 双错误通道：pollError 由 3s 轮询独占（状态查询抖动），actionError 归操作动作所有
   // （此前轮询每 3 秒把操作报错一并抹掉——用户永远看不清红字就没了，2026-08-27 复盘实锤）。
   const [pollError, setPollError] = useState<string | null>(null)
@@ -149,6 +167,13 @@ export function AdbAuthSection(_props: AdbAuthSectionProps) {
       }
     } catch (e) {
       if (mounted.current) setPollError('状态查询失败：' + String((e as Error).message))
+    }
+    // 无障碍状态来自壳侧原生（同步返回 JSON 文本），失败不影响 ADB 状态展示
+    try {
+      const raw = nativeBridge()?.a11yStatus?.()
+      if (mounted.current && typeof raw === 'string' && raw.startsWith('{')) setA11y(JSON.parse(raw) as A11yStatus)
+    } catch {
+      /* 桥不可用（桌面/旧壳）：保持上次值 */
     }
   }, [])
 
@@ -306,6 +331,45 @@ export function AdbAuthSection(_props: AdbAuthSectionProps) {
     }
   }, [])
 
+  /** 0.13.5 W4：走官方 Intent 唤起系统无障碍设置页（ACTION_ACCESSIBILITY_SETTINGS）。 */
+  const openA11y = useCallback(() => {
+    const bridge = nativeBridge()
+    if (!bridge?.openA11ySettings) {
+      raiseActionError('需在安卓壳应用内开启（原生桥不可用）')
+      return
+    }
+    setActionError(null)
+    try {
+      bridge.openA11ySettings()
+      setOkMsg('已打开系统无障碍设置：找到「DSH 设备控制」并开启（开启后本页状态会自动刷新）')
+    } catch (e) {
+      raiseActionError('打开系统设置失败：' + String((e as Error).message))
+    }
+  }, [raiseActionError])
+
+  /** 0.13.5 W4：Android 13+ 受限设置一键解锁（appops，走壳侧 ADB 通道）。 */
+  const unlockRestricted = useCallback(async () => {
+    const bridge = nativeBridge()
+    if (!bridge?.unlockRestrictedSettings) {
+      raiseActionError('需在安卓壳应用内解锁（原生桥不可用）')
+      return
+    }
+    setBusy(true)
+    setActionError(null)
+    setOkMsg(null)
+    try {
+      const raw = bridge.unlockRestrictedSettings()
+      const parsed = typeof raw === 'string' && raw.startsWith('{') ? (JSON.parse(raw) as { ok?: boolean; message?: string }) : null
+      if (parsed?.ok === true) setOkMsg(parsed.message ?? '已解锁受限设置')
+      else raiseActionError(parsed?.message ?? '解锁失败：可稍后重试，或在系统设置里手动允许')
+      await refresh()
+    } catch (e) {
+      raiseActionError('解锁失败：' + String((e as Error).message))
+    } finally {
+      setBusy(false)
+    }
+  }, [refresh, raiseActionError])
+
   const onKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
       if (e.key === 'Escape') cancelConfirm()
@@ -318,7 +382,44 @@ export function AdbAuthSection(_props: AdbAuthSectionProps) {
 
   return (
     <div className="adb-auth" data-plugin="adb-auth" onKeyDown={onKeyDown}>
+      {/* 0.13.5 W4：无障碍通道是**主入口**（PRD-0.13.2 §3.3 B3——授权形式简化：一次系统开关） */}
+      <div className={a11y?.enabled ? 'adb-auth-tier adb-auth-tier-ok' : 'adb-auth-tier adb-auth-tier-bad'}>
+        <span>{a11y?.enabled ? '无障碍通道已开启（推荐）' : '无障碍通道未开启（推荐）'}</span>
+        <span className="adb-auth-tier-sub">
+          {a11y?.hint ?? '开启后 AI 可用语义方式读取界面并点击 / 输入 / 滚动'}
+        </span>
+      </div>
+      <div className="adb-auth-actions">
+        <button type="button" className="adb-auth-btn" disabled={busy} onClick={openA11y}>
+          {a11y?.enabled ? '查看系统无障碍设置' : '去开启无障碍服务'}
+        </button>
+        {a11y?.restrictedSettingsApplies === true && (
+          <button type="button" className="adb-auth-btn" disabled={busy} onClick={() => void unlockRestricted()}>
+            一键解锁受限设置
+          </button>
+        )}
+      </div>
+      {a11y?.restrictedSettingsApplies === false && (
+        <p className="adb-auth-note">
+          当前系统（Android {a11y?.sdk ?? '?'}）没有「受限设置」限制：直接到 系统设置 → 无障碍 → 已下载的服务
+          开启「DSH 设备控制」即可。
+        </p>
+      )}
+      {a11y?.restrictedSettingsApplies === true && (
+        <p className="adb-auth-note">
+          Android 13 及以上：侧载应用的「无障碍」开关可能被系统「受限设置」挡住——先点「一键解锁受限设置」
+          （走本机 ADB 通道执行 appops，需要已配对的 ADB 通道），再开启无障碍服务。
+        </p>
+      )}
       <p className="adb-auth-note">
+        无障碍通道只需在系统设置里开启一次「DSH 设备控制」，即可使用 dump / click / input / scroll 语义操作
+        （不依赖 uiautomator、不受窗口动画阻塞）。下方 ADB 通道是高级/脚本面（shell 执行、原图截图、
+        pm / dumpsys 等系统面）。两条通道任一成立即可，会话档位仍需完全访问。
+      </p>
+
+      <details className="adb-auth-details">
+        <summary>ADB 通道（高级/脚本面）：shell 执行、原图截图、系统面</summary>
+        <p className="adb-auth-note">
         安卓调试授权三道门：完全访问档位（前置）→ 系统无线调试开启 → 应用内「允许访问」开关 → 输入配对码。
         配对为真实握手（adb pair）：码值与端口取自系统「无线调试」弹窗（IP 固定 127.0.0.1），
         配对码只在壳侧使用、绝不出壳。自动审批不构成开放条件；重启后需重新配对（安全特性）。
@@ -432,6 +533,7 @@ export function AdbAuthSection(_props: AdbAuthSectionProps) {
           </button>
         </div>
       )}
+      </details>
 
       {(actionError ?? pollError) !== null && <p className="adb-auth-error">{actionError ?? pollError}</p>}
       {okMsg !== null && <p className="adb-auth-ok">{okMsg}</p>}

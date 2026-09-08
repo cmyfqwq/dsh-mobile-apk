@@ -24,6 +24,7 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.FrameLayout
 import android.widget.LinearLayout
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.app.NotificationCompat
@@ -473,6 +474,10 @@ class MainActivity : ComponentActivity() {
         onRevokeAdbPair = { AdbState.revokePair(this, engineManager) },
         // 缓存优先（启动后台预取 + 15s TTL）；无缓存才同步扫——配对页不再卡 UI（2026-08-27 报障修复）。
         onDiscoverAdbPorts = { AdbState.cachedPorts() ?: AdbState.discoverPorts(this, engineManager).toString() },
+        // 0.13.5 W4：无障碍控制通道（状态 + 系统设置引导 + Android 13 受限设置一键解锁）。
+        onA11yStatus = { DeviceControlService.statusJson(this) },
+        onOpenA11ySettings = { openAccessibilitySettings() },
+        onUnlockRestrictedSettings = { AdbState.unlockRestrictedSettings(this, engineManager) },
       ),
       "androidBridge",
     )
@@ -606,6 +611,27 @@ class MainActivity : ComponentActivity() {
    *  acquire/release：旧实现每次调用 newWakeLock，新实例 isHeld 恒 false，
    *  关闭路径永不 release（Review 2026-08-18 实锤的锁泄漏）。 */
   private var screenWakeLock: PowerManager.WakeLock? = null
+
+  /**
+   * 0.13.5 W4：跳系统无障碍设置页（用户手动开启「DSH 设备控制」）。
+   * Android 13+ 侧载应用可能因受限设置而看不到开关——由设置页的「一键解锁」按钮先 appops 解锁。
+   */
+  private fun openAccessibilitySettings() {
+    val candidates = listOf(
+      Intent(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS),
+      Intent(android.provider.Settings.ACTION_SETTINGS),
+    )
+    for (intent in candidates) {
+      try {
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        startActivity(intent)
+        return
+      } catch (t: Throwable) {
+        Log.w(TAG, "openAccessibilitySettings failed: " + t.message)
+      }
+    }
+    Toast.makeText(this, "无法打开系统设置，请手动前往 系统设置 → 无障碍", Toast.LENGTH_LONG).show()
+  }
 
   private fun keepScreenOn(enable: Boolean) {
     try {

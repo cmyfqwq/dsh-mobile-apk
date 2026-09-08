@@ -20,6 +20,33 @@ const ROOT = dirname(dirname(fileURLToPath(import.meta.url)))
 const ABI = process.argv[2] ?? 'arm64'
 if (!['arm64', 'x86_64'].includes(ABI)) { console.error('用法: node build-snapshot-013.mjs <arm64|x86_64>'); process.exit(1) }
 
+// ── 0. Windows 宿主自动转入 WSL 内执行（0.13.5 W5）────────────────────────
+// 依据（2026-09-10 实测）：同一 125 MB 基座解压在 ext4 是 3.5 s、在 9p(/mnt/d) 是 86.8 s
+// （CPU 时间相同，差 25 倍）；而 Windows 经 \\wsl.localhost 访问 ext4 的小文件 I/O 反而比
+// D: 慢 9~97 倍（写 2000 个小文件：D: 3.0 s vs UNC 28.7 s；读 0.36 s vs 34.8 s）。
+// 结论：要吃到 ext4 的收益，**整个构建必须在 WSL 内跑**（含 python/node 遍历步骤），
+// 只有最终 tar.xz 写回 D:。故 Windows 上直接把自己重新执行进 WSL。
+// DSH_NO_WSL_REEXEC=1 跳过（调试/无 WSL 环境回退到旧的 D: 工作区）。
+if (process.platform === 'win32' && process.env.DSH_NO_WSL_REEXEC !== '1') {
+  const forwarded = ['DSH_SNAPSHOT_STAGE', 'SOURCE_DATE_EPOCH', 'DSH_INJECT_PRESET']
+    .filter((key) => process.env[key])
+    .map((key) => `${key}=${JSON.stringify(process.env[key])}`)
+    .join(' ')
+  const inner = `cd ${wslPath(ROOT)} && node scripts/build-snapshot-013.mjs ${ABI}`
+  const command = forwarded ? `${forwarded} ${inner}` : inner
+  log0(`Windows 宿主 → 转入 WSL 内执行（工作区落 ext4）：${inner}`)
+  try {
+    execSync(`wsl.exe -e bash -lc ${JSON.stringify(command)}`, { stdio: 'inherit' })
+    process.exit(0)
+  } catch (error) {
+    process.exit(typeof error.status === 'number' ? error.status : 1)
+  }
+}
+function log0(msg) { console.log(`[build-013/${ABI}] ${msg}`) }
+
+/** Python 命令名：Windows 用 python，Linux/WSL 用 python3（0.13.5 W5 起构建在 WSL 内跑）。 */
+const PYTHON = process.platform === 'win32' ? 'python' : 'python3'
+
 // ── 数据模块（Phase 2b 外置：scripts/snapshot-config/，双仓同版——雷点 10）──
 // 清单/模板与编排逻辑分离：预装包、镜像链、剥离清单、瘦身清单、seed 模板、apt.conf、
 // install-clang.sh 均在本目录维护；编排器只读数据 + 走流程。@@PREFIX@@ 为模板占位
@@ -48,7 +75,25 @@ const NEW_PREFIX = '/data/user/0/com.dsharnessmobile.shell/files/usr'
 const OLD_PREFIX = '/data/data/com.termux/files/usr'
 const BASE_DIR = join(ROOT, '.deploy-tmp', ABI === 'arm64' ? 'arm64-base' : 'x64-base')
 const OUT_DIR = join(ROOT, '.deploy-tmp', 'snapshot-013', ABI)
-const STAGE = join(OUT_DIR, 'stage')
+// 工作区位置（0.13.5 W5，2026-09-10）：
+//   - WSL 内（正常路径）：Linux ext4 的 $HOME/.dsh-stage/<abi>——9p 的 25 倍差距只在这里兑现；
+//   - 原生 Linux（CI）：沿用仓库内 .deploy-tmp/...（本来就是本地文件系统）；
+//   - Windows 且跳过 WSL 重入（DSH_NO_WSL_REEXEC=1）：回退旧行为（D: 上的 stage）。
+// 覆盖：DSH_SNAPSHOT_STAGE=<Linux 绝对路径>。
+const IN_WSL = process.platform === 'linux' && Boolean(process.env.WSL_DISTRO_NAME)
+const STAGE_DEFAULT_LINUX = `${process.env.HOME ?? '/root'}/.dsh-stage/${ABI}`
+const STAGE = (() => {
+  const override = process.env.DSH_SNAPSHOT_STAGE
+  if (override) {
+    if (!override.startsWith('/')) {
+      console.error('DSH_SNAPSHOT_STAGE 必须是 Linux 绝对路径（例如 /root/.dsh-stage/x86_64）')
+      process.exit(2)
+    }
+    return override
+  }
+  if (IN_WSL) return STAGE_DEFAULT_LINUX
+  return join(OUT_DIR, 'stage')
+})()
 const DEBPOOL = join(OUT_DIR, '.debs')
 const INDEX_BODY = join(OUT_DIR, 'Packages')
 const npmDshRoot = join('usr/lib/node_modules/@deepseek-ai/dsh/node_modules')
@@ -213,23 +258,47 @@ for (const entry of OVERLAY.keepUnpublished ?? []) {
   }
 }
 
-// ── 0f. 引擎树补丁（0.13.3 W4）：llm-pi-ai 目录漂移降级（scope=engine）──
-// 对 stage 施加 scripts/patches 登记表内全部 engine scope 补丁（幂等 + 锚点校验，
-// 失败拒打包）。vendor scope 补丁归 build-apk-013.ps1（vendor 目录），两处 scope 互不越界。
+// ── 0f. 引擎树补丁（0.13.3 W4 起）：对 stage 施加 scripts/patches 登记表内全部
+// engine scope 补丁（幂等 + 锚点校验，失败拒打包）。vendor scope 补丁归
+// build-apk-013.ps1（vendor 目录），两处 scope 互不越界。
+// 0.13.5 起复查改为**登记表驱动**：每个 engine 补丁的 marker 都必须在其 target 文件内
+// （防「exit 0 但补丁缺席」的半成品，也防新增补丁被漏检）。
 // ⚠️ 双份构建脚本必须同改（雷点 10）。
 {
   const stageRoot = join(STAGE, 'root')
-  log('施加引擎树补丁（pi-drift-F1，apply-patches --scope engine）…')
+  const registry = JSON.parse(readFileSync(join(ROOT, 'scripts', 'patches', 'registry.json'), 'utf8'))
+  const enginePatches = registry.patches.filter((p) => p.scope === 'engine')
+  log(`施加引擎树补丁（${enginePatches.map((p) => p.id).join(', ')}，apply-patches --scope engine）…`)
   const script = join(ROOT, 'scripts', 'patches', 'apply-patches.mjs')
   const out = execSync(`node "${script}" "${stageRoot}" --apply --scope engine`, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
   process.stdout.write(out)
   // 施加后复查（防 exit 0 但补丁缺席的半成品）
-  const piAiIndex = join(overlayPkgDir('@deepseek-ai/dsh-llm-pi-ai', join(stageRoot, 'usr/lib/node_modules/@deepseek-ai/dsh/node_modules')), 'lib', 'index.js')
-  if (!existsSync(piAiIndex) || !readFileSync(piAiIndex, 'utf8').includes('dsh-mobile drift guard')) {
-    console.error('[引擎树补丁断言失败] pi-drift marker 不在场——快照不可发布')
-    process.exit(1)
+  for (const patch of enginePatches) {
+    const marker = String(patch.marker ?? '').replace(/（.*$/, '').trim()
+    const target = join(stageRoot, patch.target)
+    if (marker.length === 0) {
+      console.error(`[引擎树补丁断言失败] ${patch.id} 登记表缺 marker——无法验证`)
+      process.exit(1)
+    }
+    if (!existsSync(target) || !readFileSync(target, 'utf8').includes(marker)) {
+      console.error(`[引擎树补丁断言失败] ${patch.id} marker「${marker}」不在场（${patch.target}）——快照不可发布`)
+      process.exit(1)
+    }
   }
-  log('引擎树补丁就位（pi-drift marker 在场）')
+  log(`引擎树补丁就位（${enginePatches.length} 项 marker 在场）`)
+}
+
+// ── 0g. 能力发现目录快照（0.13.5 W3）：从 stage 引擎树生成 dsh-model-capability 的厂商目录索引 ──
+// 数据必须与本次构建的引擎树同源（精确模型 id → thinkingLevelMap/input/compat），
+// 生成物落在插件 lib/（随注入进快照），因此必须在注入步骤之前完成；引擎升级后自动跟随。
+{
+  const pluginDir = join(ROOT, 'plugins', 'dsh-model-capability')
+  if (existsSync(join(pluginDir, 'package.json'))) {
+    const generator = join(ROOT, 'scripts', 'gen-model-catalog.mjs')
+    const outFile = join(pluginDir, 'lib', 'catalog-snapshot.json')
+    execSync(`node "${generator}" --engine-root "${join(STAGE, 'root')}" --out "${outFile}"`, { encoding: 'utf8', stdio: 'inherit' })
+    log('能力目录快照已生成（plugins/dsh-model-capability/lib/catalog-snapshot.json）')
+  }
 }
 
 // ── 1. Termux 索引（镜像回退链 + 404/超时快速失败）──
@@ -389,7 +458,7 @@ log('dpkg status: ' + dpkgStatus.length + ' 包')
 
 // ── 6. shebang 与 ELF RUNPATH 重写（com.termux → com.dsharnessmobile.shell）──
 log('重写 shebang/RUNPATH…')
-execSync(`python scripts/fix-shebang.py "${U}" ${NEW_PREFIX}`, { encoding: 'utf8', stdio: 'inherit' })
+execSync(`${PYTHON} scripts/fix-shebang.py "${U}" ${NEW_PREFIX}`, { encoding: 'utf8', stdio: 'inherit' })
 // termux-elf-cleaner：清理 ELF 中残留 com.termux RUNPATH（幂等：已清理的无操作）
 const cleaner = join(U, 'bin', 'termux-elf-cleaner')
 if (existsSync(cleaner)) {
@@ -731,11 +800,11 @@ writeFileSync(join(OUT_DIR, 'snapshot.sha256'), sha)
 // 流式处理快照），自检改用 Python 一行（无 WSL、无编码畸变、无压缩明文问题）。
 let licCount = 0
 try {
-  // 结论：必须**流式解压 tar** 再数条目——用 Windows 本地 python（inject-snapshot.py 同款
-  // lzma/tarfile 流式）直接开 Windows 路径归档，不经 WSL（无噪音、无编码畸变、无压缩明文问题）。
+  // 结论：必须**流式解压 tar** 再数条目——用构建环境的 Python（Windows 本地 python / WSL 内 python3；
+  // 0.13.5 W5 起整个构建在 WSL 内跑，命令名必须按平台选择，否则 exit 127）直接开归档流式统计。
   const archiveWin = archive.replace(/\\/g, '/')
   const py = `import lzma,tarfile; t=tarfile.open(${JSON.stringify(archiveWin)},'r'); n=[x for x in t.getnames() if x.startswith('usr/share/LICENSES/') and x.endswith('.txt')]; print(len(n))`
-  licCount = Number(execSync('python -c ' + JSON.stringify(py), { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 }).trim())
+  licCount = Number(execSync(PYTHON + ' -c ' + JSON.stringify(py), { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 }).trim())
 } catch (e) {
   console.error(`  [LICENSES 归档自检执行失败] ${String(e)}`)
 }

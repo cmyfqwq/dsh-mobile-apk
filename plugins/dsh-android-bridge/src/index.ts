@@ -12,10 +12,21 @@
  * 状态来源：DSH_WRITE_MODE 环境（shell-termux 注入的写面档位）+ 壳侧桥状态（经 HTTP 端点/env 注入）
  * 首版（无 ADB 通道实现时）：状态查询 + 审计 + 失败关闭引导——与 PRD "未授权全部失败关闭" 语义一致。
  */
-import { mkdirSync, appendFileSync, statSync, readFileSync, writeFileSync, renameSync, rmSync } from 'node:fs'
+import { readFileSync, appendFileSync, mkdirSync, statSync, writeFileSync, renameSync, rmSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
-import { defineTool } from '@deepseek-ai/dsh-tools'
+import { defineTool, type JsonValue } from '@deepseek-ai/dsh-tools'
+import { decideControl, type ControlDecision, type ControlOp } from './control-policy.js'
+import {
+  ControlQueue,
+  controlTokenFrom,
+  registerControlRoutes,
+  type ControlResult,
+} from './control-queue.js'
+
+export { decideControl, ControlQueue, registerControlRoutes, controlTokenFrom }
+export type { ControlDecision, ControlOp } from './control-policy.js'
+export type { ControlRequest, ControlResult } from './control-queue.js'
 
 export const name = 'dsh-android-bridge'
 // 注意：inject 声明的服务必须预先存在——ctx.logger 是 cordis 内置方法（不需 inject），
@@ -85,6 +96,12 @@ export interface ShellAdbPrefs {
   connectPort?: string
   /** 配对后 connect 探活缓存（壳侧 AdbState 维护；引擎只读）。 */
   connected?: boolean
+  /** 0.13.5 W4：无障碍服务已连接（壳侧 DeviceControlService 维护；控制通道开关事实）。 */
+  a11yEnabled?: boolean
+  /** 0.13.5 W4：无障碍控制队列的共享令牌（壳侧每次启动生成；引擎侧比对）。 */
+  controlToken?: string
+  /** 0.13.5 W4：轮询心跳（epoch ms）——判定服务是否真的活着（防僵尸 a11yEnabled）。 */
+  controlHeartbeat?: number
 }
 
 /** 持久文件路径：环境变量显式指定（测试/桌面模拟）优先；安卓壳域默认；其余返回 null。 */
@@ -97,19 +114,28 @@ function shellPrefsPath(): string | null {
 }
 
 /** SharedPreferences XML → 布尔/字符串状态；不存在/解析失败返回 undefined（上层回落 env）。 */
-function parseAdbPrefsXml(xml: string): ShellAdbPrefs | null {
+export function parseAdbPrefsXml(xml: string): ShellAdbPrefs | null {
   const mAllow = /<boolean\s+name="allowSwitch"\s+value="(true|false)"\s*\/?>/.exec(xml)
   const mPair = /<boolean\s+name="paired"\s+value="(true|false)"\s*\/?>/.exec(xml)
   const mConnected = /<boolean\s+name="connected"\s+value="(true|false)"\s*\/?>/.exec(xml)
   const mPairPort = /<string\s+name="pairPort">([^<]*)<\/string>/.exec(xml)
   const mConnectPort = /<string\s+name="connectPort">([^<]*)<\/string>/.exec(xml)
-  if (!mAllow && !mPair) return null
+  // 0.13.5 W4：无障碍控制通道事实（服务连接状态 + 队列共享令牌）
+  const mA11y = /<boolean\s+name="a11yEnabled"\s+value="(true|false)"\s*\/?>/.exec(xml)
+  const mToken = /<string\s+name="controlToken">([^<]*)<\/string>/.exec(xml)
+  const mHeartbeat = /<long\s+name="controlHeartbeat"\s+value="(\d+)"\s*\/?>/.exec(xml)
+  // 只要任一受管键在场就解析——无障碍通道独立于 ADB 三道人门，
+  // 未开启 ADB 时 prefs 里可能只有 a11yEnabled/controlToken（0.13.5 实测踩坑）。
+  if (!mAllow && !mPair && !mA11y && !mToken) return null
   return {
     allowSwitch: mAllow ? mAllow[1] === 'true' : false,
     paired: mPair ? mPair[1] === 'true' : false,
     connected: mConnected ? mConnected[1] === 'true' : false,
     pairPort: mPairPort?.[1] || undefined,
     connectPort: mConnectPort?.[1] || undefined,
+    a11yEnabled: mA11y ? mA11y[1] === 'true' : false,
+    controlToken: mToken?.[1] || undefined,
+    controlHeartbeat: mHeartbeat ? Number(mHeartbeat[1]) : undefined,
   }
 }
 
@@ -166,6 +192,16 @@ function currentStatus(env: NodeJS.ProcessEnv, defaultWriteMode?: string): AdbSt
 /** 引擎级授权就绪（用户是否授权——不掺会话档位）。 */
 function engineLevelReady(st: AdbStatus): boolean {
   return st.fullAccess && st.allowSwitchOn === true && st.paired === true && st.wirelessDebugOn === true
+}
+
+/** 0.13.5 W4：结构化授权事实（设置页与工具层共用，便于 AI 分卡定位失败原因）。 */
+export interface ControlGateFacts {
+  a11yEnabled: boolean
+  fullAccess: boolean
+  allowSwitch: boolean
+  paired: boolean
+  wirelessDebug: boolean
+  adbReady: boolean
 }
 
 /**
@@ -273,6 +309,8 @@ export class AndroidPrivilegeService {
     private readonly defaultMode?: () => string | undefined,
     private readonly sandboxPolicy?: { defaultMode?: string; resolve(r?: { session?: unknown }): { mode?: string } },
     private readonly shellFace?: { resolve?(spec: Record<string, unknown>): Record<string, unknown>; run(spec: Record<string, unknown>): Promise<Record<string, unknown>> },
+    /** 0.13.5 W4：无障碍控制队列（apply() 注入；缺省 = 控制通道不可用）。 */
+    private readonly controlQueue?: ControlQueue,
   ) {}
 
   status(): AdbStatus {
@@ -284,20 +322,48 @@ export class AndroidPrivilegeService {
    * 按 `exec.agent.session` 的档位 resolve；≠ danger-full-access 即拒绝。
    * 安全方向：会话切回 read-only/workspace-write → 下一次调用立即拒绝。
    */
-  gateFor(session?: unknown): { ok: true } | { ok: false; guidance: string } {
+  /**
+   * 会话级通道门（AI 能否获取——实时）。
+   *
+   * 0.13.5 W4 重构（PRD-0.13.2 §3.3 B3）：授权面从「ADB 三道人门」改为
+   * **两条等价通道，无障碍优先**——
+   *   - 无障碍通道：系统设置里开启「DSH 设备控制」一次即成立（设备控制面 dump/click/input/scroll）；
+   *   - ADB 通道：完全访问 + 允许访问开关 + 无线调试配对（降级为高级/脚本通道：shell 执行、
+   *     原图截图、系统面 pm/dumpsys）。
+   * 两者都要求会话档位 danger-full-access（隐私敏感面不因通道简化而放宽）。
+   * 任一通道成立即放行；都不可用时引导文案**先讲无障碍**（一次开关），再讲 ADB。
+   */
+  gateFor(session?: unknown): { ok: true; via?: 'a11y' | 'adb' } | { ok: false; guidance: string; gates?: ControlGateFacts } {
     const st = this.status()
-    if (!engineLevelReady(st)) {
-      return { ok: false, guidance: st.message ?? '未授权' }
+    const a11y = this.a11yEnabled()
+    const adbReady = engineLevelReady(st) && st.tier !== 'T0'
+    const gates: ControlGateFacts = {
+      a11yEnabled: a11y,
+      fullAccess: st.fullAccess === true,
+      allowSwitch: st.allowSwitchOn === true,
+      paired: st.paired === true,
+      wirelessDebug: st.wirelessDebugOn === true,
+      adbReady,
     }
     const policy = this.sandboxPolicy?.resolve(session === undefined ? {} : { session })
     const mode = policy?.mode
     if (mode !== 'danger-full-access') {
       return {
         ok: false,
-        guidance: `会话级档位 ${mode ?? '未知'}（需 danger-full-access）——引擎级授权已满足，但 AI 获取面不开放；会话内 /permission danger-full-access 可即时开放`,
+        gates,
+        guidance: `会话档位为 ${mode ?? '未知'}，设备控制面要求 danger-full-access（无障碍通道同样受此门约束）——会话内 /permission danger-full-access 可即时开放`,
       }
     }
-    return { ok: true }
+    if (a11y) return { ok: true, via: 'a11y' }
+    if (adbReady) return { ok: true, via: 'adb' }
+    return {
+      ok: false,
+      gates,
+      guidance: '设备控制未授权。任选其一即可：'
+        + '①（推荐，一次开关）到 系统设置 → 无障碍 → 已下载的服务 开启「DSH 设备控制」；'
+        + '②（高级/脚本通道）到「开发者选项 → 无线调试」完成 ADB 完全访问 + 允许访问 + 配对。'
+        + '两者都会即时生效，无需重启。',
+    }
   }
 
   /** 授权状态探活（F2.9 / F1.7 授权探活：断线引导重新配对）——引擎级 + 会话级（默认档位视角）。 */
@@ -320,6 +386,57 @@ export class AndroidPrivilegeService {
   /** live 连接端口（真实通道；配对后由壳侧 AdbState 写入）。 */
   connectPort(): string | undefined {
     return readShellAdbState()?.connectPort
+  }
+
+  /** 0.13.5 W4：无障碍服务是否**真的活着**。
+   *  prefs 的 a11yEnabled 会在进程被 force-stop 后变成僵尸 true（onDestroy 不保证执行），
+   *  因此叠加「壳侧轮询心跳」：队列最近一次取活距今 < 20s 才算在线（空闲长轮询 5s 一次）。 */
+  a11yEnabled(): boolean {
+    if (readShellAdbState()?.a11yEnabled !== true) return false
+    if (!this.controlQueue) return false
+    return this.controlQueue.pollAgeMs() < 20_000
+  }
+
+  /** 0.13.5 W4：结构化授权事实（两条通道各自的门）。 */
+  gateFacts(): ControlGateFacts {
+    const st = this.status()
+    const adbReady = engineLevelReady(st) && st.tier !== 'T0'
+    return {
+      a11yEnabled: this.a11yEnabled(),
+      fullAccess: st.fullAccess === true,
+      allowSwitch: st.allowSwitchOn === true,
+      paired: st.paired === true,
+      wirelessDebug: st.wirelessDebugOn === true,
+      adbReady,
+    }
+  }
+
+  /** 0.13.5 W4：当前操作应走哪个后端（纯策略，fail-closed）。 */
+  controlDecision(op: ControlOp, session?: unknown, forceBackend?: 'a11y' | 'adb'): ControlDecision {
+    const st = this.status()
+    const mode = this.sandboxPolicy?.resolve(session === undefined ? {} : { session })?.mode
+    return decideControl({
+      op,
+      a11yEnabled: this.a11yEnabled(),
+      adbReady: engineLevelReady(st) && st.tier !== 'T0',
+      sessionMode: mode,
+      forceBackend,
+    })
+  }
+
+  /** 0.13.5 W4：队列统计（诊断用；不泄漏页面内容）。 */
+  controlStats() {
+    return this.controlQueue?.stats() ?? { waiting: false, served: 0, failed: 0, lastTakeAt: 0, lastResultAt: 0 }
+  }
+
+  /**
+   * 0.13.5 W4：把一个无障碍操作交给壳侧执行。
+   * 未开启无障碍 / 队列缺失 → 直接拒绝（不降级到 ADB——降级由工具层的策略决定）。
+   */
+  async controlExec(op: ControlOp, args: Record<string, unknown>, timeoutMs?: number): Promise<ControlResult> {
+    if (!this.controlQueue) return { ok: false, error: '无障碍控制队列未装配（插件未挂载 webServer？）' }
+    if (!this.a11yEnabled()) return { ok: false, error: '无障碍服务未开启——请先在系统设置里开启「DSH 设备控制」' }
+    return this.controlQueue.enqueue(op, args, timeoutMs)
   }
 
   /**
@@ -420,12 +537,14 @@ export class AndroidPrivilegeService {
   }
 }
 
-function tools(svc: AndroidPrivilegeService, shellFace?: { resolve?(spec: Record<string, unknown>): Record<string, unknown>; run(spec: Record<string, unknown>): Promise<Record<string, unknown>> }) {
+function tools(svc: AndroidPrivilegeService, shellFace?: { resolve?(spec: Record<string, unknown>): Record<string, unknown>; run(spec: Record<string, unknown>): Promise<Record<string, unknown>> }, controlTokenConfigured: () => boolean = () => false) {
   const statusTool = defineTool({
     name: 'android_privilege_status',
     description:
-      '查询安卓调试桥（ADB）授权状态：档位（T0 未授权 / T1 授权调试档）与三道授权人门状态。' +
-      '未授权时返回引导文案。手机管理工具全部以此为前置检查，失败关闭。',
+      '查询设备控制授权状态。两条等价通道：无障碍通道（系统设置开启「DSH 设备控制」一次即成立，'
+      + '提供 dump/click/input/scroll 语义操作）与 ADB 通道（完全访问 + 允许访问 + 无线调试配对，'
+      + '高级/脚本面：shell 执行、原图截图、pm/dumpsys）。返回结构化 gates 与 control 字段；'
+      + '两者都不可用时给出两条开启路径的引导。手机管理工具全部以此为前置检查，失败关闭。',
     parameters: {},
     output: {
       schema: {
@@ -442,16 +561,39 @@ function tools(svc: AndroidPrivilegeService, shellFace?: { resolve?(spec: Record
           writeMode: { type: 'string' },
           deviceModel: { type: 'string', description: '当前绑定设备型号（连接校验缓存；空=未知）' },
           message: { type: 'string' },
+          gates: { type: 'object', additionalProperties: true, description: '结构化授权事实（a11yEnabled/fullAccess/allowSwitch/paired/wirelessDebug/adbReady）' },
+          control: { type: 'object', additionalProperties: true, description: '控制通道运行时状态（a11yEnabled/queue/tokenConfigured）' },
         },
       },
-      render: (_args, v: Record<string, unknown>) => [{
-        type: 'text',
-        text: `授权档位 ${String(v.tier)}${v.deviceModel ? ' · ' + String(v.deviceModel) : ''}${v.message ? '——' + String(v.message) : ''}`,
-      }],
+      render: (_args, v: Record<string, unknown>) => {
+        const gates = v.gates as ControlGateFacts | undefined
+        const control = v.control as { tokenConfigured?: boolean; queue?: { lastTakeAt?: number } } | undefined
+        const queueFresh = typeof control?.queue?.lastTakeAt === 'number' && control.queue.lastTakeAt > 0
+          && Date.now() - control.queue.lastTakeAt < 20_000
+        return [{
+          type: 'text',
+          text: [
+            `授权档位 ${String(v.tier)}${v.deviceModel ? ' · ' + String(v.deviceModel) : ''}`,
+            `无障碍通道：${gates?.a11yEnabled ? '已开启（可用）' : '未开启'}`
+              + `${control?.tokenConfigured === true ? ' · 令牌已配置' : ''}`
+              + `${queueFresh ? ' · 壳侧轮询在线' : ' · 壳侧轮询离线'}`,
+            `ADB 通道：${gates?.adbReady ? '已就绪' : `未就绪（完全访问=${String(gates?.fullAccess)} 允许访问=${String(gates?.allowSwitch)} 配对=${String(gates?.paired)} 无线调试=${String(gates?.wirelessDebug)}）`}`,
+            gates?.a11yEnabled ? '结论：设备控制可用（走无障碍通道）'
+              : gates?.adbReady ? '结论：设备控制可用（走 ADB 通道）'
+                : '结论：不可用——开启任一通道即可（推荐无障碍：系统设置 → 无障碍 → DSH 设备控制）',
+            v.message ? `ADB 提示：${String(v.message)}` : '',
+          ].filter((line) => line !== '').join('\n'),
+        }]
+      },
     },
     execute: async () => {
       const st = svc.status()
-      return { ...st, deviceModel: svc.boundModel() }
+      return {
+        ...st,
+        deviceModel: svc.boundModel(),
+        gates: svc.gateFacts() as unknown as Record<string, JsonValue>,
+        control: { a11yEnabled: svc.a11yEnabled(), queue: svc.controlStats(), tokenConfigured: controlTokenConfigured() },
+      }
     },
   })
   const termuxChannelTool = defineTool({
@@ -591,13 +733,18 @@ export function apply(ctx: Context, config: Record<string, unknown> = {}) {
   const shellFace = (ctx as unknown as {
     shell?: { resolve?(spec: Record<string, unknown>): Record<string, unknown>; run(spec: Record<string, unknown>): Promise<Record<string, unknown>> }
   }).shell
-  const svc = new AndroidPrivilegeService(ctx, shellMode, sandboxPolicy, shellFace)
+  // 0.13.5 W4：无障碍控制队列（引擎侧服务端；壳侧轮询取活/回填）。
+  // 令牌来自壳侧 prefs（每次启动生成）或 DSH_CONTROL_TOKEN（测试）；两者皆缺 → 路由 fail-closed。
+  const controlQueue = new ControlQueue()
+  const svc = new AndroidPrivilegeService(ctx, shellMode, sandboxPolicy, shellFace, controlQueue)
   try {
     ctx.provide('androidPrivilege', svc)
   } catch (e) {
     // 服务已提供（重复装载）：忽略，保持首个实例
     ctx.logger?.('dsh-android-bridge')?.debug?.('androidPrivilege already provided')
   }
+  const controlToken = () => controlTokenFrom(process.env, readShellAdbState())
+  ctx.effect?.(() => () => controlQueue.cancel('plugin disposed'))
   // F0.3 引擎事件桥（最小版，2026-08-24）：session 事件 → 「任务完成」标记文件。
   // 壳侧 WatchdogV2 每 5s 探活周期顺带消费标记 → 系统通知栏弹「任务完成」（POST_NOTIFICATIONS
   // 已由壳首启授权）。引擎→壳方向无页面依赖（不依赖 androidBridge/WebView 上下文）——
@@ -706,7 +853,7 @@ export function apply(ctx: Context, config: Record<string, unknown> = {}) {
       appendFileSync(probe, new Date().toISOString() + ' listener-FAILED: ' + String((e as Error).message) + '\n')
     } catch { /* 探针失败忽略 */ }
   }
-  for (const t of tools(svc, shellFace)) ctx.tools.register(t)
+  for (const t of tools(svc, shellFace, () => controlToken() !== undefined)) ctx.tools.register(t)
   // 状态端点（浏览端面/设置页查询与展示）。**只读**：无任何写面——授权变更经
   // window.androidBridge.setAdbAllow/setAdbPair/revokeAdbPair 由壳侧原生 AdbState 执行
   // （Shizuku 对照：被提权方不得自改授权；引擎侧不设 POST 写端点）。
@@ -716,8 +863,22 @@ export function apply(ctx: Context, config: Record<string, unknown> = {}) {
       kind: 'exact',
       path: '/api/android/privilege/status',
       handler: async (_req: WsReq, res: WsRes) => {
-        sendJson(res, 200, svc.status())
+        sendJson(res, 200, {
+          ...svc.status(),
+          // 0.13.5 W4：控制通道事实（只读；令牌本身绝不回显）
+          control: {
+            a11yEnabled: svc.a11yEnabled(),
+            queue: svc.controlStats(),
+            tokenConfigured: controlToken() !== undefined,
+          },
+        })
       },
+    })
+    // 0.13.5 W4：无障碍控制队列两条 exact 路由（自带共享令牌；壳侧轮询取活/回填）。
+    registerControlRoutes(wsvc, {
+      queue: controlQueue,
+      token: controlToken,
+      logger: ctx.logger?.('dsh-android-bridge'),
     })
   }
 }

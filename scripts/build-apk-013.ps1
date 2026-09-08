@@ -51,7 +51,10 @@ $pluginDirs = @(
     (Join-Path $Root "plugins\dsh-android-bridge"),
     (Join-Path $Root "plugins\dsh-android-manage"),
     (Join-Path $Root "plugins\dsh-android-linux-env"),
-    (Join-Path $Root "plugins\dsh-android-file-open")
+    (Join-Path $Root "plugins\dsh-android-file-open"),
+    # 0.13.5 W3（issue #125）：自定义提供商能力发现——被动端点描述符 + 厂商 schema +
+    # 引擎目录精确 id 查表（目录快照由 build-snapshot 0g 步从本次引擎树生成）+ 字段级写回。
+    (Join-Path $Root "plugins\dsh-model-capability")
 )
 
 foreach ($abi in @('arm64', 'x86_64')) {

@@ -60,6 +60,22 @@
       android:name=".OverlayService"
       android:exported="false" />
 
+    <!-- 0.13.5 W4：设备控制无障碍服务（语义控制面：按需取节点快照 + performAction）。
+         用户在系统设置里开启一次即生效；未开启时控制通道失败关闭（回退 ADB 通道）。
+         控制队列只服务本机引擎（127.0.0.1:3080）且要求共享令牌。 -->
+    <service
+      android:name=".DeviceControlService"
+      android:exported="true"
+      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
+      android:label="@string/a11y_service_label">
+      <intent-filter>
+        <action android:name="android.accessibilityservice.AccessibilityService" />
+      </intent-filter>
+      <meta-data
+        android:name="android.accessibilityservice"
+        android:resource="@xml/accessibility_service_config" />
+    </service>
+
     <!-- 0.13.0 F2/M3.4：开机自启接收器（恢复用户上次同意的运行状态；restart 后需已启动过）。 -->
     <receiver
       android:name=".BootReceiver"

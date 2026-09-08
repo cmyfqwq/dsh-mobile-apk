@@ -138,3 +138,13 @@
 | 2026-08-30 | 0.13.1 | **文档结构化增补**：坑 30-32 登记（assets ABI 残留/linker64 孤儿 force-stop 杀不死/forward 静默失效——与协调仓雷点 14-16 同源）；标题 AGENT.md→AGENTS.md 对齐文件名；产物路径硬编码 v0.13.0 → v<版本> 占位（产物命名已由 ps1 从 gradle 单一来源读取）；§1 补版本状态与开放跟踪行 | AI 开发助手 |
 | 2026-08-31 | 0.13.2 | **插件构建产物收口（chore, 348011c）**：.gitignore 补 `plugins/*/lib/`、`plugins/*/node_modules/`、`plugins/*/cbin_*`（本地/云端 npm 构建产物不入库）并清理存量 untracked 产物；ci/pr61-fix 孤儿分支（无 PR）与已合并 PR 的旧分支保留未动 | AI 开发助手 |
 | 2026-08-31 | 0.13.2-preview | **0.13.2-preview 功能批（versionCode 28 + versionName 0.13.2-preview；未发布，待用户指示）**：W6 内嵌 ADBKeyboard 协议 IME（AdbKeyboardService/Receiver，dcfd573）+ manage 语义工具双写（1bb0cc7）+ 门禁 settings.yaml 内容级修正（5d9988b）+ W7 悬浮球全套（OverlayService/OverlayController + live 流 + 开关，d76dc41/56c96b7）+ **preview 修正批（ae8a78d）**——面板跟随球（repositionPanel）、引擎页避让帧（emitFrame/replayFrame + frameConsumer 先于 ensureStarted 注册 + onPageFinished 补放 + instance/onDestroy 注销）、贴边容差 20dp；设备实测：避让 124px 注入/拖动清零/面板跟随；§4 文件表补 OverlayService/AdbKeyboardService 两行；preview 发布/PR 模板三要点见协调仓 AGENTS.md §4 | AI 开发助手 |
+
+## 0.13.5 新增模块（无障碍控制通道）
+
+| 文件 | 职责 | 关键函数 |
+|---|---|---|
+| `DeviceControlService.kt` | 无障碍服务（语义控制面）：能力声明、树快照（路径 id + 与 uiautomator XML 同构的 attrs）、动作执行 | `buildSnapshot()` / `nodeAtPath()` / `handleClick/setText/scroll/global/screenshot()` / `token()` / `statusJson()` / `heartbeat()` |
+| `ControlPoller.kt` | 引擎队列客户端：长轮询取活（空闲 5s / 有活即时）、执行、回填、退避 | `loop()` / `execute()` / `post()` |
+
+相关壳侧改动：`AndroidBridge.a11yStatus()/openA11ySettings()/unlockRestrictedSettings()`；`AdbState.unlockRestrictedSettings()`（appops 一键解锁）；`MainActivity.openAccessibilitySettings()`；`EngineManager.snapshotSettingsBackup()`（换树前 settings 备份，issue #126 P1 兜底）。
+能力面/权限面全量参考：`docs/AGENTS/ACCESSIBILITY-API.md`。
