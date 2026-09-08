@@ -14,6 +14,7 @@
 - **版本状态**：**0.13.5 已发布（vc32，Release v0.13.5，15 资产，2026-09-10 收官）**：无障碍控制通道 v1（`DeviceControlService` + 控制队列 + 双通道门禁等价且无障碍优先 + 无障碍截屏 API 30+ + 完整语义树/同名消歧）+ 悬浮球跟随工作会话/新会话落临时工作区 + 授权面重构 + #126/#124 引擎补丁 + #125 能力自动补全 + 构建提速（WSL 内原生执行，172s vs ~29min）。0.13.3 已发布（vc30，Release v0.13.3 正式版，14 资产）。0.13.2 已发布（vc29，悬浮球 v2.1 全套）。当前开放跟踪：**#127（无障碍截屏路径引擎读不到）、#128（WebView 无障碍树过浅，需 DOM 快速通道）、#129（点击无生效校验）**——均为本版实测残余问题，已写入 release notes；#115（市场 Phase2）、#108（数据备份）。**arm64 真机复验未完成**（升级安装 Success，但刷新途中 USB 掉线，见 release notes）。
 - **兄弟仓库**（协调仓子目录，本仓内含自包含副本——**坑 36 同步铁律**：协调仓改子仓源码/bump 版本后必须 robocopy 镜像到本仓，lib/ 产物一并拷）：`dsh-shell-termux`、`dsh-client-ui-responsive`（0.1.13）、`dsh-host-web-compat`（0.1.9）、`plugins/`（bridge 0.2.0 / manage 0.2.0 / model-capability 0.2.0 / linux-env / file-open）、`vendor/`（marketplace、undo-savepoint、dsh-model-sync + PATCHES.md）。
 - **上游** deepseek-ai/deepseek-harness（协调仓 `dsh/` 只读 checkout）：**零改动**；一切适配走补丁/插件/壳侧。
+- **PR 流程铁律（2026-09-10 用户定例）**：**任何代码/文档改动一律走 PR，禁止直接 push 到 `main`**（人类与 AI 开发助手同等适用）。流程：建分支（`<type>/<简短描述>`）→ 提交（`<type>: <描述>`，见 pr-guidelines）→ 推送分支 → 开 PR（标题/描述按模板，标签 1-3 个）→ CI Gate 绿 → 合并 → 删分支。**例外（不改仓库内容的外部动作，可直连 API）**：Release 资产上传/发布、issue 评论与开关、标签操作。协调仓 `dsh-mobile` 同规（见其 AGENTS.md §4）。
 
 ## 2. 构建命令速查（在协调仓根执行）
 
