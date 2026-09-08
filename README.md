@@ -160,7 +160,7 @@ repo `LICENSES/`, and APK `assets/licenses/`. Design rationale: `docs/design.md`
 
 ## Acknowledgments & invitation
 
-Thanks to the community for feedback and contributions — especially cdwlll (environment issues),
+Thanks to the community for feedback and contributions — especially cmyfqwq (deep dual-device debugging: coverage-install data loss, snapshot refresh fault tolerance, web boot plugin isolation, thermal/GPU diagnosis),
 haitunlang (MIUI 12 compatibility), TACONailoong (legacy-WebView compat), X-SCI-TECH (PRs),
 Yangerwei (file race feedback), gr12-cmd (armv7l demand).
 
