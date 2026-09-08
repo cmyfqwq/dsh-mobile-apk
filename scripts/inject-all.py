@@ -195,9 +195,16 @@ def main():
                         continue
                     print("  skip (non-web profile):", name)
                 if data is None:
-                    data = tin.extractfile(member).read()
-                member.mode = mode_for(data)
-                tout.addfile(member, io.BytesIO(data))
+                    # 流式复制 + 只读前 4 字节判定权限（勿整文件读进内存：51k 文件 / 743MB 白花几分钟）
+                    handle = tin.extractfile(member)
+                    prefix = handle.read(4) if handle is not None else b''
+                    if handle is not None:
+                        handle.seek(0)
+                    member.mode = mode_for(prefix)
+                    tout.addfile(member, handle)
+                else:
+                    member.mode = mode_for(data)
+                    tout.addfile(member, io.BytesIO(data))
             else:
                 if member.isdir():
                     member.mode = 0o700
