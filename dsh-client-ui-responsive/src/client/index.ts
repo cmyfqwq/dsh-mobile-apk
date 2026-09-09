@@ -28,7 +28,7 @@ import { COMPOSER_ROW_CSS } from './composer-row.css.ts'
 import { COMPOSER_INSETS_CSS } from './composer-insets.css.ts'
 import { TRAJECTORY_DETAILS_CSS } from './trajectory-details.css.ts'
 import { TrajectoryPanelsObserver } from './trajectory-panels-observer.ts'
-import { MenuViewportGuard } from './menu-viewport-guard.ts'
+import { ComposerPopupGuard } from './composer-popup-guard.ts'
 import { SESSION_LOG_DIALOG_HIDE_CSS } from './session-log-dialog.css.ts'
 import { DevSection } from './dev-section/DevSection.tsx'
 import { DEV_SECTION_CSS } from './dev-section/dev-section.css.ts'
@@ -267,13 +267,15 @@ export function apply(ctx: ClientContext): void {
     }
   }, 'ui-layout: trajectory details full-viewport overlay + :has() fallback')
 
-  // Mobile chrome occupies the top viewport edge; keep an upward-opening
-  // command menu below it rather than hiding its first rows beneath the bar.
+  // Composer popups (slash menu + model menu) anchor to their trigger, not the
+  // viewport: keep them inside the viewport horizontally, keep the painted card
+  // as narrow as its content, and keep the first rows below the mobile top bar
+  // (issue apk#135).
   ctx.effect(() => {
-    const guard = new MenuViewportGuard()
+    const guard = new ComposerPopupGuard()
     guard.attach()
     return () => { guard.detach() }
-  }, 'ui-layout: mobile command menu top clearance')
+  }, 'ui-layout: composer popup geometry guard')
 
   // Session-log export: the shell owns the only result dialog (success/failure
   // via window.__dshExportResult). Hide the upstream preparing/success/error

@@ -710,9 +710,27 @@ class OverlayPanel(private val svc: OverlayService) {
     }
   }
 
+  /**
+   * issue #133：丢弃某会话已过期的待答/待审批项（该会话已完成，用户可能已在网页端答过，
+   * 或轮次已结束）——否则球会一直停在「等待你的回答…」的琥珀态。
+   * @returns 是否真的丢弃了条目。
+   */
+  internal fun dropPendingFor(agentId: String): Boolean {
+    if (agentId.isEmpty()) return false
+    val questions = pendingQuestions.filterValues { it.agentId == agentId }.keys.toList()
+    val approvals = pendingApprovals.filterValues { it.agentId == agentId }.keys.toList()
+    for (key in questions) pendingQuestions.remove(key)
+    for (key in approvals) pendingApprovals.remove(key)
+    val dropped = questions.isNotEmpty() || approvals.isNotEmpty()
+    if (dropped) onPendingChanged()
+    return dropped
+  }
+
+  /** issue #133：面板里是否还有用户未提交的草稿——自动收起前必须保留它。 */
+  internal fun hasDraft(): Boolean = inputBox?.text?.toString()?.isNotBlank() == true
+
   /** 只更新球（光环/工作示意），不改窗口结构。 */
-  internal fun updateBallOnly() {
-    // 会话维状态 → 光环；引擎维由探活驱动。PENDING（提问/审批待处理）优先于 WORKING（黄色占先）。
+  internal fun updateBallOnly() {    // 会话维状态 → 光环；引擎维由探活驱动。PENDING（提问/审批待处理）优先于 WORKING（黄色占先）。
     svc.pendingKind = currentPending()?.first ?: ""
     svc.setHalo(svc.deriveHalo())
     if (svc.expanded) {

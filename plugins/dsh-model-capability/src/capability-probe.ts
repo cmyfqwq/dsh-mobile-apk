@@ -35,6 +35,9 @@ export type CapabilitySource = 'endpoint-descriptor' | 'vendor-descriptor' | 'en
 
 export type CapabilityKey = 'input' | 'contextWindow' | 'maxTokens' | 'reasoningEfforts'
 
+/** pi-ai compat keys that decide how a reasoning level is serialized on the wire. */
+export const DIALECT_COMPAT_KEYS = ['thinkingFormat', 'supportsReasoningEffort', 'maxTokensField'] as const
+
 export interface ModelCapabilities {
   id: string
   input?: Modality[]
@@ -42,6 +45,14 @@ export interface ModelCapabilities {
   maxTokens?: number
   /** Only levels the endpoint declared or accepted; unknown words are dropped. */
   reasoningEfforts?: ReasoningEfforts
+  /**
+   * Dialect keys (`thinkingFormat` / `supportsReasoningEffort` / `maxTokensField`)
+   * that the catalog declares unanimously. Written beside `reasoningEfforts`:
+   * pi-ai picks the wire dialect from these, so efforts without them are
+   * serialized with a detected default and can be rejected by the real gateway
+   * (issue #134).
+   */
+  compat?: Record<string, unknown>
   sources: Partial<Record<CapabilityKey, CapabilitySource>>
 }
 

@@ -17,7 +17,7 @@
  * levels whose wire value is a non-empty string (pi-ai semantics: `null` means
  * the level is not offered by that route).
  */
-import { THINKING_LEVELS, type Modality, type ReasoningEfforts } from './capability-probe.js'
+import { DIALECT_COMPAT_KEYS, THINKING_LEVELS, type Modality, type ReasoningEfforts } from './capability-probe.js'
 
 export interface CatalogEntry {
   provider: string
@@ -131,12 +131,23 @@ export function lookupCatalog(snapshot: CatalogSnapshot | undefined, id: string,
   const maxTokens = unanimous(entries.map((entry) => entry.maxTokens), 'maxTokens')
   if (maxTokens) match.capabilities.maxTokens = maxTokens
 
-  // compat: 逐键合并；同一键出现不同值时该键丢弃并记冲突
+  // compat: 逐键合并；同一键出现不同值时该键丢弃并记冲突。
+  // 方言键（thinkingFormat / supportsReasoningEffort / maxTokensField）另加严格口径：
+  // 只要有目录**声明了却另一些没声明**，方言就不算确定——缺失不能当成一致
+  // （issue #134：opencode-go 只声明 maxTokensField、zai 才声明 thinkingFormat，
+  //  宽松口径会拿 zai 的方言去配任意自定义网关）。
   const compat: Record<string, unknown> = {}
   const keys = new Set<string>()
   for (const entry of entries) for (const key of Object.keys(entry.compat ?? {})) keys.add(key)
   for (const key of keys) {
-    const value = unanimous(entries.map((entry) => entry.compat?.[key]), `compat.${key}`)
+    const declared = entries.map((entry) => entry.compat?.[key])
+    const isDialect = (DIALECT_COMPAT_KEYS as readonly string[]).includes(key)
+    const missing = declared.filter((value) => value === undefined).length
+    if (isDialect && missing > 0 && missing < declared.length) {
+      match.conflicts.push(`compat.${key}: 仅部分目录声明（方言不明）`)
+      continue
+    }
+    const value = unanimous(declared, `compat.${key}`)
     if (value !== undefined) compat[key] = value
   }
   if (Object.keys(compat).length > 0) match.capabilities.compat = compat
