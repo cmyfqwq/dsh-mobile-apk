@@ -162,7 +162,7 @@ repo `LICENSES/`, and APK `assets/licenses/`. Design rationale: `docs/design.md`
 
 Thanks to the community for feedback and contributions — especially cdwlll (environment issues),
 haitunlang (MIUI 12 compatibility), TACONailoong (legacy-WebView compat), X-SCI-TECH (PRs),
-Yangerwei (file race feedback), gr12-cmd (armv7l demand).
+Yangerwei (file race feedback), gr12-cmd (armv7l demand), cmyfqwq (coverage-install compatibility feedback).
 
 Contributors welcome: Android compatibility testing (Huawei / Honor / Xiaomi custom WebViews),
 armv7l and more device support, completing the ADB channel, and growing the plugin ecosystem.
