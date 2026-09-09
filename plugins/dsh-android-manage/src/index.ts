@@ -652,8 +652,16 @@ function tools(ctx: Context, priv: PrivilegeFace) {
       if (!a.ok) return { ok: false, denied: true, screen: { w: 0, h: 0 }, rotation: 0, count: 0, rawCount: 0, nodes: [], text: a.guidance }
       // 0.13.5 W4：无障碍通道优先（一次系统开关即用；不经 uiautomator，故不受 F1 idle 阻塞影响）
       if (controlDecision('snapshot', exec as { agent?: { session?: unknown } }).backend === 'a11y') {
-        const r = await a11yExec('snapshot', {})
-        if (!r.ok) return { ok: false, denied: false, screen: { w: 0, h: 0 }, rotation: 0, count: 0, rawCount: 0, nodes: [], text: '无障碍取树失败：' + r.error }
+        // 现场实测（2026-09-10 真机，B 站播放页）：重 UI/常驻动画页面建树慢，8s 默认超时频繁失败——
+        // 这里给到 15s；仍失败则明确指引「先 android_ui_global back 退出重页面再 dump」。
+        const r = await a11yExec('snapshot', {}, 15_000)
+        if (!r.ok) {
+          return {
+            ok: false, denied: false, screen: { w: 0, h: 0 }, rotation: 0, count: 0, rawCount: 0, nodes: [],
+            text: `无障碍取树失败：${r.error}——重 UI/播放页常见；建议：① android_ui_global back 退回上一级再 dump；`
+              + '② 或 android_screenshot 直接看画面；③ ADB 已配对时用 android_ui_tree（uiautomator）。',
+          }
+        }
         const data = (r.data ?? {}) as A11ySnapshot
         const pruned = pruneNodes(data.nodes ?? [])
         const screen = data.screen && data.screen.w > 0 ? data.screen : { w: 0, h: 0 }
@@ -1367,7 +1375,56 @@ function tools(ctx: Context, priv: PrivilegeFace) {
     },
   })
 
-  return [screenshot, uiTree, deviceInfo, actInput, uiDump, uiClick, uiScroll, uiInput, webDump, envPrepare, appLaunch]
+  /**
+   * 全局动作（无障碍通道，无需 ADB）：返回 / 主页 / 最近任务 / 通知栏。
+   * 现场实测缺口（2026-09-10 真机）：AI 在子菜单里出不来——此前没有任何工具能按返回键，
+   * `android_act_input keyevent` 又依赖 ADB 通道（未配对即不可用）。
+   */
+  const uiGlobal = defineTool({
+    name: 'android_ui_global',
+    description:
+      '【首选】系统级导航动作（无障碍通道，不需要 ADB）：back=返回上一级、home=回桌面、'
+      + 'recents=最近任务、notifications=下拉通知栏。卡在子菜单/弹窗/详情页出不来时，第一步就用 back。'
+      + '需设备控制授权（无障碍服务已开启即可）+ 会话档位 danger-full-access。',
+    parameters: {
+      action: { type: 'string', required: true, enum: ['back', 'home', 'recents', 'notifications'], description: '要执行的全局动作' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean', required: true },
+          denied: { type: 'boolean' },
+          action: { type: 'string' },
+          text: { type: 'string' },
+        },
+      },
+      render: (_args, v: Record<string, unknown>) => [{ type: 'text', text: String(v.text ?? '') }],
+    },
+    execute: async ({ action }: { action: string }, exec) => {
+      const a = guard('ui_global', { action }, exec as { agent?: { session?: unknown } })
+      if (!a.ok) return { ok: false, denied: true, action, text: a.guidance }
+      if (!['back', 'home', 'recents', 'notifications'].includes(action)) {
+        return { ok: false, denied: false, action, text: 'action 必须是 back / home / recents / notifications' }
+      }
+      const r = await a11yExec('global', { action }, 6000)
+      if (!r.ok) {
+        return { ok: false, denied: false, action, text: `全局动作 ${action} 失败：${r.error}（无障碍通道不可用时，改用 android_act_input keyevent，但那条路需要 ADB 配对）` }
+      }
+      const d = (r.data ?? {}) as { global?: string }
+      return {
+        ok: true,
+        denied: false,
+        action,
+        text: `已执行全局动作 ${d.global ?? action}`
+          + (action === 'back' ? '（返回上一级；页面已变化，请重新 dump 再定位）' : '')
+          + (action === 'home' ? '（已回桌面）' : ''),
+      }
+    },
+  })
+
+  return [screenshot, uiTree, deviceInfo, actInput, uiDump, uiClick, uiScroll, uiInput, webDump, envPrepare, appLaunch, uiGlobal]
 }
 
 export function apply(ctx: Context, _config: Record<string, unknown> = {}) {
