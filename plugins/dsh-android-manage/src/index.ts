@@ -528,6 +528,20 @@ function tools(ctx: Context, priv: PrivilegeFace) {
   /** 公开 id → 原始路径 id（无障碍动作按路径回指壳侧节点）。 */
   const origPathOf = (publicId: string): string | undefined => uiCache?.byId.get(publicId)?.origPath
 
+  /**
+   * 前台真值（现场实测教训 2026-09-10：uiautomator/a11y 可能抓到 DSH shell 覆盖层或错误的窗口，
+   * `dumpsys` 的 mCurrentFocus / ResumedActivity 才是权威）。
+   */
+  async function foregroundInfo(): Promise<{ pkg: string; activity: string } | null> {
+    if (!priv.execAdbLine) return null
+    const r = await priv.execAdbLine(`adb shell dumpsys window | grep -m1 mCurrentFocus`)
+    const m = /u0\s+([\w.]+)\/([\w.$]+)/.exec(r.ok ? r.stdout : '')
+    if (m) return { pkg: m[1], activity: m[2] }
+    const r2 = await priv.execAdbLine(`adb shell dumpsys activity activities | grep -m1 ResumedActivity`)
+    const m2 = /([\w.]+)\/([\w.$]+)/.exec(r2.ok ? r2.stdout : '')
+    return m2 ? { pkg: m2[1], activity: m2[2] } : null
+  }
+
   /** F2 统一坐标系锚点：屏幕物理尺寸（wm size）。uiDump 缓存优先，否则现场查。 */
   async function screenSize(): Promise<{ w: number; h: number }> {
     if (uiCache && Date.now() - uiCache.ts <= UI_CACHE_TTL && uiCache.screen.w > 0) return uiCache.screen
@@ -653,6 +667,16 @@ function tools(ctx: Context, priv: PrivilegeFace) {
           ts: Date.now(),
           gen: data.gen,
         }
+        const fg = await foregroundInfo()
+        const dumpPkg = pruned.nodes.find((n) => String(n.pkg || '') !== '')?.pkg ?? ''
+        const mismatch = fg !== null && dumpPkg !== '' && fg.pkg !== dumpPkg
+        const webNode = pruned.nodes.find((n) => /WebView/i.test(String(n.type || '')))
+        const warn = mismatch
+          ? `\n注意：dump 包名 ${dumpPkg} 与前台 ${fg!.pkg} 不一致——可能抓到覆盖层/错误窗口，以 dumpsys 为准。`
+          : ''
+        const webHint = webNode
+          ? `\n检测到 WebView 容器 ${webNode.id}：其内部控件在本通道不可见。若目标是 DSH 自有 Web UI，改用 android_web_dump（DOM 快照，毫秒级、按选择器精准命中）；第三方网页仍只能靠坐标。`
+          : ''
         return {
           ok: true,
           denied: false,
@@ -662,7 +686,8 @@ function tools(ctx: Context, priv: PrivilegeFace) {
           rawCount: pruned.rawCount,
           nodes: pruned.nodes as unknown as JsonValue[],
           note: '无障碍通道（backend=a11y）：id 仅在最近一次 dump 内有效；页面变化后请重新 dump',
-          text: `控件清单（无障碍通道，未截断）：${pruned.nodes.length} 个节点（原始 ${pruned.rawCount}，剔除 ${pruned.rawCount - pruned.nodes.length} 个零尺寸/完全重复节点，屏幕 ${screen.w}x${screen.h}）`,
+          text: `控件清单（无障碍通道，未截断）：${pruned.nodes.length} 个节点（原始 ${pruned.rawCount}，剔除 ${pruned.rawCount - pruned.nodes.length} 个零尺寸/完全重复节点，屏幕 ${screen.w}x${screen.h}；前台 ${fg?.pkg ?? '?'}/${fg?.activity ?? '?'}）`
+            + warn + webHint,
         }
       }
       if (!priv.execAdbLine) return { ok: false, denied: false, screen: { w: 0, h: 0 }, rotation: 0, count: 0, rawCount: 0, nodes: [], text: 'ADB 执行通道未接通（dsh-android-bridge 未提供 execAdbLine）' }
@@ -759,6 +784,34 @@ function tools(ctx: Context, priv: PrivilegeFace) {
         typeof nx === 'number' && Number.isFinite(nx) && nx >= 0 && nx <= 1 &&
         typeof ny === 'number' && Number.isFinite(ny) && ny >= 0 && ny <= 1
       if (!useRef && !useNorm) return { ok: false, denied: false, text: '需要 ref（语义引用）或 nx/ny（0-1 归一化坐标）二者之一' }
+      // #128 L1：WebView DOM 引用（wN / css: / text: / role:）走自有 WebView 通道，
+      // 不依赖无障碍虚拟树，也不需要坐标。
+      if (useRef) {
+        const webRef = ref!.trim()
+        const isWebRef = /^w\d+$/.test(webRef) || webRef.startsWith('css:') || webRef.startsWith('text:') || webRef.startsWith('role:')
+        if (isWebRef) {
+          const payload: Record<string, unknown> = { op: 'click' }
+          if (/^w\d+$/.test(webRef)) payload.ref = webRef
+          else if (webRef.startsWith('css:')) payload.sel = webRef.slice(4).trim()
+          else if (webRef.startsWith('text:')) payload.text = webRef.slice(5).trim()
+          else payload.role = webRef.slice(5).trim()
+          const wr = await a11yExec('webAction', payload, 8000)
+          if (!wr.ok) return { ok: false, denied: false, text: 'WebView 点击失败：' + wr.error }
+          const wd = (wr.data ?? {}) as { ok?: boolean; error?: string; via?: string; target?: { tag?: string; text?: string } }
+          if (wd.ok === false) return { ok: false, denied: false, text: 'WebView 点击失败：' + (wd.error ?? '未知') }
+          const verdict = await verifyClick(uiCache?.gen, exec as ExecLike)
+          return {
+            ok: true,
+            denied: false,
+            ref: webRef,
+            id: webRef,
+            label: (wd.target?.text ?? '').slice(0, 24),
+            x: 0,
+            y: 0,
+            text: `已在 WebView 内点击 ${wd.target?.tag ?? ''}「${(wd.target?.text ?? '').slice(0, 24)}」（DOM 通道 via=${wd.via ?? 'ref'}）；${verdict}`,
+          }
+        }
+      }
       // 0.13.5 W4：无障碍通道优先。坐标由壳侧用**它自己的屏幕尺寸**换算——
       // 工具层不再需要屏幕尺寸，也就不会因「dump 缓存过期」把 nx/ny 点击误拒（实机踩坑）。
       if (controlDecision('click', exec as { agent?: { session?: unknown } }).backend === 'a11y') {
@@ -998,6 +1051,27 @@ function tools(ctx: Context, priv: PrivilegeFace) {
       if (!a.ok) return { ok: false, denied: true, text: a.guidance }
       const raw = typeof text === 'string' ? text : ''
       if (!clear && (raw.length === 0 || raw.length > 500)) return { ok: false, denied: false, text: 'text 长度需为 1-500，或传 clear: true 单独清空' }
+      // #128 L1：WebView DOM 引用（wN / css: / text: / role:）→ 自有 WebView 通道直接写值
+      // （原生 value setter + input/change 事件，兼容 React 受控组件），不经 IME、不会汉字化。
+      const webRef = typeof ref === 'string' ? ref.trim() : ''
+      const isWebRef = /^w\d+$/.test(webRef) || webRef.startsWith('css:') || webRef.startsWith('text:') || webRef.startsWith('role:')
+      if (isWebRef) {
+        const payload: Record<string, unknown> = { op: 'setText', value: raw }
+        if (/^w\d+$/.test(webRef)) payload.ref = webRef
+        else if (webRef.startsWith('css:')) payload.sel = webRef.slice(4).trim()
+        else if (webRef.startsWith('text:')) payload.text = webRef.slice(5).trim()
+        else payload.role = webRef.slice(5).trim()
+        const wr = await a11yExec('webAction', payload, 8000)
+        if (!wr.ok) return { ok: false, denied: false, channel: 'web', text: 'WebView 输入失败：' + wr.error }
+        const wd = (wr.data ?? {}) as { ok?: boolean; error?: string; via?: string; value?: string; target?: { text?: string } }
+        if (wd.ok === false) return { ok: false, denied: false, channel: 'web', text: 'WebView 输入失败：' + (wd.error ?? '未知') }
+        return {
+          ok: true,
+          denied: false,
+          channel: 'web',
+          text: `已在 WebView 内写入「${(wd.value ?? raw).slice(0, 40)}」（DOM 通道 via=${wd.via ?? 'ref'}，目标 ${(wd.target?.text ?? '').slice(0, 20)}）`,
+        }
+      }
       // 0.13.5 W4：无障碍通道优先（ACTION_SET_TEXT 原子写入——绕开 IME 切换与丢字问题 F5）
       if (controlDecision('setText', exec as { agent?: { session?: unknown } }).backend === 'a11y') {
         const payload: Record<string, unknown> = { text: raw, clear: clear === true }
@@ -1035,15 +1109,45 @@ function tools(ctx: Context, priv: PrivilegeFace) {
           r = await priv.execAdbShell(p)
           if (!r.ok) break
         }
+        // 现场实测（2026-09-10）：`input text` 偶发丢尾字符、中文 IME 可能把字母汉字化——
+        // 注入后**回读断言**（壳侧 nodeText 读聚焦框，便宜），不一致自动重试一次。
+        let readBack: string | null = null
+        if (r.ok && raw.length > 0) {
+          const read = async (): Promise<string | null> => {
+            const nt = await a11yExec('nodeText', {}, 4000)
+            if (!nt.ok) return null
+            const d = (nt.data ?? {}) as { text?: string }
+            return d.text ?? ''
+          }
+          await new Promise((resolve) => setTimeout(resolve, 260))
+          readBack = await read()
+          if (readBack !== null && readBack !== raw) {
+            await priv.execAdbShell(`am broadcast -a ADB_CLEAR_TEXT`).catch(() => undefined)
+            await priv.execAdbShell(`am broadcast -a ADB_INPUT_TEXT --es msg '${raw.replace(/'/g, `'\\''`)}'`).catch(() => undefined)
+            await new Promise((resolve) => setTimeout(resolve, 320))
+            readBack = await read()
+          }
+        }
         // 还原用户原 IME（广播已被接收器入队提交，留 0.4s 提交窗口防切换竞态）。
         if (needSwitch) await priv.execAdbShell(`sleep 0.4; ime set ${prev}`).catch(() => undefined)
         if (!r.ok) return { ok: false, denied: false, channel: 'adbkeyboard', text: r.guidance ?? (r.stdout || 'ADBKeyboard 输入失败') }
+        if (readBack !== null && raw.length > 0 && readBack !== raw) {
+          return {
+            ok: false,
+            denied: false,
+            channel: 'adbkeyboard',
+            text: `输入未落地：期望「${raw.slice(0, 30)}」，回读实际「${readBack.slice(0, 30)}」——`
+              + '已自动重试一次仍不一致；建议：确认目标输入框处于聚焦态后重试，或改用 android_web_dump + ref=wN（自有 Web UI），'
+              + '纯 ASCII 也可试 channel:"input"',
+          }
+        }
         const act = [clear ? '已清空' : '', raw ? `已输入 ${raw.slice(0, 24)}${raw.length > 24 ? '…' : ''}` : ''].filter(Boolean).join(' + ')
+        const verifyNote = readBack === null ? '' : '，回读一致'
         return {
           ok: true,
           denied: false,
           channel: 'adbkeyboard',
-          text: `${act}（ADBKeyboard${needSwitch ? '，IME 已临时切换并还原；若文本未落地请确认页面输入框处于聚焦态' : ''}）`,
+          text: `${act}（ADBKeyboard${needSwitch ? '，IME 已临时切换并还原' : ''}${verifyNote}）`,
         }
       }
       // input text 兜底（channel: "input" 强制；仅可见 ASCII——部分 ROM 丢字/丢空格，F5 不推荐）
@@ -1058,7 +1162,212 @@ function tools(ctx: Context, priv: PrivilegeFace) {
     },
   })
 
-  return [screenshot, uiTree, deviceInfo, actInput, uiDump, uiClick, uiScroll, uiInput]
+  /** #128 L1：WebView DOM 快照节点（与壳侧 webSnapshot 回包同形）。 */
+  type WebNode = {
+    ref: string
+    sel?: string
+    tag?: string
+    role?: string
+    text?: string
+    editable?: boolean
+    disabled?: boolean
+    inView?: boolean
+    bounds?: number[]
+  }
+
+  /**
+   * #128 L1：DSH 自有 WebView 的 DOM 语义快照（毫秒级、按选择器精准命中，不依赖无障碍虚拟树）。
+   * 第三方应用的 WebView 不属于本通道（不是我们的页面）。
+   */
+  const webDump = defineTool({
+    name: 'android_web_dump',
+    description:
+      '【WebView 专用，首选】导出 DSH 自有 Web UI（WebView 页面）的 DOM 语义快照：每个可交互元素给 '
+      + 'ref（wN，可直接用于 android_ui_click / android_ui_input）/ CSS 选择器 / role / 文本 / bounds / 可编辑 / 是否在视口内。'
+      + '解决「无障碍树只看到一个 WebView 容器、内部控件不可见」的问题（issue #128）。'
+      + '仅对 DSH 自己的 Web UI 有效；第三方 App 的网页仍用 android_ui_dump + 坐标。',
+    parameters: {
+      root: { type: 'string', description: '可选：限定根选择器（CSS），默认整页' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean', required: true },
+          denied: { type: 'boolean' },
+          count: { type: 'number' },
+          url: { type: 'string' },
+          title: { type: 'string' },
+          nodes: {
+            type: 'array',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                ref: { type: 'string', required: true },
+                sel: { type: 'string' },
+                tag: { type: 'string' },
+                role: { type: 'string' },
+                text: { type: 'string' },
+                editable: { type: 'boolean' },
+                disabled: { type: 'boolean' },
+                inView: { type: 'boolean' },
+                bounds: { type: 'array', items: { type: 'number' } },
+              },
+            },
+          },
+          text: { type: 'string' },
+        },
+      },
+      render: (_args, v: Record<string, unknown>) => [
+        { type: 'text', text: String(v.text ?? '(no output)') },
+      ],
+    },
+    execute: async ({ root }: { root?: string }, exec) => {
+      const a = guard('web_dump', { root }, exec as { agent?: { session?: unknown } })
+      if (!a.ok) return { ok: false, denied: true, count: 0, nodes: [] as WebNode[], text: a.guidance }
+      const r = await a11yExec('webSnapshot', root ? { root } : {}, 8000)
+      if (!r.ok) return { ok: false, denied: false, count: 0, nodes: [] as WebNode[], text: 'WebView DOM 快照失败：' + r.error }
+      const data = (r.data ?? {}) as {
+        ok?: boolean; error?: string; url?: string; title?: string; vw?: number; vh?: number
+        scrollY?: number; total?: number; nodes?: WebNode[]
+      }
+      if (data.ok === false) {
+        return { ok: false, denied: false, count: 0, nodes: [] as WebNode[], text: 'WebView DOM 快照失败：' + (data.error ?? '未知') }
+      }
+      const nodes = data.nodes ?? []
+      const lines = nodes.map((n) => {
+        const flags = [n.disabled === true ? '禁用' : '', n.editable === true ? '可编辑' : '', n.inView === false ? '视口外' : ''].filter(Boolean).join('/')
+        return `  ${String(n.ref)} ${String(n.role || n.tag || '')}${flags ? '[' + flags + ']' : ''} "${String(n.text ?? '').slice(0, 40)}" sel=${String(n.sel ?? '')}`
+      })
+      return {
+        ok: true,
+        denied: false,
+        count: nodes.length,
+        url: data.url,
+        title: data.title,
+        nodes: nodes as WebNode[],
+        text: `WebView DOM 快照：${data.title ?? ''} ${data.url ?? ''}（视口 ${data.vw ?? '?'}x${data.vh ?? '?'}，滚动 ${data.scrollY ?? 0}；`
+          + `命中 ${data.total ?? nodes.length} 个可交互元素，返回 ${nodes.length} 个）\n` + lines.join('\n')
+          + '\n点击用 ref=wN，或 css:<选择器> / text:<文本> / role:<role>。',
+      }
+    },
+  })
+
+  /**
+   * 环境一次性准备（现场实测建议先跑）：关动画让 dump/tap 后界面立即稳定；
+   * 启用内嵌 ADBKeyboard 协议输入法，治「中文 IME 把字母汉字化 / input text 丢尾字符」。
+   */
+  const envPrepare = defineTool({
+    name: 'android_env_prepare',
+    description:
+      '设备环境一次性准备（现场实测推荐在长流程开始前跑一次）：① 关闭三项系统动画（dump/tap 后界面立即稳定，减少等待）；'
+      + '② 启用内嵌 ADBKeyboard 协议输入法 com.dsharnessmobile.shell/.AdbKeyboardService（中文 IME 汉字化/丢字的治本手段）。'
+      + 'restore=true 时恢复动画（输入法不还原）；setImeDefault=true 时把该输入法设为默认（会改变用户全局输入法，谨慎）。'
+      + '需 ADB 授权或无障碍通道。',
+    parameters: {
+      animations: { type: 'boolean', description: '是否处理动画（默认 true）' },
+      ime: { type: 'boolean', description: '是否启用内嵌输入法（默认 true）' },
+      restore: { type: 'boolean', description: 'true = 恢复动画默认值（1）而不是关闭' },
+      setImeDefault: { type: 'boolean', description: 'true = 同时设为默认输入法（默认 false，仅启用）' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean', required: true },
+          denied: { type: 'boolean' },
+          text: { type: 'string' },
+        },
+      },
+      render: (_args, v: Record<string, unknown>) => [{ type: 'text', text: String(v.text ?? '') }],
+    },
+    execute: async (
+      { animations = true, ime = true, restore = false, setImeDefault = false }: { animations?: boolean; ime?: boolean; restore?: boolean; setImeDefault?: boolean },
+      exec,
+    ) => {
+      const a = guard('env_prepare', { animations, ime, restore, setImeDefault }, exec as { agent?: { session?: unknown } })
+      if (!a.ok) return { ok: false, denied: true, text: a.guidance }
+      if (!priv.execAdbShell) return { ok: false, denied: false, text: 'ADB 执行通道未接通（本工具需要 adb shell；无障碍通道无法改系统设置）' }
+      const lines: string[] = []
+      if (animations) {
+        if (restore) {
+          await restoreAnimScales({})
+          lines.push('动画：已恢复默认（1）')
+        } else {
+          await setAnimScales('0')
+          lines.push('动画：已关闭（window/transition/animator 三项 = 0）')
+        }
+      }
+      if (ime) {
+        const IME_ID = 'com.dsharnessmobile.shell/.AdbKeyboardService'
+        const en = await priv.execAdbShell(`ime enable ${IME_ID}`)
+        const list = await priv.execAdbShell(`ime list -s | grep -c dsharnessmobile`)
+        const enabled = list.ok && Number.parseInt(list.stdout.trim(), 10) > 0
+        if (!enabled) {
+          lines.push('输入法：启用失败——请在「设置 → 系统 → 语言与输入法」里手动启用「DSH 设备键盘」后重试')
+        } else if (setImeDefault) {
+          const cur = await priv.execAdbShell(`settings get secure default_input_method`)
+          const prev = (cur.ok ? cur.stdout : '').trim().replace(/^"|"$/g, '')
+          const set = await priv.execAdbShell(`ime set ${IME_ID}`)
+          lines.push(`输入法：已启用并设为默认（原默认 ${prev || '?'}；如需还原：ime set ${prev || '<原输入法>' }）`)
+          if (!set.ok) lines.push('输入法：设为默认失败——' + (set.stdout || '').slice(0, 120))
+        } else {
+          lines.push(`输入法：已启用（${IME_ID}）；android_ui_input 会在注入时临时切换并在结束后还原，无需设为默认`)
+        }
+        if (!en.ok) lines.push('（ime enable 返回异常：' + (en.stdout || '').slice(0, 120) + '）')
+      }
+      return { ok: true, denied: false, text: '环境准备完成：\n- ' + lines.join('\n- ') }
+    },
+  })
+
+  /** 拉起应用（现场实测每次都要手写 monkey；包名由 pm list packages 先查）。 */
+  const appLaunch = defineTool({
+    name: 'android_app_launch',
+    description:
+      '按包名拉起应用主界面（monkey -p <pkg> -c android.intent.category.LAUNCHER 1），等待后回报前台 Activity。'
+      + '先用 android_device_info 或 pm list packages 找到包名。需 ADB 授权。',
+    parameters: {
+      pkg: { type: 'string', required: true, description: '应用包名（如 com.netease.cloudmusic）' },
+      waitMs: { type: 'number', description: '拉起后等待毫秒数（默认 2500）' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean', required: true },
+          denied: { type: 'boolean' },
+          pkg: { type: 'string' },
+          foreground: { type: 'string' },
+          text: { type: 'string' },
+        },
+      },
+      render: (_args, v: Record<string, unknown>) => [{ type: 'text', text: String(v.text ?? '') }],
+    },
+    execute: async ({ pkg, waitMs = 2500 }: { pkg: string; waitMs?: number }, exec) => {
+      const a = guard('app_launch', { pkg }, exec as { agent?: { session?: unknown } })
+      if (!a.ok) return { ok: false, denied: true, pkg, text: a.guidance }
+      if (!/^[a-zA-Z][\w.]*$/.test(pkg)) return { ok: false, denied: false, pkg, text: '包名不合法：' + pkg }
+      if (!priv.execAdbShell) return { ok: false, denied: false, pkg, text: 'ADB 执行通道未接通' }
+      const r = await priv.execAdbShell(`monkey -p ${pkg} -c android.intent.category.LAUNCHER 1`)
+      if (!r.ok) return { ok: false, denied: false, pkg, text: r.guidance ?? (r.stdout || '拉起失败') }
+      await new Promise((resolve) => setTimeout(resolve, Math.max(500, Math.min(waitMs, 8000))))
+      const fg = await foregroundInfo()
+      const matched = fg !== null && fg.pkg === pkg
+      return {
+        ok: true,
+        denied: false,
+        pkg,
+        foreground: fg ? `${fg.pkg}/${fg.activity}` : '',
+        text: `已拉起 ${pkg}；前台 ${fg ? `${fg.pkg}/${fg.activity}` : '未知'}` + (matched ? '' : `（前台不是目标包——可能被权限弹窗/其他窗口遮挡，请 android_ui_dump 核对）`),
+      }
+    },
+  })
+
+  return [screenshot, uiTree, deviceInfo, actInput, uiDump, uiClick, uiScroll, uiInput, webDump, envPrepare, appLaunch]
 }
 
 export function apply(ctx: Context, _config: Record<string, unknown> = {}) {

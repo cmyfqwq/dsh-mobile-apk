@@ -37,11 +37,17 @@ class OverlayHalo(private val svc: OverlayService) {
 
   /** setColors 二参形态（自定义渐变 stop 位置）仅 API 29+；26-28 退三等分 stop。 */
   private fun setHaloColors(g: GradientDrawable, halo: Halo) {
-    val colors = intArrayOf(Color.argb(0, 255, 255, 255), halo.color, Color.argb(0, 255, 255, 255))
+    val transparent = Color.argb(0, 255, 255, 255)
     if (android.os.Build.VERSION.SDK_INT >= 29) {
-      g.setColors(colors, floatArrayOf(0f, 0.7f, 1f))
+      // 2026-09-10 用户反馈「光晕不够可见」：峰值内移到 0.45、再加一段 0.74 的过渡，
+      // 可见环更宽更亮。半径保持 24dp 不变——超过球心到屏幕边的 25dp 会在贴边时被裁
+      // （旧「吸边后光环偏心」根因，见 haloGlowPx 注释）。
+      g.setColors(
+        intArrayOf(transparent, halo.color, halo.fade, transparent),
+        floatArrayOf(0f, 0.45f, 0.74f, 1f),
+      )
     } else {
-      g.setColors(colors)
+      g.setColors(intArrayOf(transparent, halo.color, transparent))
     }
   }
 
@@ -69,11 +75,12 @@ class OverlayHalo(private val svc: OverlayService) {
   }
 }
 
-// ── 光环四态（低饱和：融合优先） ────────────────────────────────
+// ── 光环四态（低饱和：融合优先；2026-09-10 按用户反馈整体提亮一档） ──────────
 // PENDING = 待用户处理（AI 提问 / 权限审批等待应答）——低饱和琥珀黄（用户拍板新增）。
-enum class Halo(val color: Int) {
-  IDLE(Color.argb(70, 255, 255, 255)),
-  WORKING(Color.argb(128, 92, 132, 255)),
-  PENDING(Color.argb(160, 235, 190, 60)),
-  ERROR(Color.argb(115, 224, 72, 72)),
+// fade = 同一色相的次强档，用于让可见环更宽（见 setHaloColors 的四段 stop）。
+enum class Halo(val color: Int, val fade: Int) {
+  IDLE(Color.argb(96, 255, 255, 255), Color.argb(58, 255, 255, 255)),
+  WORKING(Color.argb(170, 92, 132, 255), Color.argb(102, 92, 132, 255)),
+  PENDING(Color.argb(205, 235, 190, 60), Color.argb(123, 235, 190, 60)),
+  ERROR(Color.argb(160, 224, 72, 72), Color.argb(96, 224, 72, 72)),
 }
