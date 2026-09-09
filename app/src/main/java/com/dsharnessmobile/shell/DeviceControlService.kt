@@ -115,7 +115,8 @@ class DeviceControlService : AccessibilityService() {
   private val lock = Any()
   private var snapshot: Snapshot? = null
   private val generation = AtomicInteger(0)
-
+  /** issue #127 一次性迁移标记：旧截图目录 files/control-shots 只清一次。 */
+  private val legacyShotDirCleaned = java.util.concurrent.atomic.AtomicBoolean(false)
   @Volatile
   private var invalidated = true
 
@@ -268,6 +269,11 @@ class DeviceControlService : AccessibilityService() {
   private fun handleScreenshot(args: JSONObject): JSONObject {
     if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
       return error("无障碍截屏需要 Android 11（API 30）及以上；本机 API ${Build.VERSION.SDK_INT}——请改用 ADB 通道（screencap）")
+    }
+    // 一次性迁移（issue #127）：≤0.13.5 把截图落在 files/control-shots（引擎读不到），
+    // 升级后清掉旧目录，避免历史残留长期占位。
+    if (legacyShotDirCleaned.compareAndSet(false, true)) {
+      try { java.io.File(filesDir, "control-shots").deleteRecursively() } catch (_: Throwable) { /* 忽略 */ }
     }
     val displayId = args.optInt("displayId", android.view.Display.DEFAULT_DISPLAY)
     val latch = java.util.concurrent.CountDownLatch(1)
