@@ -50,7 +50,8 @@ export function decideControl(input: ControlPolicyInput): ControlDecision {
     return {
       backend: 'deny',
       reason: `会话档位为 ${input.sessionMode ?? '未知'}，设备控制面要求 ${REQUIRED_SESSION_MODE}`,
-      guidance: '在会话的权限档位里切到「完全访问」后重试（无障碍通道同样受此门约束）。',
+      guidance: '在会话底部的权限芯片里切到「完全权限」后重试（设置 → 通用设置 → 新会话默认权限模式 也可改默认；'
+        + '无障碍通道同样受此门约束）。这是用户侧的一次点击，工具无法自行提权。',
     }
   }
 
