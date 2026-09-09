@@ -64,11 +64,122 @@ function pickText(v: Record<string, unknown>, ...keys: string[]): string {
     .join('\n')
 }
 
-function tools(priv: PrivilegeFace) {
+function tools(ctx: Context, priv: PrivilegeFace) {
   const guard = (action: string, args: Record<string, unknown>, exec?: { agent?: { session?: unknown } }) => {
     const a = priv.gateFor(exec?.agent?.session)
     priv.audit(action, { tool: 'android-manage', args }, a.ok)
     return a
+  }
+
+  /** 可选服务最小面：不引 dsh-attachment/dsh-llm 依赖，能力缺失时自动回退路径模式。 */
+  interface AttachmentFace {
+    imageLimits: { mediaTypes: readonly string[]; maxImageBytes: number; maxMessageImageBytes: number }
+    saveImage(input: { data: Uint8Array; mediaType: string; name?: string }): Promise<{
+      attachmentId: string; mediaType: string; bytes: number; width: number; height: number; name?: string
+    }>
+  }
+
+  interface LlmFace {
+    resolveModelInfo(provider: string, model: string, signal?: AbortSignal): Promise<{ inputModalities?: readonly string[] }>
+  }
+
+  /** 工具执行上下文里取路由所需的最小面。 */
+  type ExecLike = {
+    agent?: {
+      session?: { requestHeader?: () => { config?: { provider?: string; model?: string } } | undefined }
+      options?: { provider?: string; model?: string }
+    }
+    signal?: AbortSignal
+  }
+
+  /** 截图工具的规范返回值（与 output.schema 一致；image 在场即内联回图）。 */
+  type ShotValue = {
+    imagePath: string
+    width: number
+    height: number
+    denied: boolean
+    text: string
+    image?: { attachmentId: string; mediaType: string; bytes: number; width: number; height: number; name?: string }
+  }
+
+  /**
+   * 一次性读图（issue #127）：把刚落的截图直接并入工具结果（图像块）并删除临时文件——
+   * 模型不再需要额外一轮 read_image，也不残留文件。仅当附件服务在场且当前路由声明
+   * 图像输入时启用；否则回退到「返回路径」的旧行为（文件已落引擎可读目录，read_image 可用）。
+   */
+  async function inlineShot(
+    filePath: string, width: number, height: number, exec: ExecLike, channelNote: string,
+  ): Promise<ShotValue> {
+    const fallback = (why: string): ShotValue => ({
+      imagePath: filePath,
+      denied: false,
+      width,
+      height,
+      text: `截图已保存：${filePath}（${channelNote}${why}）`,
+    })
+    const attachments = ctx.get('attachments') as AttachmentFace | undefined
+    if (!attachments) return fallback('；未挂载附件服务，请用 read_image 读该路径')
+    if (!attachments.imageLimits.mediaTypes.includes('image/png')) {
+      return fallback('；本部署不接受 PNG 附件，请用 read_image 读该路径')
+    }
+    const routed = exec.agent?.session?.requestHeader?.()?.config
+    const provider = routed?.provider ?? exec.agent?.options?.provider
+    const model = routed?.model ?? exec.agent?.options?.model
+    const llm = ctx.get('llm') as LlmFace | undefined
+    if (!llm || provider === undefined || model === undefined) {
+      return fallback('；无法解析当前模型路由，请用 read_image 读该路径')
+    }
+    try {
+      const info = await llm.resolveModelInfo(provider, model, exec.signal)
+      if (info.inputModalities === undefined || !info.inputModalities.includes('image')) {
+        return fallback(`；当前模型 ${model} 不声明图像输入，请切换到支持图像的模型后用 read_image 读该路径`)
+      }
+    } catch {
+      return fallback('；模型能力解析失败，请用 read_image 读该路径')
+    }
+    try {
+      const data = readFileSync(filePath)
+      if (data.byteLength > attachments.imageLimits.maxImageBytes) {
+        return fallback(`；图像 ${data.byteLength} 字节超出内联上限，请用 read_image 读该路径`)
+      }
+      const ref = await attachments.saveImage({ data, mediaType: 'image/png', name: `android-shot-${Date.now()}.png` })
+      rmSync(filePath, { force: true })
+      return {
+        imagePath: filePath,
+        denied: false,
+        width: ref.width || width,
+        height: ref.height || height,
+        image: {
+          attachmentId: ref.attachmentId,
+          mediaType: ref.mediaType,
+          bytes: ref.bytes,
+          width: ref.width,
+          height: ref.height,
+          ...(ref.name === undefined ? {} : { name: ref.name }),
+        },
+        text: `截图已内联返回（${channelNote}；设备物理分辨率 ${width}x${height}，${ref.bytes} 字节，临时文件已删除）。`
+          + '图像就在本结果里，无需再调用 read_image；像素坐标换算用归一化 nx/ny。',
+      }
+    } catch (e) {
+      return fallback('；内联读图失败（' + String((e as Error).message) + '），请用 read_image 读该路径')
+    }
+  }
+
+  /**
+   * 点击生效校验（issue #129）：点后短暂等待，读壳侧便宜状态（快照代次 + 失效标记，不建树）。
+   * 代次变化或 invalidated=true 即判定界面确实变了；否则明确回报「未观察到变化」，
+   * 让模型不必靠「再 dump 一次」才发现点击落空。
+   */
+  async function verifyClick(beforeGen: number | undefined, exec: ExecLike): Promise<string> {
+    await new Promise((resolve) => setTimeout(resolve, 260))
+    const s = await a11yExec('state', {}, 4000)
+    if (!s.ok) return `（生效校验不可用：${s.error}）`
+    const d = (s.data ?? {}) as { gen?: number; invalidated?: boolean }
+    const changed = d.invalidated === true
+      || (typeof d.gen === 'number' && beforeGen !== undefined && d.gen !== beforeGen)
+    return changed
+      ? '生效校验：界面已变化（已生效）'
+      : '生效校验：未观察到界面变化——可能未生效（目标不可点/被遮挡/点击落空），建议重新 dump 核对'
   }
 
   // ── ADB 可靠性批次公共件（2026-09-05，docs/BUGS-open-2026-09-05-ADB-field-report.md）──
@@ -118,10 +229,13 @@ function tools(priv: PrivilegeFace) {
   const screenshot = defineTool({
     name: 'android_screenshot',
     description:
-      '对设备截屏（PNG，经视觉链路读图）。用于界面观察闭环。需 ADB 授权；未授权失败关闭。' +
+      '对设备截屏，并**把图像直接放在本次结果里返回**（一次性：临时文件读完即删，无需再调用 read_image）。' +
+      '用于界面观察闭环（配合 android_ui_dump 的语义清单核对渲染结果）。' +
+      '无障碍通道优先（API 30+，无需 ADB），否则走 ADB screencap。未授权失败关闭。' +
+      '当前模型不声明图像输入时回退为返回文件路径（此时再用 read_image）。' +
       '可传 textRedact: true 获得文本脱敏摘要（避免敏感屏幕内容进入上下文）。',
     parameters: {
-      textRedact: { type: 'boolean', description: '文本脱敏摘要模式（默认 false 返回原图路径）' },
+      textRedact: { type: 'boolean', description: '文本脱敏摘要模式（默认 false 返回图像/路径）' },
     },
     output: {
       schema: {
@@ -131,13 +245,30 @@ function tools(priv: PrivilegeFace) {
           imagePath: { type: 'string', required: true },
           width: { type: 'number', description: '设备物理分辨率宽（截图像素坐标换算锚点）' },
           height: { type: 'number', description: '设备物理分辨率高' },
+          image: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              attachmentId: { type: 'string', required: true },
+              mediaType: { type: 'string', required: true },
+              bytes: { type: 'integer', required: true },
+              width: { type: 'integer', required: true },
+              height: { type: 'integer', required: true },
+              name: { type: 'string' },
+            },
+          },
           denied: { type: 'boolean' },
           text: { type: 'string' },
         },
       },
-      render: (_args, v: Record<string, unknown>) => [
-        { type: 'text', text: pickText(v, 'text', 'imagePath') || '(no output)' },
-      ],
+      render: (_args, v: Record<string, unknown>) => {
+        const blocks: Array<Record<string, unknown>> = [
+          { type: 'text', text: pickText(v, 'text', 'imagePath') || '(no output)' },
+        ]
+        const image = v.image as { attachmentId: string; mediaType: string; bytes: number; width: number; height: number; name?: string } | undefined
+        if (image !== undefined) blocks.push({ type: 'image', attachment: image })
+        return blocks as never
+      },
     },
     execute: async ({ textRedact = false }, exec) => {
       const a = guard('screenshot', { textRedact }, exec as { agent?: { session?: unknown } })
@@ -148,14 +279,13 @@ function tools(priv: PrivilegeFace) {
         if (!r.ok) return { imagePath: '', denied: false, text: '无障碍截屏失败：' + r.error }
         const data = (r.data ?? {}) as { path?: string; width?: number; height?: number }
         if (!data.path) return { imagePath: '', denied: false, text: '无障碍截屏未返回文件路径' }
-        return {
-          imagePath: data.path,
-          denied: false,
-          width: data.width ?? 0,
-          height: data.height ?? 0,
-          text: `截图已保存：${data.path}（无障碍通道，设备物理分辨率 ${data.width ?? '?'}x${data.height ?? '?'}；`
-            + '读图可能降采样，定位换算用归一化坐标 nx/ny）',
-        }
+        return inlineShot(
+          data.path,
+          data.width ?? 0,
+          data.height ?? 0,
+          exec as ExecLike,
+          `无障碍通道，设备物理分辨率 ${data.width ?? '?'}x${data.height ?? '?'}`,
+        )
       }
       // 0.14 真实通道：adbd（shell uid）执行 screencap → adb pull 回引擎私有临时目录（app uid 可读）。
       if (!priv.execAdbLine) return { imagePath: '', denied: false, text: 'ADB 执行通道未接通（dsh-android-bridge 未提供 execAdbLine）' }
@@ -168,16 +298,10 @@ function tools(priv: PrivilegeFace) {
         if (!/^-rw|^-|^total|dsh-shot/.test(r.stdout.trim()) && !existsSync(local)) {
           return { imagePath: '', denied: false, text: '截图未落地：' + (r.stdout.trim().slice(-400) || '无输出') }
         }
-        // F2 统一坐标系：回传物理分辨率锚点。模型侧 read_image 可能降采样（maxDim 2048），
+        // F2 统一坐标系：回传物理分辨率锚点。模型侧读图可能降采样（maxDim 2048），
         // 严禁直接用截图像素坐标点击——归一化用 android_ui_click 的 nx/ny。
         const size = await screenSize()
-        return {
-          imagePath: local,
-          denied: false,
-          width: size.w,
-          height: size.h,
-          text: `截图已保存：${local}（设备物理分辨率 ${size.w}x${size.h}；读图可能降采样，定位换算用归一化坐标 nx/ny）`,
-        }
+        return inlineShot(local, size.w, size.h, exec as ExecLike, `ADB 通道，设备物理分辨率 ${size.w}x${size.h}`)
       } catch (e) {
         return { imagePath: '', denied: false, text: '截图失败：' + String((e as Error).message) }
       }
@@ -187,8 +311,8 @@ function tools(priv: PrivilegeFace) {
   const uiTree = defineTool({
     name: 'android_ui_tree',
     description:
-      '导出当前界面控件树（uiautomator dump）：每个节点的像素级边界、坐标与可点属性——' +
-      'AI 定位判定以控件树为主源、截图视觉为辅。未授权失败关闭。',
+      '【兜底】导出原始 uiautomator XML（大而全，token 高）：仅当无障碍通道不可用、或明确需要原始 XML 字段时才用。' +
+      '日常定位请优先 android_ui_dump（无障碍语义树，字段更全且无需配对）。未授权失败关闭。',
     parameters: {},
     output: {
       schema: {
@@ -422,11 +546,14 @@ function tools(priv: PrivilegeFace) {
   const uiDump = defineTool({
     name: 'android_ui_dump',
     description:
-      '导出当前界面语义控件清单（ADB 2.0）：uiautomator dump → 解析剪枝 → 紧凑 JSON 节点表（' +
-      'id(text/desc 语义定位用，同一次 dump 内稳定)/文本/描述/类型/中心坐标/尺寸/可点/可滚动/可编辑）。' +
-      '节点上限 60（超出截断）、文本截 50 字符——token 远低于原始 XML 与截图。' +
-      '调用序：先 android_ui_dump 定位目标，再 android_ui_click/scroll/input 语义动作；' +
-      '复杂页面动作后建议重新 dump 验证。需设备控制授权（无障碍服务已开启，或 ADB 三道门齐备）+ 会话档位 danger-full-access；未授权失败关闭。',
+      '【首选】导出当前界面语义控件清单：无障碍语义树优先（无障碍服务已开启时走这条路——一次系统开关即可用、'
+      + '无配对、无 uiautomator idle 阻塞、字段更全），否则回退 uiautomator dump。'
+      + '产出紧凑 JSON 节点表（id(text/desc 语义定位用，同一次 dump 内稳定)/文本/描述/类型/中心坐标/尺寸/可点/可滚动/可编辑）。'
+      + '节点上限 60（超出截断）、文本截 50 字符——token 远低于原始 XML 与截图。'
+      + '调用序：先 android_ui_dump 定位目标，再 android_ui_click/scroll/input 语义动作；'
+      + '点击已自带生效校验（android_ui_click 会回报「已生效/未观察到变化」），页面大幅变化后再 dump。'
+      + '需设备控制授权（无障碍服务已开启，或 ADB 三道门齐备）+ 会话档位 danger-full-access；未授权失败关闭。'
+      + '注意：需要原始 uiautomator XML 或无障碍不可用时，才用 android_ui_tree。',
     parameters: {},
     output: {
       schema: {
@@ -654,20 +781,27 @@ function tools(priv: PrivilegeFace) {
           payload.path = orig
           const r = await a11yExec('click', payload)
           if (!r.ok) return { ok: false, denied: false, text: '无障碍点击失败：' + r.error }
+          const clicked = (r.data ?? {}) as { x?: number; y?: number; via?: string }
+          const verdict = await verifyClick(uiCache?.gen, exec as ExecLike)
           return {
             ok: true, denied: false, ref: ref!.trim(), id: node.id,
-            label: (node.text || node.desc).slice(0, 24), x: node.cx, y: node.cy,
-            text: `已点击 ${node.id}「${(node.text || node.desc).slice(0, 24)}」（无障碍通道）——建议重新 dump 验证`,
+            label: (node.text || node.desc).slice(0, 24),
+            x: clicked.x ?? node.cx, y: clicked.y ?? node.cy,
+            text: `已点击 ${node.id}「${(node.text || node.desc).slice(0, 24)}」（无障碍通道 ${clicked.via ?? 'performAction'}，`
+              + `坐标 ${Math.round(clicked.x ?? node.cx)},${Math.round(clicked.y ?? node.cy)}）；${verdict}`,
           }
         }
         payload.nx = nx
         payload.ny = ny
         const r = await a11yExec('click', payload)
         if (!r.ok) return { ok: false, denied: false, text: '无障碍点击失败：' + r.error }
+        const clicked = (r.data ?? {}) as { x?: number; y?: number; via?: string }
+        const verdict = await verifyClick(uiCache?.gen, exec as ExecLike)
         return {
           ok: true, denied: false, ref: '', id: `norm(${nx!.toFixed(3)},${ny!.toFixed(3)})`, label: '归一化坐标',
-          x: 0, y: 0,
-          text: `已按归一化坐标 (${nx!.toFixed(3)},${ny!.toFixed(3)}) 点击（无障碍通道，坐标由壳侧换算）——建议重新 dump 验证`,
+          x: clicked.x ?? 0, y: clicked.y ?? 0,
+          text: `已按归一化坐标 (${nx!.toFixed(3)},${ny!.toFixed(3)}) 点击（无障碍通道，实际坐标 `
+            + `${Math.round(clicked.x ?? 0)},${Math.round(clicked.y ?? 0)}）；${verdict}`,
         }
       }
       let cx = 0; let cy = 0; let hitId = ''; let label = ''
@@ -936,5 +1070,5 @@ export function apply(ctx: Context, _config: Record<string, unknown> = {}) {
     gateFor: () => ({ ok: false, guidance: '授权桥（dsh-android-bridge）未装配' }),
     audit: () => {},
   }
-  for (const t of tools(face)) ctx.tools.register(t)
+  for (const t of tools(ctx, face)) ctx.tools.register(t)
 }

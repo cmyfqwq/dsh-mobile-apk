@@ -255,6 +255,7 @@ class DeviceControlService : AccessibilityService() {
       "scroll" -> handleScroll(args)
       "global" -> handleGlobal(args)
       "screenshot" -> handleScreenshot(args)
+      "state" -> handleState()
       else -> error("未知操作 $op")
     }
   }
@@ -279,7 +280,10 @@ class DeviceControlService : AccessibilityService() {
           if (bitmap == null) {
             payload = error("截屏位图解码为空")
           } else {
-            val dir = java.io.File(filesDir, "control-shots").apply { mkdirs() }
+            // 落引擎可读目录（EngineManager 把 TMPDIR 设为 files/home/tmp，管理插件
+            // 的 dsh-tmp 同源）——此前落在 files/control-shots，引擎 read_image 打不开
+            // （issue #127）。工具层读完即删，这里只留 LRU 兜底清理。
+            val dir = java.io.File(java.io.File(filesDir, "home/tmp"), "dsh-tmp").apply { mkdirs() }
             val file = java.io.File(dir, "shot-${System.currentTimeMillis()}.png")
             java.io.FileOutputStream(file).use { out ->
               bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, out)
@@ -287,6 +291,7 @@ class DeviceControlService : AccessibilityService() {
             val width = bitmap.width
             val height = bitmap.height
             bitmap.recycle()
+            pruneShots(dir, keep = 8)
             payload = JSONObject().put("path", file.absolutePath).put("width", width).put("height", height)
           }
         } catch (t: Throwable) {
@@ -370,8 +375,13 @@ class DeviceControlService : AccessibilityService() {
       }
       if (node.isClickable) {
         val ok = node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-        return if (ok) JSONObject().put("clicked", path).put("via", "ACTION_CLICK")
-        else error("ACTION_CLICK 被目标拒绝（path=$path）")
+        if (ok) {
+          val rect = Rect()
+          node.getBoundsInScreen(rect)
+          return JSONObject().put("clicked", path).put("via", "ACTION_CLICK")
+            .put("x", rect.exactCenterX().toDouble()).put("y", rect.exactCenterY().toDouble())
+        }
+        return error("ACTION_CLICK 被目标拒绝（path=$path）")
       }
       val rect = Rect()
       node.getBoundsInScreen(rect)
@@ -400,7 +410,28 @@ class DeviceControlService : AccessibilityService() {
     if (!dispatched) return error("手势派发失败（无障碍服务未就绪）")
     latch.await(3, java.util.concurrent.TimeUnit.SECONDS)
     return if (ok) JSONObject().put("clicked", "($x,$y)").put("via", via)
+      .put("x", x.toDouble()).put("y", y.toDouble())
     else error("手势点击未完成（被系统取消）")
+  }
+
+  /**
+   * 便宜的状态读数（不建树）：当前快照代次 + 是否已被窗口/内容事件失效。
+   * 供工具层做「点击是否生效」校验（issue #129）：点后等待再读一次，
+   * 代次变化或 invalidated=true 即界面确实变了。
+   */
+  private fun handleState(): JSONObject = JSONObject()
+    .put("gen", synchronized(lock) { snapshot?.gen ?: -1 })
+    .put("invalidated", invalidated)
+    .put("enabled", true)
+
+  /** 截图目录 LRU 兜底（工具层读完即删，这里只防异常路径堆积）。 */
+  private fun pruneShots(dir: java.io.File, keep: Int) {
+    try {
+      val shots = dir.listFiles { f -> f.isFile && f.name.startsWith("shot-") }?.sortedByDescending { it.lastModified() } ?: return
+      for (f in shots.drop(keep)) {
+        try { f.delete() } catch (_: Throwable) { /* 忽略 */ }
+      }
+    } catch (_: Throwable) { /* 忽略 */ }
   }
 
   private fun handleSetText(args: JSONObject): JSONObject {

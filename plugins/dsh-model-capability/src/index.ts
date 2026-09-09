@@ -17,6 +17,7 @@ import { readFileSync, appendFileSync } from 'node:fs'
 import { Context } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import {
+  DIALECT_COMPAT_KEYS,
   THINKING_LEVELS,
   probePassive,
   probeReasoningEfforts,
@@ -122,8 +123,24 @@ export function loadCatalogSnapshot(): CatalogSnapshot | undefined {
   return cachedSnapshot
 }
 
-/** Injects catalog-derived capabilities into a probe report and recomputes unknowns. */
-export function mergeCatalog(
+/**
+ * Keep only the wire-dialect compat keys, and only when the catalog actually
+ * declares a thinking format — a partial dialect (e.g. only maxTokensField)
+ * would still let pi-ai fall back to a detected default (issue #134).
+ * @param compat - unanimous compat map from the catalog lookup.
+ * @returns the dialect keys to write, or undefined when the dialect is unknown.
+ */
+export function pickDialect(compat: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+  if (!compat || compat.thinkingFormat === undefined) return undefined
+  const out: Record<string, unknown> = {}
+  for (const key of DIALECT_COMPAT_KEYS) {
+    const value = compat[key]
+    if (value !== undefined) out[key] = value
+  }
+  return out
+}
+
+/** Injects catalog-derived capabilities into a probe report and recomputes unknowns. */export function mergeCatalog(
   report: ProbeReport,
   declared: string[],
   snapshot: CatalogSnapshot | undefined,
@@ -142,9 +159,23 @@ export function mergeCatalog(
     if (match.providers.length > 0) report.notes.push(`${model.id}: 引擎目录命中 ${match.providers.join('/')}`)
     for (const conflict of match.conflicts) report.notes.push(`${model.id}: ${conflict}`)
     const capabilities = match.capabilities
+    // 方言优先（issue #134）：reasoningEfforts 只有在「pi-ai 知道该模型的方言」时才写。
+    // 目录里同名模型来自多个厂商、thinkingFormat 冲突或缺失时，pi-ai 会按探测默认
+    // （未知 baseURL → openai）序列化 reasoning_effort，真实网关可能直接 400。
+    const dialect = pickDialect(capabilities.compat)
+    if (dialect && !model.compat) {
+      model.compat = dialect
+    }
     if (capabilities.reasoningEfforts && !model.reasoningEfforts) {
-      model.reasoningEfforts = capabilities.reasoningEfforts
-      model.sources.reasoningEfforts = 'engine-catalog'
+      if (dialect) {
+        model.reasoningEfforts = capabilities.reasoningEfforts
+        model.sources.reasoningEfforts = 'engine-catalog'
+      } else {
+        report.notes.push(
+          `${model.id}: 目录未给出统一 thinkingFormat（方言不明）——跳过 reasoningEfforts 写入，`
+          + '避免按错误方言发送推理等级导致请求被拒；如需档位请在设置里显式声明 compat.thinkingFormat',
+        )
+      }
     }
     if (capabilities.input && !model.input) {
       model.input = capabilities.input
@@ -190,6 +221,7 @@ export function patchesFrom(report: ProbeReport): ModelPatch[] {
     const patch: ModelPatch = { id: model.id }
     let any = false
     if (model.reasoningEfforts) { patch.reasoningEfforts = model.reasoningEfforts; any = true }
+    if (model.compat) { patch.compat = model.compat; any = true }
     if (model.input) { patch.input = model.input; any = true }
     if (model.contextWindow) { patch.contextWindow = model.contextWindow; any = true }
     if (model.maxTokens) { patch.maxTokens = model.maxTokens; any = true }

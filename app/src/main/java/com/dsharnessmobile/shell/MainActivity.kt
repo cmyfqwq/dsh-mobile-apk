@@ -52,8 +52,9 @@ class MainActivity : ComponentActivity() {
   /** True only after WebView reported a load error for the local engine origin. */
   @Volatile
   internal var enginePageFailed = false
-  /** Bottom insets in CSS px, cached until the engine page is ready to receive them. */
+  /** System insets in CSS px, cached until the engine page is ready to receive them. */
   private var webSystemBottomInset = 0
+  private var webSystemTopInset = 0
   private var webImeBottomInset = 0
   /** Coalesces rapid IME animation callbacks into one WebView evaluation per UI turn. */
   private var webInsetsPushScheduled = false
@@ -150,9 +151,15 @@ class MainActivity : ComponentActivity() {
     setContentView(root)
     ViewCompat.setOnApplyWindowInsetsListener(root) { _, insets ->
       val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+      val cutout = insets.getInsets(WindowInsetsCompat.Type.displayCutout())
       val mandatoryGestures = insets.getInsets(WindowInsetsCompat.Type.mandatorySystemGestures()).bottom
       val ime = insets.getInsets(WindowInsetsCompat.Type.ime()).bottom
       val density = resources.displayMetrics.density
+      // Edge-to-edge (setDecorFitsSystemWindows(false)) means the page owns the
+      // status-bar strip; with the immersive toggle off the bar is visible and
+      // would cover the mobile top bar / settings header (issue #135). bars.top
+      // is 0 while the bar is hidden, so this tracks the toggle for free.
+      webSystemTopInset = pxToCssPx(maxOf(bars.top, cutout.top), density)
       webSystemBottomInset = pxToCssPx(maxOf(bars.bottom, mandatoryGestures), density)
       webImeBottomInset = pxToCssPx(ime, density)
       scheduleWebInsetsPush()
@@ -589,9 +596,11 @@ class MainActivity : ComponentActivity() {
   private fun pushWebInsets(view: WebView = webView) {
     try {
       view.evaluateJavascript(
-        "(function(){var root=document.documentElement;if(!root)return;var system='" + webSystemBottomInset +
+        "(function(){var root=document.documentElement;if(!root)return;var top='" + webSystemTopInset +
+          "px';var system='" + webSystemBottomInset +
           "px';var ime='" + webImeBottomInset +
           "px';root.style.setProperty(" +
+          "'--dsh-android-system-top',top);root.style.setProperty(" +
           "'--dsh-android-system-bottom',system);root.style.setProperty('--dsh-android-ime-bottom',ime);" +
           "})()",
         null,

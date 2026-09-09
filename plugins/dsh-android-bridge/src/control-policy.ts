@@ -13,7 +13,7 @@
  *   - 策略是纯函数，便于单测；调用方（工具层）必须使用它的结论，不得自行旁路。
  */
 
-export type ControlOp = 'snapshot' | 'click' | 'setText' | 'scroll' | 'global' | 'screenshot'
+export type ControlOp = 'snapshot' | 'click' | 'setText' | 'scroll' | 'global' | 'screenshot' | 'state'
 
 export interface ControlPolicyInput {
   op: ControlOp
@@ -36,8 +36,9 @@ export interface ControlDecision {
 
 export const REQUIRED_SESSION_MODE = 'danger-full-access'
 
-/** a11y 通道能覆盖的操作（v1）：五个语义操作 + 截屏（API 30+，见 A11Y-CONTROL-DESIGN.md §2.2）。 */
-export const A11Y_OPS: readonly ControlOp[] = ['snapshot', 'click', 'setText', 'scroll', 'global', 'screenshot']
+/** a11y 通道能覆盖的操作：五个语义操作 + 截屏（API 30+，见 A11Y-CONTROL-DESIGN.md §2.2）
+ *  + `state`（便宜的状态读数：快照代次/失效标记，供点击生效校验，issue #129）。 */
+export const A11Y_OPS: readonly ControlOp[] = ['snapshot', 'click', 'setText', 'scroll', 'global', 'screenshot', 'state']
 
 export function decideControl(input: ControlPolicyInput): ControlDecision {
   if (input.sessionMode !== REQUIRED_SESSION_MODE) {

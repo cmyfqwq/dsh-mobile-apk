@@ -421,8 +421,14 @@ class OverlayService : Service() {
     updateBallOnly()
   }
 
-  /** 探活 tick 调用：乐观忙态超时未获 live 事件确认则回退。返回 true 表示发生了回退。 */
-  private fun optimisticBusyExpired(): Boolean {
+  /** issue #133：完成后自动收起面板（默认开，可在 overlay_display prefs 关掉）。 */
+  private fun autoCollapseOnDone(): Boolean = try {
+    getSharedPreferences("overlay_display", MODE_PRIVATE).getBoolean("auto_collapse_on_done", true)
+  } catch (_: Exception) {
+    true
+  }
+
+  /** 探活 tick 调用：乐观忙态超时未获 live 事件确认则回退。返回 true 表示发生了回退。 */  private fun optimisticBusyExpired(): Boolean {
     if (optimisticBusyAt == 0L) return false
     if (System.currentTimeMillis() - optimisticBusyAt <= 45_000L) return false
     optimisticBusyAt = 0L
@@ -478,7 +484,20 @@ class OverlayService : Service() {
       sessionBusy = false
       toolCount = 0
       currentToolName = ""; currentToolSummary = ""
+      // issue #133：会话完成 → 该会话的待答/待审批项已过期，先清掉（否则球停在琥珀
+      // 「等待你的回答…」）；再按设置把已展开的过期面板自动收起。
+      val dropped = panel.dropPendingFor(agentId)
       setHalo(deriveHalo())
+      if (expanded && autoCollapseOnDone() && !panel.hasDraft()) {
+        main.postDelayed({
+          if (expanded && !sessionBusy && pendingKind.isEmpty()) {
+            hidePanel()
+            if (dropped) flashStatus("已完成")
+          }
+        }, 900)
+      } else if (dropped && expanded) {
+        flashStatus("已完成")
+      }
     }
     if (expanded) panel.updateBallOnly() else updateBallOnly()
   }
