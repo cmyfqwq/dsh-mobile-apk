@@ -49,6 +49,160 @@ class DeviceControlService : AccessibilityService() {
     private const val MAX_DEPTH = 40
     private const val TOKEN_BYTES = 18
 
+    /**
+     * #128 L1：自有 WebView 的紧凑 DOM 语义快照（在页面上下文里跑，毫秒级）。
+     * 只收集「可交互」元素（链接/按钮/输入/role/contenteditable/tabindex），
+     * 每个节点回 `ref`（window.__dshWebRefs 里的句柄，动作优先用它）+ `sel`（CSS 路径兜底）
+     * + role/text/bounds/editable/disabled/inView。视口内的排前面，上限 120 条。
+     */
+    private const val WEB_SNAPSHOT_JS = """
+(function(){
+  var rootSel = __ROOT__;
+  var root = rootSel ? document.querySelector(rootSel) : document.body;
+  if (!root) return JSON.stringify({ok:false,error:'根选择器无匹配：' + rootSel});
+  var reg = window.__dshWebRefs || (window.__dshWebRefs = {n:0,map:{}});
+  reg.map = {}; reg.n = 0;
+  var SEL = 'a,button,input,textarea,select,[role],[contenteditable="true"],[onclick],[tabindex]';
+  var all = root.querySelectorAll(SEL);
+  function textOf(el){
+    var t = el.getAttribute('aria-label') || el.getAttribute('title') || el.innerText || el.textContent || '';
+    return String(t).replace(/\s+/g,' ').trim().slice(0,80);
+  }
+  function cssPath(el){
+    var parts = [], node = el, guard = 0;
+    while (node && node.nodeType === 1 && guard++ < 6){
+      var tag = node.tagName.toLowerCase();
+      if (node.id){ parts.unshift('#' + node.id); break; }
+      var parent = node.parentElement;
+      if (parent){ var idx = Array.prototype.indexOf.call(parent.children, node) + 1; tag += ':nth-child(' + idx + ')'; }
+      parts.unshift(tag);
+      node = parent;
+    }
+    return parts.join(' > ');
+  }
+  var picked = [];
+  for (var i = 0; i < all.length; i++){
+    var el = all[i];
+    var style = getComputedStyle(el);
+    if (style.display === 'none' || style.visibility === 'hidden') continue;
+    var r = el.getBoundingClientRect();
+    if (r.width < 2 || r.height < 2) continue;
+    var tag = el.tagName.toLowerCase();
+    var type = (el.getAttribute('type') || '').toLowerCase();
+    var editable = !!el.isContentEditable || tag === 'textarea' ||
+      (tag === 'input' && ['text','search','email','password','number','url','tel',''].indexOf(type) >= 0);
+    var role = el.getAttribute('role') || (tag === 'a' ? 'link' : tag === 'button' ? 'button'
+      : tag === 'select' ? 'combobox' : editable ? 'textbox' : tag === 'input' ? (type || 'input') : '');
+    picked.push({
+      el: el, tag: tag, role: role, editable: editable,
+      disabled: !!el.disabled || el.getAttribute('aria-disabled') === 'true',
+      text: textOf(el),
+      bounds: [Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height)],
+      inView: r.bottom > 0 && r.top < innerHeight && r.right > 0 && r.left < innerWidth
+    });
+  }
+  picked.sort(function(a, b){ return a.inView === b.inView ? 0 : (a.inView ? -1 : 1); });
+  var nodes = [], cap = 120;
+  for (var j = 0; j < picked.length && nodes.length < cap; j++){
+    var item = picked[j];
+    var id = ++reg.n;
+    reg.map[id] = item.el;
+    nodes.push({
+      ref: 'w' + id, sel: cssPath(item.el), tag: item.tag, role: item.role,
+      text: item.text, editable: item.editable, disabled: item.disabled,
+      bounds: item.bounds, inView: item.inView
+    });
+  }
+  return JSON.stringify({
+    ok: true, url: location.href, title: document.title,
+    vw: innerWidth, vh: innerHeight, scrollY: Math.round(window.scrollY),
+    total: picked.length, count: nodes.length, nodes: nodes
+  });
+})()
+"""
+
+    /**
+     * #128 L1：按 ref / CSS 选择器 / 文本 / role 定位并执行 click|setText|scroll。
+     * ref 是上一次 webSnapshot 的句柄（同一页面上下文内有效，元素被 React 换掉则退回 sel）；
+     * setText 走原生 value setter + input/change 事件，兼容 React 受控组件。
+     */
+    private const val WEB_ACTION_JS = """
+(function(){
+  var a = __ARGS__;
+  var reg = window.__dshWebRefs;
+  function textOf(el){
+    var t = el.getAttribute('aria-label') || el.getAttribute('title') || el.innerText || el.textContent || '';
+    return String(t).replace(/\s+/g,' ').trim();
+  }
+  function candidates(){
+    var sel = 'a,button,input,textarea,select,[role],[contenteditable="true"],[onclick],[tabindex]';
+    return Array.prototype.slice.call(document.querySelectorAll(sel)).filter(function(el){
+      var s = getComputedStyle(el);
+      if (s.display === 'none' || s.visibility === 'hidden') return false;
+      var r = el.getBoundingClientRect();
+      return r.width >= 2 && r.height >= 2;
+    });
+  }
+  var el = null;
+  var key = String(a.ref || '').replace(/^w/, '');
+  if (key && reg && reg.map[key]) { el = reg.map[key]; if (el && !el.isConnected) el = null; }
+  if (!el && a.sel) { try { el = document.querySelector(a.sel); } catch (e) { el = null; } }
+  if (!el && a.text){
+    var want = String(a.text).replace(/\s+/g,' ').trim().toLowerCase();
+    var list = candidates(), exact = null, partial = null;
+    for (var i = 0; i < list.length; i++){
+      var t = textOf(list[i]).toLowerCase();
+      if (!exact && t === want) exact = list[i];
+      if (!partial && t.indexOf(want) >= 0) partial = list[i];
+    }
+    el = exact || partial;
+  }
+  if (!el && a.role){
+    var role = String(a.role).toLowerCase();
+    var list2 = candidates();
+    for (var k = 0; k < list2.length; k++){
+      var r2 = list2[k].getAttribute('role');
+      if (r2 && r2.toLowerCase() === role){ el = list2[k]; break; }
+    }
+    if (!el){
+      var tagMap = {link:'a', button:'button', textbox:'input', combobox:'select'};
+      var tag = tagMap[role];
+      if (tag){ for (var m = 0; m < list2.length; m++){ if (list2[m].tagName.toLowerCase() === tag){ el = list2[m]; break; } } }
+    }
+  }
+  if (!el) return JSON.stringify({ok:false,error:'未找到目标元素（ref/sel/text/role 均无匹配）'});
+  try { el.scrollIntoView({block:'center', inline:'center'}); } catch (e) {}
+  var info = {tag: el.tagName.toLowerCase(), text: textOf(el).slice(0,60)};
+  var via = key ? 'ref' : (a.sel ? 'selector' : (a.text ? 'text' : 'role'));
+  if (a.op === 'click'){
+    el.click();
+    return JSON.stringify({ok:true, op:'click', via:via, target:info});
+  }
+  if (a.op === 'setText'){
+    var value = String(a.value || '');
+    if (el.isContentEditable){
+      el.focus();
+      el.textContent = value;
+    } else {
+      var isArea = el.tagName.toLowerCase() === 'textarea';
+      var proto = isArea ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+      var setter = Object.getOwnPropertyDescriptor(proto, 'value');
+      el.focus();
+      if (setter && setter.set) setter.set.call(el, value); else el.value = value;
+    }
+    el.dispatchEvent(new Event('input', {bubbles:true}));
+    el.dispatchEvent(new Event('change', {bubbles:true}));
+    return JSON.stringify({ok:true, op:'setText', via:via, target:info, value:value.slice(0,60)});
+  }
+  if (a.op === 'scroll'){
+    var dy = Number(a.dy) || 300;
+    window.scrollBy(0, dy);
+    return JSON.stringify({ok:true, op:'scroll', dy:dy, scrollY:Math.round(window.scrollY)});
+  }
+  return JSON.stringify({ok:false,error:'未知 op：' + a.op});
+})()
+"""
+
     @Volatile
     private var instance: DeviceControlService? = null
 
@@ -257,6 +411,9 @@ class DeviceControlService : AccessibilityService() {
       "global" -> handleGlobal(args)
       "screenshot" -> handleScreenshot(args)
       "state" -> handleState()
+      "nodeText" -> handleNodeText(args)
+      "webSnapshot" -> handleWebSnapshot(args)
+      "webAction" -> handleWebAction(args)
       else -> error("未知操作 $op")
     }
   }
@@ -323,6 +480,81 @@ class DeviceControlService : AccessibilityService() {
     })
     latch.await(12, java.util.concurrent.TimeUnit.SECONDS)
     return payload ?: error("截屏超时")
+  }
+
+  /**
+   * 读节点当前文本（输入落地校验用；不给 path 时读聚焦的可编辑节点）。
+   * 比整树快照便宜得多——现场实测「注入后回读断言」是输入链路唯一可靠的闭环。
+   */
+  private fun handleNodeText(args: JSONObject): JSONObject {
+    val path = args.optString("path", "")
+    val node: AccessibilityNodeInfo = if (path.isNotEmpty()) {
+      nodeAtPath(path) ?: return error("路径 $path 已不存在（页面已变化）")
+    } else {
+      findFocusedEditable() ?: return error("没有聚焦的输入框——请先点击目标输入框，或用 path 指定")
+    }
+    return JSONObject()
+      .put("text", node.text?.toString() ?: "")
+      .put("desc", node.contentDescription?.toString() ?: "")
+      .put("editable", node.isEditable)
+      .put("path", path)
+  }
+
+  /**
+   * #128 L1：自有 WebView 的 DOM 语义快照（毫秒级，不依赖无障碍虚拟树）。
+   * 只对 DSH 自己的 Web UI 生效；页面不在场（Activity 已销毁/未加载）时明确报错。
+   */
+  private fun handleWebSnapshot(args: JSONObject): JSONObject {
+    val rootSel = args.optString("root", "")
+    val script = WEB_SNAPSHOT_JS.replace("__ROOT__", if (rootSel.isEmpty()) "null" else JSONObject.quote(rootSel))
+    return evalWebScript(script)
+  }
+
+  /** #128 L1：按 ref / 选择器 / 文本 / role 在自有 WebView 上执行 click|setText|scroll。 */
+  private fun handleWebAction(args: JSONObject): JSONObject {
+    val payload = JSONObject()
+      .put("op", args.optString("op", "click"))
+      .put("ref", args.optString("ref", ""))
+      .put("sel", args.optString("sel", ""))
+      .put("text", args.optString("text", ""))
+      .put("role", args.optString("role", ""))
+      .put("value", args.optString("value", ""))
+      .put("dy", args.optInt("dy", 300))
+    return evalWebScript(WEB_ACTION_JS.replace("__ARGS__", payload.toString()))
+  }
+
+  /**
+   * 在自有 WebView 上求值一段返回 JSON 字符串的脚本（主线程 evaluateJavascript + 同步等待）。
+   * `evaluateJavascript` 的回包是 JSON 字面量：脚本返回字符串时会被再转义一层，这里解回。
+   */
+  private fun evalWebScript(script: String, timeoutMs: Long = 6000): JSONObject {
+    val web = MainActivity.webViewRef
+      ?: return error("自有 WebView 不在场（页面未加载或 Activity 已销毁）——网页内容请改用 android_ui_tree / android_ui_dump")
+    val latch = java.util.concurrent.CountDownLatch(1)
+    val holder = arrayOfNulls<String>(1)
+    val posted = mainHandler.post {
+      try {
+        web.evaluateJavascript(script) { value ->
+          holder[0] = value
+          latch.countDown()
+        }
+      } catch (t: Throwable) {
+        holder[0] = null
+        latch.countDown()
+      }
+    }
+    if (!posted) return error("WebView 求值无法派发（主线程不可用）")
+    if (!latch.await(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)) {
+      return error("WebView DOM 求值超时（${timeoutMs}ms）")
+    }
+    val raw = holder[0] ?: return error("WebView DOM 求值失败（页面可能正在跳转）")
+    val json = if (raw.startsWith("\"")) {
+      try { org.json.JSONTokener(raw).nextValue() as? String } catch (_: Throwable) { null }
+    } else {
+      raw
+    }
+    if (json.isNullOrBlank()) return error("WebView DOM 求值返回空")
+    return try { JSONObject(json) } catch (t: Throwable) { error("WebView DOM 结果解析失败：" + (t.message ?: "?")) }
   }
 
   private fun error(message: String): JSONObject = JSONObject().put("__error", message)

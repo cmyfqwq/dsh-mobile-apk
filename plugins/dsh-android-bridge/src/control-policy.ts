@@ -14,6 +14,7 @@
  */
 
 export type ControlOp = 'snapshot' | 'click' | 'setText' | 'scroll' | 'global' | 'screenshot' | 'state'
+  | 'nodeText' | 'webSnapshot' | 'webAction'
 
 export interface ControlPolicyInput {
   op: ControlOp
@@ -37,8 +38,12 @@ export interface ControlDecision {
 export const REQUIRED_SESSION_MODE = 'danger-full-access'
 
 /** a11y 通道能覆盖的操作：五个语义操作 + 截屏（API 30+，见 A11Y-CONTROL-DESIGN.md §2.2）
- *  + `state`（便宜的状态读数：快照代次/失效标记，供点击生效校验，issue #129）。 */
-export const A11Y_OPS: readonly ControlOp[] = ['snapshot', 'click', 'setText', 'scroll', 'global', 'screenshot', 'state']
+ *  + `state`（便宜的状态读数：快照代次/失效标记，供点击生效校验，issue #129）
+ *  + `webSnapshot`/`webAction`（issue #128 L1：自有 WebView 的 DOM 语义快照与动作——
+ *  与 a11y 共用同一队列/心跳，壳侧在页面不在场时明确报错）。 */
+export const A11Y_OPS: readonly ControlOp[] = [
+  'snapshot', 'click', 'setText', 'scroll', 'global', 'screenshot', 'state', 'nodeText', 'webSnapshot', 'webAction',
+]
 
 export function decideControl(input: ControlPolicyInput): ControlDecision {
   if (input.sessionMode !== REQUIRED_SESSION_MODE) {

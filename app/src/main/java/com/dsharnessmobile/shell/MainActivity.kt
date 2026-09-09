@@ -96,6 +96,13 @@ class MainActivity : ComponentActivity() {
     /** #120：显式拒绝哨兵路径前缀（引擎侧识别为拒绝而非取消，见 host-web-compat）。
      *  协议：`__dsh_pick_refused__:<reason>`，reason = permission-denied | android-10。 */
     const val PICK_REFUSED_PREFIX = "__dsh_pick_refused__:"
+
+    /**
+     * #128 L1：控制面（无障碍服务）读取/操作**自有 WebView** 的 DOM 需要拿到实例。
+     * 只在 Activity 存活期间非空；控制服务拿到 null 即回「页面不在场」。
+     */
+    @Volatile
+    internal var webViewRef: WebView? = null
   }
 
   // —— 引擎流 / 引导页委托（原位一行委托到协作类；引擎启动与引导页状态渲染
@@ -145,6 +152,7 @@ class MainActivity : ComponentActivity() {
       id = View.generateViewId()
       visibility = View.GONE
     }
+    webViewRef = webView
     root.addView(webView, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
     guideView = guideRenderer.buildGuideView()
     root.addView(guideView, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
@@ -293,6 +301,8 @@ class MainActivity : ComponentActivity() {
 
   override fun onDestroy() {
     super.onDestroy()
+    // #128 L1：控制面不再持有已销毁 Activity 的 WebView。
+    webViewRef = null
     // 悬浮球避让帧消费者清除（Service 侧持有引用，避免 Activity 泄漏）
     OverlayService.frameConsumer = null
     engineFlow.stopMonitoring()

@@ -372,7 +372,11 @@ async function ensureDurableDirectory(path, boundary) {
 	let level = target;
 	while (level !== stop) {
 		const parent = dirname(level);
-		await syncDirectory(parent);
+		try { await syncDirectory(parent); } catch (error) {
+			// dsh-mobile durable-walk guard: Android app-private ancestors (/data/user/0) are not readable by the app.
+			if (error && (error.code === 'EACCES' || error.code === 'EPERM')) return;
+			throw error;
+		}
 		/* v8 ignore next -- filesystem-root guard: callers pass a boundary that is an ancestor of path, so the walk reaches it first. */
 		if (parent === level) return;
 		level = parent;

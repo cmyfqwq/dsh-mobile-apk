@@ -342,10 +342,42 @@ class EngineManager(private val context: Context, private val pickToken: String?
    * mechanism depends on the app-private domain (public FUSE forbids symlinks), so DSH_HOME must
    * never be migrated wholesale.
    */
+  /**
+   * #130-2：播种「手机操控」Agent 预设（`$DSH_HOME/.agent-presets/phone-control/`）。
+   * 组成文件直接复制当前引擎自带的 `standard` 预设（避免随引擎升级漂移），另附 SKILL.md
+   * 固定「dump → 按 ref 动作 → 校验 → 再 dump」的流程与纪律。已存在则不覆盖（用户可自改）。
+   */
+  private fun seedPhoneControlPreset(privateDsh: File) {
+    try {
+      val dir = File(File(privateDsh, ".agent-presets"), "phone-control")
+      if (File(dir, "preset.yml").exists()) return
+      val shipped = File(
+        context.filesDir,
+        "usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-agent-presets/presets/standard/agent.cordis.yml",
+      )
+      if (!shipped.isFile) {
+        Log.w(TAG, "phone-control preset skipped: shipped standard composition absent at " + shipped.absolutePath)
+        return
+      }
+      val skillDir = File(dir, "skills/phone-control").apply { mkdirs() }
+      File(dir, "agent.cordis.yml").writeText(shipped.readText())
+      File(dir, "preset.yml").writeText(
+        "name: 手机操控\n" +
+          "description: 以无障碍语义树 / DOM 快照驱动的手机操控预设：dump → 按 ref 点击或输入 → 校验 → 再 dump；禁止盲点坐标。\n" +
+          "order: 50\n",
+      )
+      File(skillDir, "SKILL.md").writeText(PHONE_CONTROL_SKILL)
+      Log.i(TAG, "phone-control preset seeded -> " + dir.absolutePath)
+    } catch (t: Throwable) {
+      Log.w(TAG, "phone-control preset seeding failed", t)
+    }
+  }
+
   fun ensurePrivateDshData(): File {
     val dshData = dshDataDir
     val privateDsh = File(homeDir, ".dsh")
     privateDsh.mkdirs()
+    seedPhoneControlPreset(privateDsh)
     val privateMarker = File(privateDsh, ".private-layout")
     if (privateMarker.exists()) {
       ensurePublicExportRepo(dshData)
@@ -1061,6 +1093,29 @@ class EngineManager(private val context: Context, private val pickToken: String?
 
   companion object {
     private const val TAG = "dsh-engine"
+
+    /**
+     * #130-2：手机操控预设自带的 skill——把 0.13.5 现场实测的流程与纪律固定下来
+     * （无障碍/DOM 优先、先验前台、按 ref 而非盲点坐标、动作后必校验、输入单次注入并回读）。
+     */
+    private val PHONE_CONTROL_SKILL = """
+# 手机操控流程（DSH 设备控制）
+
+## 固定顺序
+1. 会话档位必须是 danger-full-access，否则设备工具一律拒绝。
+2. 长流程开始前跑一次 android_env_prepare（关动画 + 启用内嵌 ADB 键盘），之后 dump/tap 更稳。
+3. 感知：android_ui_dump（无障碍语义树，首选）→ 若结果是 WebView 容器或目标是 DSH 自己的 Web UI，改用 android_web_dump（DOM 快照）。
+4. 动作：android_ui_click / android_ui_input，引用用 ref（id:nN / text:精确文本#k / desc: / rid: / wN / css: / text: / role:）。
+5. 校验：工具自带回执（点击回报「已生效 / 未观察到界面变化」；输入回报「回读一致 / 未落地」）——不要假设动作成功。
+6. 需要看画面时用 android_screenshot（图像直接随结果返回，不需要再 read_image）。
+
+## 纪律
+- 禁止盲点坐标点击；nx/ny 仅作兜底，且必须说明理由。
+- 同名节点必须消歧：用 dump 里的 #k 序号（text:设置#2）。
+- 抓到的包名与前台不一致时以 dumpsys 为准（uiautomator/无障碍可能抓到覆盖层）。
+- 输入只走单次注入 + 回读断言；不要用 keyevent 打字母（中文 IME 会汉字化），不要拆成多段输入。
+- 连续两次动作未产生预期变化时停下来重新 dump，并如实汇报当前界面状态，不要继续猜测。
+"""
 
     /** Healthy ticks (each 5s watchdog poll) required before the update-v2 finalize deletes usr-old. */
     const val UPDATE_CONFIRM_TICKS = 3
