@@ -350,6 +350,14 @@ class EngineManager(private val context: Context, private val pickToken: String?
   private fun seedPhoneControlPreset(privateDsh: File) {
     try {
       val dir = File(File(privateDsh, ".agent-presets"), "phone-control")
+      // SKILL.md 是我们管理的纪律文案：每次启动都刷新（保证升级后纪律立即生效）；
+      // preset.yml / agent.cordis.yml 只在缺失时播种，保留用户可能的改动。
+      val skillDir = File(dir, "skills/phone-control").apply { mkdirs() }
+      val skillFile = File(skillDir, "SKILL.md")
+      if (skillFile.readText().trim() != PHONE_CONTROL_SKILL.trim()) {
+        skillFile.writeText(PHONE_CONTROL_SKILL)
+        Log.i(TAG, "phone-control SKILL refreshed")
+      }
       if (File(dir, "preset.yml").exists()) return
       val shipped = File(
         context.filesDir,
@@ -359,14 +367,12 @@ class EngineManager(private val context: Context, private val pickToken: String?
         Log.w(TAG, "phone-control preset skipped: shipped standard composition absent at " + shipped.absolutePath)
         return
       }
-      val skillDir = File(dir, "skills/phone-control").apply { mkdirs() }
       File(dir, "agent.cordis.yml").writeText(shipped.readText())
       File(dir, "preset.yml").writeText(
         "name: 手机操控\n" +
           "description: 以无障碍语义树 / DOM 快照驱动的手机操控预设：dump → 按 ref 点击或输入 → 校验 → 再 dump；禁止盲点坐标。\n" +
           "order: 50\n",
       )
-      File(skillDir, "SKILL.md").writeText(PHONE_CONTROL_SKILL)
       Log.i(TAG, "phone-control preset seeded -> " + dir.absolutePath)
     } catch (t: Throwable) {
       Log.w(TAG, "phone-control preset seeding failed", t)
