@@ -106,16 +106,11 @@ cat > stage-root/home/.dsh/profiles/web/cordis.patch.yml <<'PATCH_EOF'
         maxTimeoutMs: 600000
     - id: host-web-compat
       name: '@dsh-android/dsh-host-web-compat'
-- id: ui-layout
-  disabled: true
+# 0.13.7：ui-layout 不再禁用（0.1.5 起它是布局服务中枢，禁用即会话与左栏一起消失）；
+# dsh-attachment-formats 退役（上游 0.1.5 自带附件入口与文档预览，避免两个「添加附件」并排）。
 - insert:
     - id: ui-responsive
       name: '@dsh-android/dsh-client-ui-responsive'
-# Attachment format extensions (0.12.1, issue #39): dsh-attachment-formats
-# (PDF text layer / Office local structuring; scanned-doc local OCR via tesseract.js with bundled language packs).
-- insert:
-    - id: attachment-formats
-      name: dsh-attachment-formats
 # Workspace picker (issue apk#5): directory-picker-auto always resolves to browse on Android —
 # disable it and mount the upstream renderless native surface, driven by host-web-compat's SAF bridge
 # to the system directory picker.

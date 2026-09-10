@@ -50,11 +50,22 @@ for (const sym of contract.symbols) {
   else fail(sym.pkg + ': 符号 ' + sym.symbol + ' 不在基线类型面（继承面断裂）')
 }
 
-console.log('== 4. 客户端槽位声明 ==')
+// 0.2.0 起注入层不再替换上游框架：它组合进上游的座位，绝不注册 'root'。
+console.log('== 4. 客户端槽位声明（组合面，非框架替换） ==')
 const slotText = readFileSync(join(root, contract.clientSlots.repo, 'src/client/index.ts'), 'utf8')
 for (const slot of contract.clientSlots.slots) {
-  if (slotText.includes("'" + slot + "'")) ok('槽位 ' + slot + ' 已声明')
-  else fail('槽位 ' + slot + ' 未声明')
+  if (slotText.includes("'" + slot + "'")) ok('槽位 ' + slot + ' 已组合')
+  else fail('槽位 ' + slot + ' 未组合')
+}
+if (contract.clientSlots.ownRoot === false) {
+  if (/name:\s*'root'/.test(slotText)) fail("注入层注册了 'root' 槽（框架替换回归）")
+  else ok("未注册 'root' 槽（上游 ui-layout 持有框架）")
+}
+if (contract.clientSlots.enabledRow !== undefined) {
+  const patchText = readFileSync(join(root, 'scripts/profile-web.cordis.patch.yml'), 'utf8')
+  const disabled = new RegExp('- id:\\s*' + contract.clientSlots.enabledRow + '\\s*\\n\\s*disabled:\\s*true').test(patchText)
+  if (disabled) fail('profile patch 禁用了 ' + contract.clientSlots.enabledRow + '（0.1.5 起为布局服务中枢，禁用即会话与左栏同时失效）')
+  else ok('profile patch 保留 ' + contract.clientSlots.enabledRow + ' 启用')
 }
 
 console.log('== 5. 环境契约键 ==')

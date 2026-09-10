@@ -53,7 +53,7 @@ $pluginDirs = @(
     (Join-Path $Root "plugins\dsh-android-linux-env"),
     (Join-Path $Root "plugins\dsh-android-file-open"),
     # 0.13.5 W3（issue #125）：自定义提供商能力发现——被动端点描述符 + 厂商 schema +
-    # 引擎目录精确 id 查表（目录快照由 build-snapshot 0g 步从本次引擎树生成）+ 字段级写回。
+    # 引擎目录精确 id 查表 + 显式批准后的主动探测；字段级写回 llm-pi-ai 模型能力。
     (Join-Path $Root "plugins\dsh-model-capability")
 )
 

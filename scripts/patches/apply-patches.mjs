@@ -248,6 +248,34 @@ const IMPLS = {
     },
   },
 
+  // ── undo-E8：快照徽章折叠成小绿点（2026-09-10 用户定例）──
+  // 会话头部在 360dp 竖屏已被「模式徽章 + 打开方式 + … + 右栏键」占满，
+  // 「已存 N 份快照」的文字徽章把标题挤成省略号，更窄处还会错位。
+  // 口径：直接折叠成一个小绿点——数量与含义挪进 title/aria-label（悬停/读屏仍可见），
+  // 点击行为不变（打开快照管理面板）。E6（去相对时间）与 E7（宽度封顶）保留但已非必需；
+  // E7 的 marker 串保持不动（改它会让 E7 误判未应用 → 二次施加锚点失配）。
+  'undo-E8': {
+    file: 'dsh-undo-savepoint/lib/client.js',
+    check: (s) => s.includes('dsh-mobile dot-only badge'),
+    apply: (s) => {
+      if (s.includes('dsh-mobile dot-only badge')) return s
+      const TEXT = 't("badge.count", { n: stat.total }),'
+      if (!s.includes(TEXT)) throw new Error('E8 锚点缺失：badge.count 文本节点')
+      s = s.replace(TEXT, '// dsh-mobile dot-only badge: 数量只在 title/aria-label 里，头部只留绿点')
+      const TITLE = 'title: t("badge.title"),'
+      const ARIA = '"aria-label": t("badge.title"),'
+      if (!s.includes(TITLE) || !s.includes(ARIA)) throw new Error('E8 锚点缺失：badge title/aria-label')
+      s = s.replace(TITLE, 'title: t("badge.title") + " · " + t("badge.count", { n: stat.total }),')
+      s = s.replace(ARIA, '"aria-label": t("badge.title") + ", " + t("badge.count", { n: stat.total }),')
+      // 同优先级后置规则覆盖上面的胶囊样式：20x20 圆形、绿点居中（不改 E7 的 marker 串）。
+      const CSS_END = 'overflow:hidden}";'
+      if (!s.includes(CSS_END)) throw new Error('E8 锚点缺失：css2 结尾')
+      s = s.replace(CSS_END, 'overflow:hidden}.u_badge{padding:0;width:20px;height:20px;justify-content:center;gap:0}";')
+      if (!s.includes('dsh-mobile dot-only badge')) throw new Error('E8 复核失败——不写回')
+      return s
+    },
+  },
+
   // ── flock-android-F3：Android 无预编译 flock 绑定（0.13.7 追上游 0.1.5）──
   // 0.1.5 的 dsh-session-persistence-jsonl 用 @deepseek-ai/node-addon-system/flock 做
   // 会话目录写锁（session.lock，跨进程互斥）；dsh-sandbox-local 用同包的 landlock-run

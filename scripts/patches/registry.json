@@ -87,6 +87,13 @@
       "marker": "gap:5px;white-space:nowrap;flex:none;max-width:30vw（存在=已应用）"
     },
     {
+      "id": "undo-E8",
+      "target": "dsh-undo-savepoint/lib/client.js",
+      "summary": "快照徽章折叠成小绿点（数量与含义挪进 title/aria-label，点击行为不变；20x20 圆形后置覆盖胶囊样式）",
+      "provenance": "2026-09-10 用户定例；360dp 竖屏头部被模式徽章/打开方式/…/右栏键占满，文字徽章挤标题且更窄处错位",
+      "marker": "dsh-mobile dot-only badge"
+    },
+    {
       "id": "flock-android-F3",
       "target": "usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/node-addon-system/lib/flock.js",
       "scope": "engine",

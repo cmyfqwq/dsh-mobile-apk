@@ -33,12 +33,12 @@
     - id: ui-responsive
       name: '@dsh-android/dsh-client-ui-responsive'
 
-# Attachment format extensions (0.12.1, issue #39): dsh-attachment-formats
-# (PDF text layer / Office local structuring; scanned-doc local OCR via tesseract.js with bundled language packs).
-- insert:
-    - id: attachment-formats
-      name: dsh-attachment-formats
-
+# 0.13.7（2026-09-10 用户拍板退役）：dsh-attachment-formats 不再挂载。
+# 它是 0.12.1 期的「附件格式扩展」过渡插件（PDF 文本层 / Office 结构化 / 扫描件 OCR），
+# 自带一个 composer 附件按钮（class dshaf-btn）——上游 0.1.5 已有自己的附件入口
+# （dsh-client-file-upload + onShowFileChooser 官方通道）与文档预览（documentpreview 内含
+# pdfjs），两个「添加附件」按钮并排出现（窄屏尤其挤）。包体仍在基座快照内，不再装载即等于退役；
+# 若日后需要 Office/OCR 能力，恢复本节 insert 即可（一行可逆）。
 # 崩溃自动回退（0.13.0 F3，M3.0）：dsh-undo-savepoint——配置+插件代码树快照、撤销、安全模式；
 # 装坏可退，与 F4 市场安装共用同一机制（撤销保护的安装）。
 - insert:

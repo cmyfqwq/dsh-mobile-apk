@@ -17,7 +17,7 @@ window.__ModuleLoader__.load({
 			document.head.appendChild(tag);
 		}
 		// v0.3.4 UI 增强补充样式:图标对齐 / 状态徽章 / 面板副标题
-		const css2 = ".u_icon{display:inline-block;vertical-align:-2px;flex:none;line-height:0}.u_badge{cursor:pointer;border:1px solid var(--dsw-alias-border-l1, rgba(128,128,128,.35));background:var(--dsw-specific-tip, transparent);color:var(--dsw-alias-label-secondary, inherit);border-radius:999px;height:20px;padding:0 8px;font-size:11px;line-height:18px;display:inline-flex;align-items:center;gap:5px;white-space:nowrap;flex:none;max-width:30vw;overflow:hidden;text-overflow:ellipsis}.u_badge:hover{background:var(--dsw-alias-interactive-bg-hover, rgba(128,128,128,.15));color:var(--dsw-alias-label-primary, inherit)}.u_dot{width:6px;height:6px;border-radius:50%;background:#30a46c;flex:none}.u_subtitle{font-size:11px;color:var(--dsw-alias-label-tertiary, #888);font-weight:400;white-space:nowrap;max-width:min(220px,30vw);text-overflow:ellipsis;overflow:hidden}";
+		const css2 = ".u_icon{display:inline-block;vertical-align:-2px;flex:none;line-height:0}.u_badge{cursor:pointer;border:1px solid var(--dsw-alias-border-l1, rgba(128,128,128,.35));background:var(--dsw-specific-tip, transparent);color:var(--dsw-alias-label-secondary, inherit);border-radius:999px;height:20px;padding:0 8px;font-size:11px;line-height:18px;display:inline-flex;align-items:center;gap:5px;white-space:nowrap;flex:none;max-width:30vw;overflow:hidden;text-overflow:ellipsis}.u_badge:hover{background:var(--dsw-alias-interactive-bg-hover, rgba(128,128,128,.15));color:var(--dsw-alias-label-primary, inherit)}.u_dot{width:6px;height:6px;border-radius:50%;background:#30a46c;flex:none}.u_subtitle{font-size:11px;color:var(--dsw-alias-label-tertiary, #888);font-weight:400;white-space:nowrap;max-width:min(220px,30vw);text-overflow:ellipsis;overflow:hidden}.u_badge{padding:0;width:20px;height:20px;justify-content:center;gap:0}";
 		const tagId2 = "dsh-undo-savepoint/undo.enhance.module.css";
 		if (typeof document !== "undefined" && document.querySelector("style[data-plugin-css=" + JSON.stringify(tagId2) + "]") === null) {
 			const tag = document.createElement("style");
@@ -388,12 +388,12 @@ window.__ModuleLoader__.load({
 					stat !== null && (0, react_jsx_runtime.jsx)("button", {
 						type: "button",
 						className: styles.badge,
-						title: t("badge.title"),
-						"aria-label": t("badge.title"),
+						title: t("badge.title") + " · " + t("badge.count", { n: stat.total }),
+						"aria-label": t("badge.title") + ", " + t("badge.count", { n: stat.total }),
 						onClick: () => { onOpenPanel(); },
 						children: [
 							(0, react_jsx_runtime.jsx)("span", { className: styles.dot }),
-							t("badge.count", { n: stat.total }),
+							// dsh-mobile dot-only badge: 数量只在 title/aria-label 里，头部只留绿点
 						]
 					}),
 					msg !== null && (0, react_jsx_runtime.jsx)("span", {
