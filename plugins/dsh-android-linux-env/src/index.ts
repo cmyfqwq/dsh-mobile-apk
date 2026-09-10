@@ -80,7 +80,9 @@ function recipeExport(): Record<string, unknown> {
   for (const k of allowlisted) if (process.env[k]) env[k] = process.env[k]!
   return {
     exportedAt: new Date().toISOString(),
-    version: '0.13.0',
+    // 版本口径单一来源：壳侧 BuildConfig.VERSION_NAME 经引擎环境传入（DSH_APP_VERSION）——
+    // 硬编码会让「界面 0.13.7 / 配方 0.13.0」口径分裂（2026-09-10 用户定例）。
+    version: process.env.DSH_APP_VERSION ?? 'unknown',
     env,
     dpkgPackages: dpkgList,
     profilePatch: readText(join(profile, 'cordis.patch.yml')),

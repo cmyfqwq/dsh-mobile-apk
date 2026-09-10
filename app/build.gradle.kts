@@ -14,14 +14,15 @@ android {
     // (the embedded engine, bash, and every child command would need linker64
     // wrappers); 34 keeps native exec working on Android 15/16 devices.
     targetSdk = 34
-    // 0.13.6：versionCode 33（修复批：附件持久化祖先 fsync Android 守卫——图片上传/read_image 全链修复；
-    // 自有 WebView DOM 快速通道 webSnapshot/webAction + android_web_dump；android_ui_global 返回/主页/
-    // 最近任务；android_env_prepare/android_app_launch/前台真值/输入回读断言；phone-control 预设；
-    // 顶部系统 inset 通道 + 弹出面板几何守卫 + 悬浮球光环提亮；覆盖安装 0.13.5(32)）。
-    versionCode = 33
-    // Snapshot builds append a suffix (e.g. -SN-1-RC8) via -PversionNameSuffix; release builds pass none.
+    // 0.13.7：versionCode 34（追上游 dsh 0.1.5-rc.1：上游 ui-layout 基线 + 移动适配层 0.2.0 +
+    // 原生「打开方式」PathOpen/openPathChooser + 引擎树补丁 F3/F4 + polyfill 装配与 Iterator 垫片修复 +
+    // UI 冗余清理（退役 attachment-formats、快照徽章折叠成小绿点）；覆盖安装 0.13.6(33)）。
+    versionCode = 34
+    // Snapshot builds append a suffix (e.g. -SN-1-RC13) via -PversionNameSuffix; release builds pass none.
     val snapshotSuffix = providers.gradleProperty("versionNameSuffix").getOrElse("")
-    versionName = "0.13.6" + snapshotSuffix
+    // 版本号单一来源：UI（GuidePageRenderer）、桥（androidBridge.version）、诊断日志、引擎环境变量
+    // （DSH_APP_VERSION，见 EngineManager.engineEnv）全部读这里，禁止任何地方再硬编码版本字面量。
+    versionName = "0.13.7" + snapshotSuffix
     buildConfigField("String", "TERMUX_VERSION", "\"0.118.3\"")
   }
 
