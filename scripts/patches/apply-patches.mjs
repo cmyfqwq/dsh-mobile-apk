@@ -248,52 +248,363 @@ const IMPLS = {
     },
   },
 
-  // ── pi-drift-F1：llm-pi-ai 目录漂移降级（0.13.3 W4，引擎树补丁 scope=engine）──
-  // 不变量（用户拍板）：单条过期模型 id 或一条未描述路由，永远不能再打死整个 llm-pi-ai。
-  // 三处致命 invalid()（整包拒绝）降级为告警+跳过：override 未知 id/未知路由 → continue 丢该条；
-  // 路由零模型 → resolveRouteModels 返回 skipped 标记，调用方 continue 跳过该 provider。
-  // 锚点随引擎升级重验（0.1.2-rc.1 dsh-llm-pi-ai/lib/index.js）。
-  'pi-drift-F1': {
-    file: 'usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-llm-pi-ai/lib/index.js',
-    scope: 'engine',
-    check: (s) => [
-      'override skipped (dsh-mobile drift guard)',
-      'route skipped (dsh-mobile drift guard)',
-      'if (catalog.skipped) continue;',
-    ].every((m) => s.includes(m)),
+  // ── undo-E8：快照徽章折叠成小绿点（2026-09-10 用户定例）──
+  // 会话头部在 360dp 竖屏已被「模式徽章 + 打开方式 + … + 右栏键」占满，
+  // 「已存 N 份快照」的文字徽章把标题挤成省略号，更窄处还会错位。
+  // 口径：直接折叠成一个小绿点——数量与含义挪进 title/aria-label（悬停/读屏仍可见），
+  // 点击行为不变（打开快照管理面板）。E6（去相对时间）与 E7（宽度封顶）保留但已非必需；
+  // E7 的 marker 串保持不动（改它会让 E7 误判未应用 → 二次施加锚点失配）。
+  'undo-E8': {
+    file: 'dsh-undo-savepoint/lib/client.js',
+    check: (s) => s.includes('dsh-mobile dot-only badge'),
     apply: (s) => {
+      if (s.includes('dsh-mobile dot-only badge')) return s
+      const TEXT = 't("badge.count", { n: stat.total }),'
+      if (!s.includes(TEXT)) throw new Error('E8 锚点缺失：badge.count 文本节点')
+      s = s.replace(TEXT, '// dsh-mobile dot-only badge: 数量只在 title/aria-label 里，头部只留绿点')
+      const TITLE = 'title: t("badge.title"),'
+      const ARIA = '"aria-label": t("badge.title"),'
+      if (!s.includes(TITLE) || !s.includes(ARIA)) throw new Error('E8 锚点缺失：badge title/aria-label')
+      s = s.replace(TITLE, 'title: t("badge.title") + " · " + t("badge.count", { n: stat.total }),')
+      s = s.replace(ARIA, '"aria-label": t("badge.title") + ", " + t("badge.count", { n: stat.total }),')
+      // 同优先级后置规则覆盖上面的胶囊样式：20x20 圆形、绿点居中（不改 E7 的 marker 串）。
+      const CSS_END = 'overflow:hidden}";'
+      if (!s.includes(CSS_END)) throw new Error('E8 锚点缺失：css2 结尾')
+      s = s.replace(CSS_END, 'overflow:hidden}.u_badge{padding:0;width:20px;height:20px;justify-content:center;gap:0}";')
+      if (!s.includes('dsh-mobile dot-only badge')) throw new Error('E8 复核失败——不写回')
+      return s
+    },
+  },
+
+  // ── flock-android-F3：Android 无预编译 flock 绑定（0.13.7 追上游 0.1.5）──
+  // 0.1.5 的 dsh-session-persistence-jsonl 用 @deepseek-ai/node-addon-system/flock 做
+  // 会话目录写锁（session.lock，跨进程互斥）；dsh-sandbox-local 用同包的 landlock-run
+  // 选 Linux 沙箱后端。该包（独立版本线 0.1.2）只发布 darwin/linux 预编译，
+  // optionalDependencies 没有 android → Android 上 tryLockExclusive() 必抛
+  // ERR_FLOCK_UNSUPPORTED_PLATFORM：会话写入直接失败（实测连整树 boot 都进不去）。
+  //
+  // 不变量：拿不到原生 flock 不能杀死会话写入。降级口径与上游自己的先例一致——
+  // lease 模块注释明写「The browser worker stubs the native flock entry to immediate
+  // success: it is single-process, so the in-process write claim already excludes every
+  // writer」。Android 上同理：壳侧看门狗保证同一时刻只有一个引擎进程，
+  // 进程内写声明已排除所有写者，故 stub 为立即成功并一次性告警（不记账、不误判 fd 复用）。
+  'flock-android-F3': {
+    file: 'usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/node-addon-system/lib/flock.js',
+    scope: 'engine',
+    check: (s) => s.includes('dsh-mobile flock fallback (F3)'),
+    apply: (s) => {
+      if (s.includes('dsh-mobile flock fallback (F3)')) return s
+      const OLD = [
+        "    if (platform !== 'linux' && platform !== 'darwin') {",
+        '        throw Object.assign(new Error(`flock is not supported on ${platform}-${arch}`), {',
+        "            code: 'ERR_FLOCK_UNSUPPORTED_PLATFORM',",
+        "            syscall: 'flock',",
+        '        });',
+        '    }',
+      ].join('\n')
+      const NEW = [
+        "    if (platform !== 'linux' && platform !== 'darwin') {",
+        '        // dsh-mobile flock fallback (F3): no prebuilt binding for this platform. Single-process host',
+        '        // (one engine process), so the in-process write claim already excludes',
+        '        // every writer — same stub upstream ships for its browser worker.',
+        '        if (!globalThis.__dshMobileFlockStubbed) {',
+        '            globalThis.__dshMobileFlockStubbed = true;',
+        '            console.warn(`node-addon-system: no prebuilt flock binding for ${platform}-${arch}; stubbed to immediate success (dsh-mobile F3, single-process host)`);',
+        '        }',
+        '        binding = { tryLock(_fd, done) { done(0); } };',
+        '        return binding;',
+        '    }',
+      ].join('\n')
+      if (!s.includes(OLD)) {
+        throw new Error('flock-android 锚点未命中：unsupported-platform throw——引擎升级后请人工核对 node-addon-system/lib/flock.js')
+      }
+      s = s.replace(OLD, NEW)
+      if (!s.includes('dsh-mobile flock fallback (F3)')) throw new Error('flock-android 复核失败——不写回')
+      return s
+    },
+  },
+
+  // ── atomic-stale-lock-F4：孤儿写锁回收（2026-09-10 模拟器实测，scope=engine）──
+  // withFileLock 用 wx 建 <file>.lock 做跨进程写互斥，锁内容就是持有者 pid；释放走 operation 的
+  // finally（rm）。进程被硬杀（用户划掉应用 / 系统 OOM / am force-stop / 壳侧看门狗重启）时 finally
+  // 不执行 → 锁文件永久残留 → 之后每一次写该文件都等到 deadline 抛
+  // "atomic-write: timed out waiting for the writer lock at …/.credentials.yaml.lock"。
+  // 上游注释明写「contender never removes an existing lock… orphan recovery is an operator action」——
+  // 桌面/服务器有位「运维」可以删锁，Android 应用私有目录（/data/data/<pkg>/…）用户无任何可达手段，
+  // 症状等于应用永久起不来（实测：重复引擎进程被清掉后仍 boot 失败，只因残留 .credentials.yaml.lock）。
+  //
+  // 不变量：仅当锁记录的 pid 已消失且锁内容二次核验一致时才回收，且每次获取最多回收一次。
+  // pid 存活用 process.kill(pid, 0)：ESRCH=不存活（可回收），EPERM=存活但非本进程（不回收）。
+  // 读取失败 / 内容非 pid / 二次核验不一致 / 任何异常 → 一律不动锁（退回上游的等待-超时语义）。
+  'atomic-stale-lock-F4': {
+    file: 'usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-atomic-write/lib/index.js',
+    scope: 'engine',
+    check: (s) => s.includes('dsh-mobile stale-lock recovery (F4)'),
+    apply: (s) => {
+      if (s.includes('dsh-mobile stale-lock recovery (F4)')) return s
+      const IMPORT_OLD = 'import { lstat, mkdir, rename, rm, writeFile } from "node:fs/promises";'
+      const IMPORT_NEW = 'import { lstat, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";'
+      const HELPER_OLD = '/**\n* Retry cadence for a contended lock.'
+      const HELPER_NEW = [
+        '/**',
+        '* dsh-mobile stale-lock recovery (F4): remove a writer lock whose recorded owner is gone.',
+        '* Returns whether the lock was removed; any unproven case leaves the lock untouched so the',
+        '* upstream wait-and-timeout semantics stay authoritative.',
+        '* @param lockPath - the `<file>.lock` sibling to inspect.',
+        '* @returns `true` when an orphaned lock was removed.',
+        '*/',
+        'async function recoverStaleLock(lockPath) {',
+        '\ttry {',
+        '\t\tconst owner = Number.parseInt((await readFile(lockPath, "utf8")).trim(), 10);',
+        '\t\tif (!Number.isInteger(owner) || owner <= 0) return false;',
+        '\t\tlet alive = true;',
+        '\t\ttry {',
+        '\t\t\tprocess.kill(owner, 0);',
+        '\t\t} catch (error) {',
+        '\t\t\talive = error?.code === "EPERM"; // EPERM: the process exists but is not ours',
+        '\t\t}',
+        '\t\tif (alive) return false;',
+        '\t\tconst confirmed = Number.parseInt((await readFile(lockPath, "utf8")).trim(), 10);',
+        '\t\tif (confirmed !== owner) return false; // a live contender re-took the lock meanwhile',
+        '\t\tawait rm(lockPath, { force: true });',
+        '\t\tconsole.warn(`atomic-write: removed the orphaned writer lock at ${lockPath} (owner pid ${owner} is gone; dsh-mobile F4)`);',
+        '\t\treturn true;',
+        '\t} catch {',
+        '\t\treturn false; // unreadable/unremovable lock: let the deadline decide, as upstream does',
+        '\t}',
+        '}',
+        '/**',
+        '* Retry cadence for a contended lock.',
+      ].join('\n')
+      const LOOP_OLD = '\tlet delay = LOCK_RETRY_INITIAL_MS;'
+      const LOOP_NEW = '\tlet delay = LOCK_RETRY_INITIAL_MS;\n\tlet recovered = false; // dsh-mobile F4: at most one orphan recovery per acquisition'
+      // 上游把 deadline 声明为 const（只读一次就够，因为从不延长）；回收后要重新给一点宽限，
+      // 故这里必须改成 let——功能测试实测：不改则 TypeError: Assignment to constant variable。
+      const DEADLINE_DECL_OLD = '\tconst deadline = Date.now() + (options?.waitMs ?? DEFAULT_LOCK_WAIT_MS);'
+      const DEADLINE_DECL_NEW = '\tlet deadline = Date.now() + (options?.waitMs ?? DEFAULT_LOCK_WAIT_MS); // dsh-mobile F4: extended once after an orphan recovery'
+      const DEADLINE_OLD = '\t\tif (Date.now() >= deadline) throw new Error(`atomic-write: timed out waiting for the writer lock at ${lockPath}`);'
+      const DEADLINE_NEW = [
+        '\t\tif (Date.now() >= deadline) {',
+        '\t\t\tif (!recovered && await recoverStaleLock(lockPath)) {',
+        '\t\t\t\trecovered = true;',
+        '\t\t\t\tdeadline = Date.now() + LOCK_RETRY_MAX_MS * 5;',
+        '\t\t\t\tcontinue;',
+        '\t\t\t}',
+        '\t\t\tthrow new Error(`atomic-write: timed out waiting for the writer lock at ${lockPath}`);',
+        '\t\t}',
+      ].join('\n')
+      for (const [old, label] of [[IMPORT_OLD, 'import 行'], [HELPER_OLD, 'LOCK_RETRY 常量注释'], [LOOP_OLD, 'delay 初始化'], [DEADLINE_DECL_OLD, 'deadline 声明'], [DEADLINE_OLD, '超时 throw']]) {
+        if (!s.includes(old)) throw new Error(`atomic-stale-lock 锚点未命中（${label}）——引擎升级后请人工核对 dsh-atomic-write/lib/index.js`)
+      }
+      s = s.replace(IMPORT_OLD, IMPORT_NEW)
+      s = s.replace(HELPER_OLD, HELPER_NEW)
+      s = s.replace(LOOP_OLD, LOOP_NEW)
+      s = s.replace(DEADLINE_DECL_OLD, DEADLINE_DECL_NEW)
+      s = s.replace(DEADLINE_OLD, DEADLINE_NEW)
+      if (!s.includes('dsh-mobile stale-lock recovery (F4)')) throw new Error('atomic-stale-lock 复核失败——不写回')
+      return s
+    },
+  },
+
+  // ── attach-durable-F2：附件持久化祖先 fsync 的 Android 守卫（2026-09-10 实测，scope=engine）──
+  // 根因：attachment-local 的 ensureDurableDirectory 从 DSH_HOME 一路 fsync 到文件系统根
+  // （boundary = parse(home).root），而 Android 应用私有路径的祖先 /data/user/0 对应用不可读
+  // → open('/data/user/0') EACCES → 任何图片上传（session/prompt 的 image 内容）在准入阶段抛错，
+  // api-proxy 兜底映射为 session/agent-busy（details.reason=EACCES open '/data/user/0'）；
+  // 同一根因也是 read_image 读任何路径都报同一 EACCES 的原因（附件提交在读取之后）。
+  // 不变量：打不开的祖先不再致命——上层目录由平台负责持久化。
+  'attach-durable-F2': {
+    file: 'usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-attachment-local/lib/index.js',
+    scope: 'engine',
+    check: (s) => s.includes('dsh-mobile durable-walk guard'),
+    apply: (s) => {
+      if (s.includes('dsh-mobile durable-walk guard')) return s
+      const OLD = 'const parent = dirname(level);\n\t\tawait syncDirectory(parent);'
+      const NEW = [
+        'const parent = dirname(level);',
+        '\t\ttry { await syncDirectory(parent); } catch (error) {',
+        '\t\t\t// dsh-mobile durable-walk guard: Android app-private ancestors (/data/user/0) are not readable by the app.',
+        "\t\t\tif (error && (error.code === 'EACCES' || error.code === 'EPERM')) return;",
+        '\t\t\tthrow error;',
+        '\t\t}',
+      ].join('\n')
+      if (!s.includes(OLD)) {
+        throw new Error('attach-durable 锚点未命中：syncDirectory(parent) 循环——引擎升级后请人工核对 ensureDurableDirectory')
+      }
+      s = s.replace(OLD, NEW)
+      if (!s.includes('dsh-mobile durable-walk guard')) throw new Error('attach-durable 复核失败——不写回')
+      return s
+    },
+  },
+
+  // ── boot-pending-G1：web boot 容错（0.13.5 W1b，引擎树补丁 scope=engine）──
+  // issue #126 P3：第三方插件声明 inject 了 client-only 服务（uiConversation 只存在于
+  // dsh-client-ui-*/lib/client.js），宿主永远不 provide → fiber 永久 pending →
+  // assertEntriesActivated 抛错 → 整树 boot 失败、用户看到「Failed to load plugins」。
+  // 不变量：非官方包的 pending 降级为告警（等不到的服务不会因等待而出现），
+  // FAILED 与官方包（@deepseek-ai/*）pending 仍然致命——核心 bundle 坏掉必须响亮失败。
+  'boot-pending-G1': {
+    file: 'usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-app-boot/lib/index.js',
+    scope: 'engine',
+    check: (s) => s.includes('dsh-mobile boot tolerance (G1)'),
+    apply: (s) => {
+      const DECL_OLD = '\tconst failures = [];'
+      const DECL_NEW = '\tconst failures = [];\n'
+        + '\t// dsh-mobile boot tolerance (G1): entries that stay pending are collected here\n'
+        + '\t// instead of failing the boot, unless they are official packages.\n'
+        + '\tconst deferred = [];'
+      const PENDING_OLD = '\t\t\tfailures.push(`${entry.options.name}: pending (waiting for ${subject}: ${missing.join(", ") || "unknown"})`);'
+      const PENDING_NEW = '\t\t\tconst pendingLine = `${entry.options.name}: pending (waiting for ${subject}: ${missing.join(", ") || "unknown"})`;\n'
+        + '\t\t\t// dsh-mobile boot tolerance (G1): a missing service a third-party entry waits for\n'
+        + '\t\t\t// never appears on the host, so waiting cannot succeed; keep it pending and boot on.\n'
+        + '\t\t\tif (String(entry.options.name ?? "").startsWith("@deepseek-ai/")) failures.push(pendingLine);\n'
+        + '\t\t\telse deferred.push(pendingLine);'
+      const THROW_OLD = '\tif (failures.length > 0) {'
+      const THROW_NEW = '\tif (deferred.length > 0) {\n'
+        + '\t\tconst deferredNoun = deferred.length === 1 ? "entry" : "entries";\n'
+        + '\t\tconsole.warn(`${binName}: ${String(deferred.length)} ${deferredNoun} did not activate and stays pending; boot continues (dsh-mobile boot tolerance (G1))\\n${deferred.join("\\n")}`);\n'
+        + '\t}\n'
+        + '\tif (failures.length > 0) {'
       const REPL = [
-        // F1-a：路由整体不在目录（defaults.size === 0）时的 override → 跳过该条
-        {
-          old: 'if (defaults.size === 0) invalid(provider, `sets modelOverrides for "${id}", but the installed catalog does not describe this route; a declared route spells every model out in its models list`);',
-          neu: 'if (defaults.size === 0) { console.warn(`llm-pi-ai: provider "${provider}" sets modelOverrides for "${id}", but the installed catalog does not describe this route; override skipped (dsh-mobile drift guard)`); continue; }',
-        },
-        // F1-b：override 引用目录中不存在的模型 id → 跳过该条（路由保留目录默认模型）
-        {
-          old: 'if (!defaults.has(id)) invalid(provider, `modelOverrides names "${id}", which the installed catalog does not describe`);',
-          neu: 'if (!defaults.has(id)) { console.warn(`llm-pi-ai: provider "${provider}" modelOverrides names "${id}", which the installed catalog does not describe; override skipped (dsh-mobile drift guard)`); continue; }',
-        },
-        // F1-c：路由零模型 → 告警 + skipped 标记返回（不再 throw）
-        {
-          old: 'if (entries.length === 0) invalid(provider, "resolves no models; the installed catalog does not describe this route, so its models must be listed in configuration");',
-          neu: 'if (entries.length === 0) { console.warn("llm-pi-ai: provider \\"" + provider + "\\" resolves no models; the installed catalog does not describe this route, so its models must be listed in configuration; route skipped (dsh-mobile drift guard)"); return { models: [], configuredMaxTokens: /* @__PURE__ */ new Map(), skipped: true }; }',
-        },
-        // F1-d：调用方（resolveProfiles）消费 skipped 标记 → 跳过该 provider，其余路由照常
-        {
-          old: 'const { apiKeyEnv, retryPolicy, models: _models, displayName: _displayName, ...rest } = source;',
-          neu: 'if (catalog.skipped) continue;\n\t\tconst { apiKeyEnv, retryPolicy, models: _models, displayName: _displayName, ...rest } = source;',
-        },
+        { old: DECL_OLD, neu: DECL_NEW },
+        { old: PENDING_OLD, neu: PENDING_NEW },
+        { old: THROW_OLD, neu: THROW_NEW },
       ]
       let changed = 0
       for (const { old, neu } of REPL) {
-        if (s.includes(neu)) continue // 幂等（重复施加无害）
-        if (!s.includes(old)) throw new Error('pi-drift 锚点未命中：' + old.slice(0, 80) + '…——引擎升级后请人工核对 resolveRouteModels')
+        if (s.includes(neu)) continue
+        if (!s.includes(old)) throw new Error('boot-pending 锚点未命中：' + old.slice(0, 90) + '…——引擎升级后请人工核对 assertEntriesActivated')
         s = s.replace(old, neu)
         changed++
       }
-      const ok = ['override skipped (dsh-mobile drift guard)', 'route skipped (dsh-mobile drift guard)', 'if (catalog.skipped) continue;'].every((m) => s.includes(m))
-      if (!ok) throw new Error('pi-drift 复核失败——不写回')
-      console.log(`  pi-drift-F1: ${changed} 处锚点替换`)
+      if (!s.includes('dsh-mobile boot tolerance (G1)') || !s.includes('const deferred = [];')) {
+        throw new Error('boot-pending 复核失败——不写回')
+      }
+      console.log(`  boot-pending-G1: ${changed} 处锚点替换`)
+      return s
+    },
+  },
+
+  // ── pi-toolcall-G2：流式 tool_call 空名止血（0.13.5 W2，引擎树补丁 scope=engine）──
+  // issue #124：两条独立路径都实测复现（.deploy-tmp/0135/repro-124*.mjs）——
+  //  A 累加器：续块缺 index 且缺 id 时新建块 → 一次调用裂成两个，第二个 name/id 为空；
+  //  B 出口：convertMessages 不做空名过滤 → 损坏历史被原样回放，网关 400
+  //    「invalid tool_call: function/name/arguments cannot be empty」。
+  // 修复必须同时覆盖：只堵 A 则已损坏会话仍 400，只堵 B 则新损坏继续产生。
+  'pi-toolcall-G2': {
+    file: 'usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@earendil-works/pi-ai/dist/api/openai-completions.js',
+    scope: 'engine',
+    check: (s) => s.includes('dsh-mobile tool_call guard (G2)') && s.includes('dsh-mobile continuation guard (G2)'),
+    apply: (s) => {
+      const DECL_OLD = '    const params = [];\n    const normalizeToolCallId = (id) => {'
+      const DECL_NEW = '    const params = [];\n'
+        + '    // dsh-mobile tool_call guard (G2): ids of tool calls dropped from this request.\n'
+        + '    const droppedToolCallIds = new Set();\n'
+        + '    const normalizeToolCallId = (id) => {'
+      const MAP_OLD = [
+        '            if (toolCalls.length > 0) {',
+        '                assistantMsg.tool_calls = toolCalls.map((tc) => {',
+        '                    const customInputProperty = options?.grammarToolInputProperties?.get(tc.name);',
+        '                    if (customInputProperty !== undefined) {',
+        '                        return {',
+        '                            id: tc.id,',
+        '                            type: "custom",',
+        '                            custom: {',
+        '                                name: tc.name,',
+        '                                input: sanitizeSurrogates(getGrammarToolInput(tc.name, tc.arguments, customInputProperty)),',
+        '                            },',
+        '                        };',
+        '                    }',
+        '                    return {',
+        '                        id: tc.id,',
+        '                        type: "function",',
+        '                        function: {',
+        '                            name: tc.name,',
+        '                            arguments: JSON.stringify(tc.arguments),',
+        '                        },',
+        '                    };',
+        '                });',
+        '            }',
+      ].join('\n')
+      const MAP_NEW = [
+        '            if (toolCalls.length > 0) {',
+        '                // dsh-mobile tool_call guard (G2): a tool call with no name cannot be replayed —',
+        '                // OpenAI-compatible gateways reject the whole request. Drop it (and its tool',
+        '                // result below) so one corrupted history entry cannot poison every later turn.',
+        '                const replayableToolCalls = toolCalls.filter((tc) => {',
+        '                    if (typeof tc.name === "string" && tc.name.trim().length > 0)',
+        '                        return true;',
+        '                    if (tc.id)',
+        '                        droppedToolCallIds.add(tc.id);',
+        '                    return false;',
+        '                });',
+        '                if (replayableToolCalls.length > 0) {',
+        '                    assistantMsg.tool_calls = replayableToolCalls.map((tc) => {',
+        '                        const customInputProperty = options?.grammarToolInputProperties?.get(tc.name);',
+        '                        if (customInputProperty !== undefined) {',
+        '                            return {',
+        '                                id: tc.id,',
+        '                                type: "custom",',
+        '                                custom: {',
+        '                                    name: tc.name,',
+        '                                    input: sanitizeSurrogates(getGrammarToolInput(tc.name, tc.arguments, customInputProperty)),',
+        '                                },',
+        '                            };',
+        '                        }',
+        '                        const serializedArguments = JSON.stringify(tc.arguments ?? {});',
+        '                        return {',
+        '                            id: tc.id,',
+        '                            type: "function",',
+        '                            function: {',
+        '                                name: tc.name,',
+        '                                arguments: typeof serializedArguments === "string" && serializedArguments.length > 0 ? serializedArguments : "{}",',
+        '                            },',
+        '                        };',
+        '                    });',
+        '                }',
+        '            }',
+      ].join('\n')
+      const RESULT_OLD = [
+        '                const toolResultMsg = {',
+        '                    role: "tool",',
+        '                    content: sanitizeSurrogates(toolResultText),',
+        '                    tool_call_id: toolMsg.toolCallId,',
+        '                };',
+      ].join('\n')
+      const RESULT_NEW = '                if (toolMsg.toolCallId && droppedToolCallIds.has(toolMsg.toolCallId))\n'
+        + '                    continue; // dsh-mobile tool_call guard (G2): its tool call was dropped\n'
+        + RESULT_OLD
+      const ACC_OLD = [
+        '                let block = streamIndex !== undefined ? toolCallBlocksByIndex.get(streamIndex) : undefined;',
+        '                if (!block && toolCall.id) {',
+        '                    block = toolCallBlocksById.get(toolCall.id);',
+        '                }',
+      ].join('\n')
+      const ACC_NEW = ACC_OLD + '\n'
+        + '                if (!block && streamIndex === undefined && !toolCall.id && (toolCall.function?.name ?? toolCall.custom?.name ?? "").length === 0) {\n'
+        + '                    // dsh-mobile continuation guard (G2): a continuation chunk that omits both\n'
+        + '                    // index and id must extend the single open tool call, never start a nameless one.\n'
+        + '                    const openToolCalls = blocks.filter((entry) => entry.type === "toolCall");\n'
+        + '                    if (openToolCalls.length === 1)\n'
+        + '                        block = openToolCalls[0];\n'
+        + '                }'
+      const REPL = [
+        { old: DECL_OLD, neu: DECL_NEW },
+        { old: MAP_OLD, neu: MAP_NEW },
+        { old: RESULT_OLD, neu: RESULT_NEW },
+        { old: ACC_OLD, neu: ACC_NEW },
+      ]
+      let changed = 0
+      for (const { old, neu } of REPL) {
+        if (s.includes(neu)) continue
+        if (!s.includes(old)) throw new Error('pi-toolcall 锚点未命中：' + old.slice(0, 90).replace(/\n/g, '\\n') + '…——引擎升级后请人工核对 convertMessages / ensureToolCallBlock')
+        s = s.replace(old, neu)
+        changed++
+      }
+      if (!s.includes('dsh-mobile tool_call guard (G2)') || !s.includes('dsh-mobile continuation guard (G2)')) {
+        throw new Error('pi-toolcall 复核失败——不写回')
+      }
+      console.log(`  pi-toolcall-G2: ${changed} 处锚点替换`)
       return s
     },
   },

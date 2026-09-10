@@ -2,7 +2,9 @@
 // pi-catalog-diff.mjs — pi-ai 模型目录 diff（0.13.3 W1/P2，交接文档）
 // 用途：引擎升级 pin 变更时例行执行，输出两个版本 dist/providers/data/*.json 的
 // 模型 id 删除/新增清单进构建日志与回归报告（信息性输出，不拒绝构建——模型增删是
-// 上游常态，删除项由 W4 降级补丁兜底不死整包）。
+// 上游常态，删除项由上游 0.1.5 的 strict/deferred 校验兜底不死整包——
+// 写严格、读宽容：未知 modelOverrides id 记入 modelErrors 诊断而不抛错，非严格路径下
+// 目录错误只跳过该 provider。0.13.7 追上游时 pi-drift-F1 降级补丁已因此退役）。
 //
 // 用法：
 //   node scripts/pi-catalog-diff.mjs --from 0.84.2 --to 0.85.1 [--out <报告文件>] [--package @earendil-works/pi-ai]
@@ -108,7 +110,7 @@ const summary = `pi-ai 目录 diff ${PKG} ${FROM} -> ${TO}：删除 ${delTotal} 
 console.log('==== ' + summary + ' ====')
 if (lines.length) console.log(lines.join('\n'))
 else console.log('（两版目录模型 id 集合一致）')
-if (delTotal > 0) console.log('注意：删除模型若被 modelOverrides/显式列表引用，W4 降级补丁保证「该模型缺席、其余路由存活」而非整包拒绝。')
+if (delTotal > 0) console.log('注意：删除模型若被 modelOverrides/显式列表引用，由上游 strict/deferred 校验保证「该模型缺席、其余路由存活」而非整包拒绝（dsh-llm-pi-ai 0.1.5 原生；原 pi-drift-F1 补丁已退役）。')
 if (OUT) {
   mkdirSync(dirname(OUT), { recursive: true })
   writeFileSync(OUT, `# pi-ai 目录 diff（${FROM} -> ${TO}）\n\n${summary}\n\n${lines.join('\n') || '（无差异）'}\n`)

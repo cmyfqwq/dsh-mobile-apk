@@ -239,7 +239,7 @@ object FileIncoming {
         android.util.Log.w("dsh-image", "openNativePath: not exists: $path")
         return false
       }
-      if (!isReaderAllowedPath(activity, file)) {
+      if (!isReaderAllowed(activity, file)) {
         android.util.Log.w("dsh-image", "openNativePath rejected (outside reader whitelist): $path")
         return false
       }
@@ -258,8 +258,9 @@ object FileIncoming {
     }
   }
 
-  /** 外部阅读器白名单（与 res/xml/file_paths.xml 映射面一致；canonical 比较防 symlink/.. 逃逸）。 */
-  private fun isReaderAllowedPath(activity: MainActivity, file: java.io.File): Boolean {
+  /** 外部阅读器白名单（与 res/xml/file_paths.xml 映射面一致；canonical 比较防 symlink/.. 逃逸）。
+   *  0.13.7：PathOpen（系统选择器）复用同一道门——两处出口同一份允许面。 */
+  internal fun isReaderAllowed(activity: MainActivity, file: java.io.File): Boolean {
     return try {
       val canon = file.canonicalPath
       val roots = listOf(

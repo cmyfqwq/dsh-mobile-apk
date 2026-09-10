@@ -19,31 +19,23 @@ MIT）。来源为 npm 发布的 `dshmarketplace-plugin-0.1.5.tgz`（解包即�
 
 上游 0.1.6 尚未发布修复，故 0.13.0 快照 vendored 本修复版本。
 
-## 与上游的差异（唯一一处）
+## 与上游的差异（由 scripts/patch-marketplace.mjs 幂等施加，构建门禁自动执行）
 
-`lib/index.js` 中 `tt()`（pre-execute listener）：
-
-| 行（minified 单行内） | 上游 0.1.5 | 本副本 |
+| 补丁 | 面 | 内容 |
 | --- | --- | --- |
-| 签名 | `async t=>{` | `async (t,n)=>{` |
-| 非安装调用 | `return;` | `return n();` |
-| fullName 为空 | `return;` | `return n();` |
-| 安装完成尾部 | （无） | `});return n()` 追加 |
+| A（0.13.0） | `lib/index.js` | pre-execute listener 补 `next()`（上述崩溃修复） |
+| B（0.13.1） | `lib/index.js` | 安装 runner execPath 安全化（linker64 回退污染 process.execPath → bad ELF magic；改 `TERMUX__PREFIX/bin/node`） |
+| C（0.13.1） | `lib/client.js` | 不可安装条目（NO_COMMAND/需凭据/仅桌面）安装钮置灰 + title 说明 |
+| D（0.13.2 W1） | `lib/index.js` + `lib/client.js` | **移动兼容性徽章 + mobile: 前缀过滤**：搜索响应逐条富化 `compat`/`compatNote`（内嵌兼容性 map，按 fullName 末段匹配；未登记=unknown）；`q` 以 `mobile:` 开头时滤除 desktop 条目；卡片 meta 行加徽章（移动可用/仅桌面/原生?/未验证），搜索框旁「仅移动端可用」复选框把前缀并入搜索词。工具面 schema（B 的 additionalProperties:false）不动——富化仅发生在 webServer 响应层 |
 
-其余文件（`lib/client.js`、`package.json`、`cordis.patch.yml`、
-`skills/dsh-plugin-store/SKILL.md`、README/LICENSE）与 0.1.5 逐字节一致。
+其余文件（`lib/client.js` 无 D 前形态、`package.json`、`cordis.patch.yml`、
+`skills/dsh-plugin-store/SKILL.md`、README/LICENSE）与 0.1.5 逐字节一致（除上表补丁外）。
 校验方式：
 
 ```powershell
-node scripts/patch-marketplace.mjs vendor/dshmarketplace-plugin/lib/index.js
-# 输出 "already fixed (3/3 return n() 路径在场)——跳过" 且退出码 0 即为修复版
+node scripts/patch-marketplace.mjs vendor/dshmarketplace-plugin/lib
+# 输出 "patch-marketplace: ALL OK" 且退出码 0 即为全部补丁在场
 ```
 
-## 重新 vendor（上游出新版时）
-
-1. 下载新 tgz：`npm pack dshmarketplace-plugin@<ver> --pack-destination .deploy-tmp/`
-2. 解包到临时目录，比对修复：先 `node scripts/patch-marketplace.mjs <new>/lib/index.js`
-   （上游若已修则直接输出 already fixed）；若未修则本脚本会就地打补丁并退出 0。
-3. 覆盖本目录文件（保留本文件），更新版本号与差异表。
-4. 回归：注入链测试（`verify-013.sh` 或设备端 `/api/undo/status` + 工具调用冒烟，
-   见 `docs/review-0.13.0-20260823.md`）。
+兼容性 map 数据源：dshmarketplace.dev 目录（6108 条目）+ 已知事实分类；D 补丁为幂等
+施加（map 变更随时同步回已修补文件）。
