@@ -299,11 +299,12 @@ internal class DirectoryPickerController(private val activity: MainActivity) {
 }
 
 /**
- * 系统文件/图片选择控制器（自 MainActivity 拆出）：
+ * 系统文件选择控制器（自 MainActivity 拆出）：
  * - <input type=file> 上传（onShowFileChooser → 文档/相册选择器）
- * - bridge 图片选择（原生读图 → base64 data URL → window.__dshBridge.onImagePicked；
- *   华为 WebView Chromium 114 的 onShowFileChooser 收 content:// 不触发 input change，
- *   改由原生层读字节直接回传 JS）
+ *
+ * 2026-09-10（追上游 0.1.5）：上游自带附件入口（回形针 → 系统文件选择器 → 官方
+ * 上传接口），我们注入的「上传图片」菜单项与其 bridge 图片回传链（onImagePicked）
+ * 一并退役；accept 为 image 类型时的相册分支仍在（上游若有图片专用入口就靠它）。
  */
 internal class MediaPickController(private val activity: MainActivity) {
 
@@ -331,46 +332,6 @@ internal class MediaPickController(private val activity: MainActivity) {
       }
     }
 
-  /** bridge 图片选择：原生读图 → base64 data URL → window.__dshBridge.onImagePicked。
-   *  华为 WebView（Chromium 114）的 onShowFileChooser 收到 content:// Uri 后不触发
-   *  input change，改由原生层读字节直接回传 JS，彻底绕开 WebView 文件选择器。 */
-  private var pendingImagePickCallback: String? = null
-
-  private val imagePickerBridge =
-    activity.registerForActivityResult(PickImageContract()) { uri ->
-      val callbackId = pendingImagePickCallback
-      pendingImagePickCallback = null
-      Log.i("dsh-image", "bridge pick result: callbackId=" + callbackId + " uri=" + uri)
-      if (callbackId == null) return@registerForActivityResult
-      if (uri == null) {
-        activity.webView.evaluateJavascript(
-          "window.__dshBridge?.onImagePicked?.(" + jsString(callbackId) + ", null)", null,
-        )
-        return@registerForActivityResult
-      }
-      try {
-        val mediaType = activity.contentResolver.getType(uri) ?: "image/jpeg"
-        val bytes = activity.contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: byteArrayOf()
-        Log.i("dsh-image", "read bytes=" + bytes.size + " type=" + mediaType)
-        val b64 = android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)
-        val dataUrl = "data:$mediaType;base64,$b64"
-        val name = queryImageName(uri) ?: "image"
-        val json = "{\"dataUrl\":" + jsString(dataUrl) +
-          ",\"mediaType\":" + jsString(mediaType) +
-          ",\"name\":" + jsString(name) +
-          ",\"size\":" + bytes.size + "}"
-        Log.i("dsh-image", "json length=" + json.length)
-        activity.webView.evaluateJavascript(
-          "window.__dshBridge?.onImagePicked?.(" + jsString(callbackId) + ", " + json + ")",
-        ) { value -> Log.i("dsh-image", "js result: " + value) }
-      } catch (e: Exception) {
-        Log.e("dsh-image", "read failed", e)
-        activity.webView.evaluateJavascript(
-          "window.__dshBridge?.onImagePicked?.(" + jsString(callbackId) + ", null)", null,
-        )
-      }
-    }
-
   /** WebView onShowFileChooser 委托（自 MainActivity.configureWebView 迁入）。 */
   fun handleFileChooser(callback: ValueCallback<Array<Uri>>, params: WebChromeClient.FileChooserParams): Boolean {
     // 文件上传走系统文件选择器；directoryPicker 是目录选择（工作区用），两者分离。
@@ -387,18 +348,7 @@ internal class MediaPickController(private val activity: MainActivity) {
     return true
   }
 
-  fun pickImageForBridge(callbackId: String) {
-    if (pendingImagePickCallback != null) {
-      activity.webView.evaluateJavascript(
-        "window.__dshBridge?.onImagePicked?.(" + jsString(callbackId) + ", null)", null,
-      )
-      return
-    }
-    pendingImagePickCallback = callbackId
-    imagePickerBridge.launch(Unit)
-  }
-
-  /** 从 content Uri 读取显示名（MediaStore DISPLAY_NAME）。 */
+  /** 从 content Uri 读取显示名（MediaStore DISPLAY_NAME）；读不到时调用方回退路径尾段。 */
   private fun queryImageName(uri: Uri): String? {
     return try {
       activity.contentResolver.query(uri, arrayOf(MediaStore.MediaColumns.DISPLAY_NAME), null, null, null)

@@ -44,3 +44,12 @@ node scripts/patches/apply-patches.mjs vendor --list
 ## 历史
 
 - 2026-09-05 Phase 2a：统合 patch-marketplace.mjs（A/B/C/D）+ patch-undo-mobile.mjs（E1-E7）为本模块，旧脚本删除；双仓 scripts 同版（雷点 10）。
+## 2026-09-10 追上游 0.1.5-rc.1 的补丁增减
+
+- **退役 pi-drift-F1**：上游 0.1.5 的 dsh-llm-pi-ai 原生实现了同类容错——
+  resolveRouteModels(request, validation) 与 resolveProfiles(providers, validation) 增加
+  strict/deferred 双模（写严格、读宽容）：未知 modelOverrides id 记入 modelErrors 诊断而不抛错，
+  非严格路径下 PiAiCatalogError 被捕获后只跳过该 provider（0.1.5 lib/index.js:633/646/1051/1086-1099）。
+  F1 的三处 invalid() 降级与 skipped 标记失去了锚点，也不应再用补丁覆盖上游的原生行为。
+- **保留并已对齐 0.1.5 锚点**：attach-durable-F2（祖先 fsync 守卫）、boot-pending-G1（3 处）、
+  pi-toolcall-G2（4 处）——均在 0.1.5-rc.1 产物上验证命中。

@@ -16,13 +16,11 @@ class AndroidBridge(
   private val onKeepScreen: (enable: Boolean) -> Unit,
   private val onNotify: (title: String, text: String) -> Unit,
   private val onAllFilesAccessRequest: () -> Unit = {},
-  private val onDebugLogsRequest: () -> Unit = {},
   /** 0.13.1 W4：配置导出（私有 settings.yaml -> 共享 exports/config/）。返回 JSON {ok, path?, error?}。 */
   private val onExportConfig: () -> String = { """{"ok":false,"error":"bridge not wired"}""" },
   /** 0.13.1 W4：配置导入（共享 exports/config/settings.yaml -> 私有 DSH_HOME）。返回 JSON 同上。 */
   private val onImportConfig: () -> String = { """{"ok":false,"error":"bridge not wired"}""" },
   private val onGetSystemDark: () -> Boolean = { false },
-  private val onPickImageRequest: (callbackId: String) -> Unit = {},
   /** 0.13.3 W10：@文件引用路径选择（SAF 文档 → primary 真实路径 → 页面插 mention）。 */
   private val onPickFilePathRequest: (callbackId: String) -> Unit = {},
   private val onSetImmersiveRequest: (enable: Boolean) -> Unit = {},
@@ -35,6 +33,9 @@ class AndroidBridge(
   private val onGetDevLogEnabled: () -> Boolean = { false },
   private val onSetDevLogEnabled: (Boolean) -> Unit = {},
   private val onOpenNativePath: (path: String) -> Boolean = { false },
+  /** 0.13.7：系统「打开方式」选择器（MT 管理器 / 系统文件管理…）。返回 JSON {ok, reason?}。 */
+  private val onOpenPathChooser: (path: String, mode: String?) -> String =
+    { _, _ -> """{"ok":false,"reason":"bridge not wired"}""" },
   /** 0.13.0 F1.7：ADB shell 执行原语（授权时执行；未授权失败关闭返回引导 JSON）。 */
   private val onAdbShell: (cmd: String) -> String = { _ -> "" },
   /** 0.13.0 F1.7：授权状态 JSON（三道人门状态视图，供设置页/授权状态探活）。 */
@@ -90,11 +91,6 @@ class AndroidBridge(
     onPickRequest(callbackId)
   }
 
-  @JavascriptInterface
-  fun pickImage(callbackId: String) {
-    onPickImageRequest(callbackId)
-  }
-
   /** 0.13.3 W10：@文件引用路径选择（SAF 文档选择器 → primary 真实路径 → onFilePicked 回调）。 */
   @JavascriptInterface
   fun pickFilePath(callbackId: String) {
@@ -115,12 +111,6 @@ class AndroidBridge(
   @JavascriptInterface
   fun copyText(text: String): Boolean = onCopyTextRequest(text)
 
-  /** Debug log export: engine logs + environment info zipped (same download/dialog path as session export). */
-  @JavascriptInterface
-  fun downloadDebugLogs() {
-    onDebugLogsRequest()
-  }
-
   /**
    * 0.13.1 W4：配置导出（私有 settings.yaml -> Documents/dshdata/exports/config/settings.yaml）。
    * 引擎 DSH_HOME 在私有域（外部改共享目录副本无效），本桥是安全的手改通道：
@@ -140,6 +130,10 @@ class AndroidBridge(
     if (android.os.Build.VERSION.SDK_INT < 30) return false
     return android.os.Environment.isExternalStorageManager()
   }
+
+  /** 0.13.7：把路径交给系统选择器（MT 管理器 / 系统文件管理…；返回 JSON {ok, reason?}）。 */
+  @JavascriptInterface
+  fun openPathChooser(path: String, mode: String?): String = onOpenPathChooser(path, mode)
 
   /** Open the system screen granting All Files Access (special permission). */
   @JavascriptInterface

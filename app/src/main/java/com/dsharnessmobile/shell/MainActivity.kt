@@ -40,7 +40,7 @@ import kotlin.math.ceil
  *
  * 职责收窄（拆分重构）：本类只保留 WebView 宿主/生命周期/桥接线/insets 核心；
  * 引导页渲染→GuidePageRenderer、启动流/监控→EngineStartFlow、下载落盘→DownloadSaver、
- * 配置导入导出→ConfigTransfer、调试日志→DebugLogExporter、来件接线→FileIncoming、
+ * 配置导入导出/文件选择→ConfigTransfer、路径打开→PathOpen、来件接线→FileIncoming、
  * 文件选择/SAF→DirectoryPickerController/MediaPickController、窗口 UI chrome→WebUiChrome。
  */
 class MainActivity : ComponentActivity() {
@@ -70,9 +70,6 @@ class MainActivity : ComponentActivity() {
   internal val engineFlow by lazy { EngineStartFlow(this) }
   internal val engineManager by lazy { EngineManager(this, pickToken) }
   private val downloadSaver by lazy { DownloadSaver(this, engineManager.dshDataDir) }
-  private val debugLogExporter by lazy {
-    DebugLogExporter(this, engineManager.dshDataDir, engineManager.homeDir, downloadSaver)
-  }
   // 文件选择/SAF 与媒体选择控制器：字段初始化即注册 ActivityResult（必须在 STARTED 前；
   // 与拆分前 MainActivity 字段初始化时序一致）。
   internal val dirPickerController = DirectoryPickerController(this)
@@ -436,7 +433,7 @@ class MainActivity : ComponentActivity() {
         onKeepScreen = { enable -> keepScreenOn(enable) },
         onNotify = { title, text -> NotifyCenter.notify(this, "task", title, text) },
         onAllFilesAccessRequest = { dirPickerController.openAllFilesAccessSettings() },
-        onDebugLogsRequest = { debugLogExporter.downloadDebugLogs() },
+
         onExportConfig = { ConfigTransfer(engineManager.homeDir, engineManager.dshDataDir).exportToShared() },
         onImportConfig = { ConfigTransfer(engineManager.homeDir, engineManager.dshDataDir).importFromShared() },
         onGetSystemDark = {
@@ -444,7 +441,6 @@ class MainActivity : ComponentActivity() {
             android.content.res.Configuration.UI_MODE_NIGHT_MASK) ==
             android.content.res.Configuration.UI_MODE_NIGHT_YES
         },
-        onPickImageRequest = { callbackId -> mediaPickerController.pickImageForBridge(callbackId) },
         onPickFilePathRequest = { callbackId -> mediaPickerController.pickFilePathForBridge(callbackId) },
         onSetImmersiveRequest = { enable -> setImmersivePersisted(enable) },
         onCopyTextRequest = { text -> copyTextNative(text) },
@@ -473,6 +469,8 @@ class MainActivity : ComponentActivity() {
           }
         },
         onOpenNativePath = { path -> FileIncoming.openWithExternalReader(this, path) },
+        // 0.13.7：上游 0.1.5「在外部应用打开」的 Android 落点——系统选择器（MT 管理器 / 系统文件管理）。
+        onOpenPathChooser = { path, mode -> PathOpen.openChooser(this, path, mode) },
         onAdbShell = { cmd -> AdbState.adbShellExecute(this, engineManager, cmd) },
         // F1 预热钩子：设置页每 3s 轮询此桥，服务掉线后 60s 节流内自动补热（prewarmDue 纯读，线程仅在到期时创建）。
         onGetAdbState = {
