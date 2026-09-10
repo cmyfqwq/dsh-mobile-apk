@@ -1077,6 +1077,11 @@ class EngineManager(private val context: Context, private val pickToken: String?
       "TERMUX_APP__DATA_DIR" to context.filesDir.parentFile.absolutePath,
       "TERMUX_APP__LEGACY_DATA_DIR" to "/data/data/com.dsharnessmobile.shell",
       "TERMUX_VERSION" to BuildConfig.TERMUX_VERSION,
+      // 版本口径单一来源（2026-09-10 用户定例）：壳侧 UI/桥/诊断都读 BuildConfig.VERSION_NAME，
+      // 引擎侧插件（如 android-linux-env 导出的环境配方）一律读这两个环境变量，
+      // 不许再出现「界面显示 0.13.x 而插件里写 0.13.0」这类内部口径分裂。
+      "DSH_APP_VERSION" to BuildConfig.VERSION_NAME,
+      "DSH_APP_VERSION_CODE" to BuildConfig.VERSION_CODE.toString(),
       // Directory-picker endpoint auth token (validated by the web-compat plugin via x-dsh-pick-token).
       "DSH_PICK_TOKEN" to (pickToken ?: ""),
       // ADB 授权状态（0.13.0 F1.7）：dsh-android-bridge 插件据此失败关闭；门控=完全访问档位+开关+配对。

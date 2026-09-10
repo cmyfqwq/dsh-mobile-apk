@@ -286,6 +286,21 @@ for (const entry of OVERLAY.keepUnpublished ?? []) {
     }
   }
   log(`引擎树补丁就位（${enginePatches.length} 项 marker 在场）`)
+  // 行为回归（0.13.7）：G1/G2 这类补丁光有 marker 不足以证明「改完还能跑」——marker 只证文本被替换。
+  // 两个测试直接驱动刚打过补丁的产物（不联网、不花额度），缺目标文件时自行 skip（裸 clone 正常）。
+  for (const [label, script, flag, target] of [
+    ['boot-pending-G1', 'boot-pending.test.mjs', '--boot', join(stageRoot, 'usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-app-boot/lib/index.js')],
+    ['pi-toolcall-G2', 'pi-toolcall.test.mjs', '--pi-ai', join(stageRoot, 'usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@earendil-works/pi-ai/dist/api/openai-completions.js')],
+  ]) {
+    const out = execSync(`node "${join(ROOT, 'scripts', 'tests', script)}" ${flag} "${target}"`, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+    const pass = /(?:^|\n)ℹ pass (\d+)/.exec(out)?.[1] ?? '0'
+    const fail = /(?:^|\n)ℹ fail (\d+)/.exec(out)?.[1] ?? '0'
+    if (Number(fail) > 0 || out.includes('[skip]')) {
+      console.error(`[引擎树补丁行为回归失败] ${label}: pass=${pass} fail=${fail}${out.includes('[skip]') ? '（目标文件不在场）' : ''}`)
+      process.exit(1)
+    }
+    log(`引擎树补丁行为回归 ${label}: pass=${pass} fail=${fail}`)
+  }
 }
 
 // ── 0g. 能力发现目录快照（0.13.5 W3）：从 stage 引擎树生成 dsh-model-capability 的厂商目录索引 ──
