@@ -48,6 +48,7 @@
 |---|---|
 | v1→v2 asset 更新被跳过 | 固定 marker 字符串在目标文件更新后仍命中 → 新 asset 永不落盘；改为内容指纹判定（:404-405、:432-434） |
 | 2026-08-23 前端审核 CRITICAL#4 | 引擎升级换 bundle hash → patched 模板旧引用 404 白屏；加 hashAdaptive（:435-438、:471-490） |
+| 2026-09-11 旧会话迁移 EACCES（issue #154） | asset 只覆盖 `materialize` 的 `link(tmp, finalPath)`，漏了 `publishCurrentExclusive` 的 `link(staged, currentPath)`；0.13.7 格式升 v3 后旧会话首次打开必经迁移发布 → 全部旧会话 EACCES 打不开。教训：**link(2) 回退要按调用点逐一清点**，不能只补历史锚点 |
 | v0.12.4（rc8）迁移批 | onImagePicked/describeImage/bundle-hardening/textzoom 四补丁删除（上游 rc.8 原生覆盖 + textzoom 功能取消）；textzoom 桥方法保留（:413-416） |
 | rc.1 → rc.2 链路 | rc.1 丢 rename 回退 → fs-local/session-persistence-jsonl 两补丁补回；rc.2 原生捆绑 vision-exp → llm-deepseek 补丁退役为遗留资产（:399-425） |
 | 目标包缺席语义 | 上游裁包（如某版本依赖图变动）时跳过而非报错/硬写，避免死覆盖（:440-446） |
@@ -68,7 +69,7 @@
 | asset | 目标 | 本次 delta（相对 0.1.5-rc.1 原文件） |
 |---|---|---|
 | `attachment-local-index.js` | `dsh-attachment-local/lib/index.js` | F2 祖先 fsync 守卫（`ensureDurableDirectory` 里的 `syncDirectory(parent)`；与 `scripts/patches/` 构建期补丁同源）+ **两处** link(2)→rename 回退（`publishImmutableAlias` 的 `source`、`publishStagedObject` 的 `staged.path`——0.1.5 变量名已变，旧锚点 `temporary/target` 失效）+ `publishStagedObject` 主链 `unlink(staged.path)` 容忍 ENOENT |
-| `session-persistence-jsonl-index.js` | `dsh-session-persistence-jsonl/lib/index.js` | import 行加 `rename` + `link(tmp, finalPath)` 的 EACCES/EPERM/ENOTSUP → rename 回退（0.1.5 锚点仍在） |
+| `session-persistence-jsonl-index.js` | `dsh-session-persistence-jsonl/lib/index.js` | import 行加 `rename` + **两处** EACCES/EPERM/ENOTSUP → rename 回退：① `link(tmp, finalPath)`（`materialize` 路径，0.1.5 锚点仍在）；② **`link(staged, currentPath)`（`publishCurrentExclusive`，迁移/新代的原子发布）**——②此前漏打：0.13.7 起旧会话 `v0→v3` 迁移必经此路径 → 升级后**全部旧会话打不开**（EACCES，issue #154）；本次补齐 |
 | `web-frontend-index.html` | `dist/index.html`（hashAdaptive） | 与 0.1.5 dist 模板同源；资产里的 hash 由壳侧 `adaptIndexHashes` 跟随引擎改写，无需人工维护 |
 | ~~`llm-deepseek-index.js`~~ | — | **删除**：无 `applyAssetPatch` 调用点（rc.2 原生含 vision 后已成死资产，39KB） |
 
