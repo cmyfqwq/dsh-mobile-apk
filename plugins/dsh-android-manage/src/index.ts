@@ -30,22 +30,21 @@ import { parseUiTreeXml, pruneNodes, resolveRef, findActionableAncestor, checkUi
 import { cacheFromV2, decodeV2, isV2Payload, type V2Decoded } from './protocol-v2.js'
 import { detailRecord, pageRows, writeDetailStore } from './detail-store.js'
 import { resolveVirtualDisplayToken, vdTokenMissingText } from './vd-shot.js'
+import {
+  IME_ID,
+  KB_ACTION_CLEAR,
+  KB_ACTION_INPUT,
+  KB_RESULT,
+  adbKeyboardAuth,
+  adbKeyboardBroadcast,
+  isCommitAccepted,
+  parseBroadcastResult,
+} from './ime-broadcast.js'
 
 /**
- * 0.13.8 #183：键盘广播来源校验 nonce 参数（壳侧 AdbKeyboardReceiver 私有文件，
- * 引擎与壳同 uid 可读）。文件缺失（旧壳 / 桌面宿主）返回空串 = 不带 auth 参数，
- * 由壳侧 34+ sentFromUid 白名单兜底；桌面宿主无广播路径不受影响。
+ * 0.13.8 #183 / #413：键盘广播的 nonce 与命令构造已抽到 ./ime-broadcast.js
+ * （纯函数，单测守住「点名组件」「结果码解析」两条真判据）。
  */
-function adbKeyboardAuthArg(): string {
-  const base = process.env.DSH_FILES_DIR
-  if (!base) return ''
-  try {
-    const nonce = readFileSync(join(base, 'adb-keyboard-nonce'), 'utf8').trim()
-    return nonce ? ` --es auth '${nonce}'` : ''
-  } catch {
-    return ''
-  }
-}
 
 export const name = 'dsh-android-manage'
 // androidPrivilege 由 dsh-android-bridge 在 apply 时经 ctx.provide 注册；
@@ -1984,69 +1983,101 @@ return String(value.text ?? '') + (lines.length > 0 ? '\n' + lines.join('\n') : 
       }
       if (!priv.execAdbShell) return { ok: false, denied: false, text: 'ADB 执行通道未接通' }
       const wantKb = channel !== 'input'
-      const IME_ID = 'com.dsharnessmobile.shell/.AdbKeyboardService'
       if (wantKb) {
-        // ADBKeyboard 协议：am broadcast -a ADB_INPUT_TEXT / ADB_CLEAR_TEXT --es msg <文本>。
+        // ADBKeyboard 协议：am broadcast -n <接收器组件> -a ADB_INPUT_TEXT / ADB_CLEAR_TEXT --es msg <文本>。
         // 本应用 0.13.2 起内嵌同协议 IME。F5 修复：ime enable 只入列不生效（广播被静默丢弃）——
         // 探测当前默认 IME → 临时 ime set 切到本通道 → 注入 → 还原原 IME（借道不劫持）。
-        const cur = await priv.execAdbShell(`settings get secure default_input_method`).catch(() => ({ ok: false, stdout: '' }))
+        const execShell = priv.execAdbShell
+        const cur = await execShell(`settings get secure default_input_method`).catch(() => ({ ok: false, stdout: '' }))
         const prev = (cur.ok ? cur.stdout : '').trim().replace(/^"|"$/g, '')
-        await priv.execAdbShell(`ime enable ${IME_ID}`).catch(() => undefined)
+        await execShell(`ime enable ${IME_ID}`).catch(() => undefined)
         const needSwitch = prev.length > 0 && prev !== IME_ID
-        if (needSwitch) await priv.execAdbShell(`ime set ${IME_ID}`).catch(() => undefined)
-        // 0.13.8 #183：键盘广播来源校验 nonce——壳侧私有文件（DSH_FILES_DIR），引擎与壳
-        // 同 uid 可读，随广播 --es auth 携带；API 34+ 壳侧另有 sentFromUid 白名单兜底。
-        const authArg = adbKeyboardAuthArg()
-        const parts: string[] = []
-        if (clear) parts.push(`am broadcast -a ADB_CLEAR_TEXT${authArg}`)
-        if (raw) parts.push(`am broadcast -a ADB_INPUT_TEXT${authArg} --es msg '${raw.replace(/'/g, `'\\''`)}'`)
-        let r: { ok: boolean; stdout: string; guidance?: string } = { ok: true, stdout: '' }
-        for (const p of parts) {
-          r = await priv.execAdbShell(p)
-          if (!r.ok) break
-        }
-        // 现场实测（2026-09-10）：`input text` 偶发丢尾字符、中文 IME 可能把字母汉字化——
-        // 注入后**回读断言**（壳侧 nodeText 读聚焦框，便宜），不一致自动重试一次。
-        // 块G F3：回读必须带目标屏——否则壳侧按真实屏读聚焦框，校验与注入不在同一块屏上，
-        // 会假报「输入未落地」（模型据此重试或改道，实际输入早已成功）。
-        const nodeTextArgs = { ...screenArgs(args) }
-        let readBack: string | null = null
-        if (r.ok && raw.length > 0) {
-          const read = async (): Promise<string | null> => {
-            const nt = await a11yExec('nodeText', { ...nodeTextArgs }, 4000)
-            if (!nt.ok) return null
-            const d = (nt.data ?? {}) as { text?: string }
-            return d.text ?? ''
+        if (needSwitch) await execShell(`ime set ${IME_ID}`).catch(() => undefined)
+        // 0.13.8 #183 / #413：来源校验 nonce（壳侧私有文件，引擎与壳同 uid 可读）+ 点名组件。
+        const auth = adbKeyboardAuth(process.env.DSH_FILES_DIR)
+        type KbSend = { ok: boolean; stdout: string; guidance?: string; code: number | null }
+        const sendKb = async (action: string, msg?: string): Promise<KbSend> => {
+          const line = adbKeyboardBroadcast(action, msg, auth)
+          let r = await execShell(line)
+          let code = r.ok ? parseBroadcastResult(r.stdout) : null
+          // ime set 与本 IME 的系统绑定存在竞态：未就绪时等一个绑定周期再重试一次（不再静默失败）。
+          if (r.ok && (code === KB_RESULT.imeNotReady || code === KB_RESULT.noConnection)) {
+            await new Promise((resolve) => setTimeout(resolve, 220))
+            r = await execShell(line)
+            code = r.ok ? parseBroadcastResult(r.stdout) : null
           }
-          await new Promise((resolve) => setTimeout(resolve, 260))
-          readBack = await read()
-          if (readBack !== null && readBack !== raw) {
-            await priv.execAdbShell(`am broadcast -a ADB_CLEAR_TEXT${authArg}`).catch(() => undefined)
-            await priv.execAdbShell(`am broadcast -a ADB_INPUT_TEXT${authArg} --es msg '${raw.replace(/'/g, `'\\''`)}'`).catch(() => undefined)
-            await new Promise((resolve) => setTimeout(resolve, 320))
+          return { ok: r.ok, stdout: r.stdout, guidance: r.guidance, code }
+        }
+        const kbFailText = (action: string, code: number | null): string => {
+          const what = action === KB_ACTION_CLEAR ? '清空' : '输入'
+          if (code === KB_RESULT.imeNotReady) return `${what}未落地：内嵌输入法尚未被系统绑定（ime set 后未就绪）——请确认「DSH 设备键盘」已在系统里启用，稍后重试`
+          if (code === KB_RESULT.noConnection) return `${what}未落地：目标输入框没有输入连接（可能未聚焦或已被回收）——请先点聚焦目标输入框后重试`
+          if (code === KB_RESULT.rejected) return `${what}未落地：广播来源校验被拒（只有 adb shell/root 直发或携带有效 auth nonce 才能通过，见 AdbKeyboardReceiver 注释）`
+          if (code === KB_RESULT.badRequest) return `${what}未落地：广播请求不合法（文本为空或动作不识别）`
+          return `${what}未落地：未知结果码 ${code}`
+        }
+        try {
+          if (clear) {
+            const res = await sendKb(KB_ACTION_CLEAR)
+            if (!res.ok) return { ok: false, denied: false, channel: 'adbkeyboard', text: res.guidance ?? (res.stdout || 'ADBKeyboard 清空执行失败') }
+            if (!isCommitAccepted(res.code)) {
+              return { ok: false, denied: false, channel: 'adbkeyboard', text: kbFailText(KB_ACTION_CLEAR, res.code) }
+            }
+          }
+          let resultCode: number | null = null
+          if (raw) {
+            const res = await sendKb(KB_ACTION_INPUT, raw)
+            if (!res.ok) return { ok: false, denied: false, channel: 'adbkeyboard', text: res.guidance ?? (res.stdout || 'ADBKeyboard 输入执行失败') }
+            resultCode = res.code
+            if (!isCommitAccepted(res.code)) {
+              return { ok: false, denied: false, channel: 'adbkeyboard', text: kbFailText(KB_ACTION_INPUT, res.code) }
+            }
+          }
+          // 现场实测（2026-09-10）：`input text` 偶发丢尾字符、中文 IME 可能把字母汉字化——
+          // 注入后**回读断言**（壳侧 nodeText 读聚焦框，便宜），不一致自动重试一次。
+          // 块G F3：回读必须带目标屏——否则壳侧按真实屏读聚焦框，校验与注入不在同一块屏上，
+          // 会假报「输入未落地」（模型据此重试或改道，实际输入早已成功）。
+          const nodeTextArgs = { ...screenArgs(args) }
+          let readBack: string | null = null
+          if (raw.length > 0) {
+            const read = async (): Promise<string | null> => {
+              const nt = await a11yExec('nodeText', { ...nodeTextArgs }, 4000)
+              if (!nt.ok) return null
+              const d = (nt.data ?? {}) as { text?: string }
+              return d.text ?? ''
+            }
+            await new Promise((resolve) => setTimeout(resolve, 260))
             readBack = await read()
+            if (readBack !== null && readBack !== raw) {
+              await sendKb(KB_ACTION_CLEAR)
+              await sendKb(KB_ACTION_INPUT, raw)
+              await new Promise((resolve) => setTimeout(resolve, 320))
+              readBack = await read()
+            }
           }
-        }
-        // 还原用户原 IME（广播已被接收器入队提交，留 0.4s 提交窗口防切换竞态）。
-        if (needSwitch) await priv.execAdbShell(`sleep 0.4; ime set ${prev}`).catch(() => undefined)
-        if (!r.ok) return { ok: false, denied: false, channel: 'adbkeyboard', text: r.guidance ?? (r.stdout || 'ADBKeyboard 输入失败') }
-        if (readBack !== null && raw.length > 0 && readBack !== raw) {
+          if (readBack !== null && raw.length > 0 && readBack !== raw) {
+            return {
+              ok: false,
+              denied: false,
+              channel: 'adbkeyboard',
+              text: `输入未落地：期望「${raw.slice(0, 30)}」，回读实际「${readBack.slice(0, 30)}」——`
+                + '已自动重试一次仍不一致；建议：确认目标输入框处于聚焦态后重试，或改用 android_web_dump + ref=wN（自有 Web UI），'
+                + '纯 ASCII 也可试 channel:"input"',
+            }
+          }
+          const act = [clear ? '已清空' : '', raw ? `已输入 ${raw.slice(0, 24)}${raw.length > 24 ? '…' : ''}` : ''].filter(Boolean).join(' + ')
+          const verifyNote = readBack === null
+            ? (resultCode === KB_RESULT.committed ? '，壳侧结果码确认已提交' : '')
+            : '，回读一致'
           return {
-            ok: false,
+            ok: true,
             denied: false,
             channel: 'adbkeyboard',
-            text: `输入未落地：期望「${raw.slice(0, 30)}」，回读实际「${readBack.slice(0, 30)}」——`
-              + '已自动重试一次仍不一致；建议：确认目标输入框处于聚焦态后重试，或改用 android_web_dump + ref=wN（自有 Web UI），'
-              + '纯 ASCII 也可试 channel:"input"',
+            text: `${act}（ADBKeyboard${needSwitch ? '，IME 已临时切换并还原' : ''}${verifyNote}）`,
           }
-        }
-        const act = [clear ? '已清空' : '', raw ? `已输入 ${raw.slice(0, 24)}${raw.length > 24 ? '…' : ''}` : ''].filter(Boolean).join(' + ')
-        const verifyNote = readBack === null ? '' : '，回读一致'
-        return {
-          ok: true,
-          denied: false,
-          channel: 'adbkeyboard',
-          text: `${act}（ADBKeyboard${needSwitch ? '，IME 已临时切换并还原' : ''}${verifyNote}）`,
+        } finally {
+          // 还原用户原 IME（广播已被接收器入队提交，留 0.4s 提交窗口防切换竞态）。
+          if (needSwitch) await execShell(`sleep 0.4; ime set ${prev}`).catch(() => undefined)
         }
       }
       // input text 兜底（channel: "input" 强制；仅可见 ASCII——部分 ROM 丢字/丢空格，F5 不推荐）

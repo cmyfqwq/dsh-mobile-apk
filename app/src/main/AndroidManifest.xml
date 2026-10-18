@@ -53,7 +53,10 @@
         android:resource="@xml/input_method" />
     </service>
 
-    <!-- ADBKeyboard 协议广播入口（ADB_INPUT_TEXT/ADB_CLEAR_TEXT）；仅在 IME 活跃时生效。 -->
+    <!-- ADBKeyboard 协议广播入口（ADB_INPUT_TEXT/ADB_CLEAR_TEXT）；仅在 IME 活跃时生效。
+         0.14.8 #413：targetSdk 26+ 的 manifest 接收器收不到**隐式**广播（设备实测 0 个接收者），
+         因此点名组件/点名包的广播由本组件承接；纯隐式广播由 AdbKeyboardService 在 IME
+         活跃期运行期注册的接收器承接（两个实例按投递方式分工，见 AdbKeyboardReceiver）。 -->
     <receiver
       android:name=".AdbKeyboardReceiver"
       android:exported="true">

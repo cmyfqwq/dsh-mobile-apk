@@ -136,7 +136,7 @@ sequenceDiagram
 | K10 | 通知中心 | 引擎事件到通知栏应答的投递-应答闭环；延后日志同步提交、恢复与结算 | 引擎 .notify.ndjson / WS waterfall / 通知动作广播 | 交互面 | P01 通知投影、K09 面板 pending | EngineService.onCreate、动作广播冷启动 | NotifyCenter.kt,NotifyBridge.kt,NotifyStore.kt,NotifySuppressQueue.kt,NotifyDecisionQueue.kt | 高 |
 | K11 | Kotlin 单测面 | JVM策略/core/settlement/wiring与instrumentation覆盖；在场不是已执行。0.14.8 P1 增补：刷新窗口内启动请求的有界等待（跨进程真源 = 真 journal 文件；收口即停 / 超预算必返 / 换代立刻收手 / 无事务不等）与接线契约（裸 `flowOwnership.begin() ?: return` 不得回归、推迟必须进 boot-fail），见 `app/src/test/java/com/dsharnessmobile/shell/DeferredEngineStartTest.kt` | 外部Gradle/结果基线门禁 | 测试与门禁 | 横切 | 实际XML/日志与外部三层证据 | app/src/test/java/com/dsharnessmobile/shell,scripts/check-kotlin-test-count.mjs,scripts/kotlin-test-baseline.json,app/build.gradle.kts | 中 |
 | P01 | 桥插件（dsh-android-bridge） | 设备控制的授权判定、控制队列与三条特权执行出口 | 模型设备工具 / 其它插件直连服务面 / 壳侧长轮询取活 | 稳态控制 | K04 控制队列协议、K05 无障碍面、K06 特权执行、P02 manage、P03 浏览器、K10 通知 | cordis 装配（provide androidPrivilege）、模型设备工具、壳侧 ControlPoller 长轮询 | plugins/dsh-android-bridge/src/index.ts,plugins/dsh-android-bridge/src/control-queue.ts,plugins/dsh-android-bridge/src/screen-scope.ts | 高 |
-| P02 | 管理插件（dsh-android-manage） | 把模型意图落成壳侧无障碍或特权 shell 的屏幕工具面 | 模型每轮 tool call；插件 apply 时注册 14 个工具 | 稳态控制 | 授权桥与控制队列（androidPrivilege）,壳侧无障碍与特权执行面,屏幕范围偏好 | 引擎 cordis 装配（android-bridge 先于 android-manage）；每次模型 tool call | plugins/dsh-android-manage/src/index.ts,plugins/dsh-android-manage/src/protocol-v2.ts,plugins/dsh-android-manage/src/vd-shot.ts | 高 |
+| P02 | 管理插件（dsh-android-manage） | 把模型意图落成壳侧无障碍或特权 shell 的屏幕工具面 | 模型每轮 tool call；插件 apply 时注册 14 个工具 | 稳态控制 | 授权桥与控制队列（androidPrivilege）,壳侧无障碍与特权执行面,屏幕范围偏好 | 引擎 cordis 装配（android-bridge 先于 android-manage）；每次模型 tool call | plugins/dsh-android-manage/src/index.ts,plugins/dsh-android-manage/src/protocol-v2.ts,plugins/dsh-android-manage/src/vd-shot.ts,plugins/dsh-android-manage/src/ime-broadcast.ts | 高 |
 | P03 | 浏览器与虚拟屏插件 | browser_* 与 vd* 工具落壳侧控制 op 并如实回执 | 模型调用 browser_* / android_vdisplay_* 工具 | 稳态控制 | K08,K07,桥控制队列 | 引擎启动时按装配集注册 | plugins/dsh-android-browser/src/tools.ts,plugins/dsh-android-browser/src/index.ts,plugins/dsh-android-vdisplay/src/index.ts,plugins/dsh-android-vdisplay/src/status.ts | 高 |
 | P04 | 文件打开、Linux 环境与模型能力插件 | 外部来件草稿、工具链与缓存清理、模型能力写回 | 壳侧 FileIncoming 投递 / 设置页 HTTP / cordis 装配 | 稳态控制 | 桥与鉴权、客户端注入层、shell-termux 工具链表、快照装配链 | 壳侧 FileIncoming.processIncomingIntent、设置页与开发者选项、cordis 装配 | plugins/dsh-android-file-open/src/index.ts,plugins/dsh-android-linux-env/src/runtime-cache.ts,plugins/dsh-model-capability/src/index.ts | 高 |
 | S01 | 引擎侧注入层（三个子仓） | 页面内发布标记与桥入口、钳面板几何、装配老内核垫片 | 客户端插件 apply() 装载；每个 index 响应经 tapIndex 注入 | 交互面 | K04（壳侧 androidBridge/dshBackBridge 桥面） | 引擎插件系统按 profile-web.cordis.patch.yml 的 insert 行拉起 | dsh-client-ui-responsive/src/client/index.ts,dsh-host-web-compat/lib/index.js,dsh-shell-termux/src/index.ts | 高 |
@@ -516,7 +516,7 @@ sequenceDiagram
 | P02 | 虚拟屏执行面 | 别名枚举走 vdInfo、虚拟屏坐标点击走 vdInput、跨屏拉起走 vdLaunchApp | plugins/dsh-android-manage/src/index.ts:1519 |
 | P02 | 屏幕范围偏好 | guard 每次调用现读用户范围，默认 virtual-only，越界即结构化拒绝并给引导 | plugins/dsh-android-manage/src/index.ts:138 |
 | P02 | 引擎工具面 | defineTool 的 output.schema 与返回值受引擎整值校验，注册完整性由源码级门禁守 | plugins/dsh-android-manage/src/index.ts:2283 |
-| P02 | ADBKeyboard 输入法 | 广播 ADB_INPUT_TEXT 与 ADB_CLEAR_TEXT 带 nonce auth，壳侧接收器按 uid 白名单校验 | plugins/dsh-android-manage/src/index.ts:1886 |
+| P02 | ADBKeyboard 输入法 | 广播点名组件 `-n …/.AdbKeyboardReceiver` 并带 nonce auth；壳侧按 `getSentFromUid()`（root/adb shell）或 nonce 校验，结果码写回广播（1 已提交/2 未就绪/3 被拒/4 请求不合法/5 无连接），引擎据结果码判真实落地 | plugins/dsh-android-manage/src/ime-broadcast.ts:61 |
 | P02 | 审计面 | priv.audit 写 files/audit/audit.ndjson，与 bridge 和壳侧 ControlAudit 同路径同格式 | plugins/dsh-android-manage/src/index.ts:152 |
 | P02 | vdisplay 工具面 | 失败文案把模型引到 android_vdisplay_input 与 android_vdisplay_status 承接坐标与状态 | plugins/dsh-android-manage/src/index.ts:1268 |
 | P02 | 引擎 WebView 面 | android_web_dump 与 webAction 读壳自有 WebView 而非设备屏，故刻意不进 SCREEN_ACTIONS | plugins/dsh-android-manage/src/index.ts:114 |
@@ -831,7 +831,7 @@ flowchart TD
 - **入口/触发**：
   - 队列取活：`ControlPoller.loop()`（`ControlPoller.kt:96`）向 `127.0.0.1:3080/api/android/ui/pending` 长轮询 → `ControlCarrier.handle`（`ControlCarrier.kt:86`）→ `DeviceControlService.handle`（`DeviceControlService.kt:607`）。
   - 服务生命周期：系统绑定 → `onServiceConnected`（:444，登记 `ControlCarrier.a11y` 并 `ensureStarted`）；`onAccessibilityEvent`（:457）只做失效标记；`onInterrupt`（:471）空实现；`onUnbind`/`onDestroy` → `teardown`（:485）。
-  - 键盘：`AdbKeyboardReceiver.onReceive`（`AdbKeyboardReceiver.kt:23`）← `am broadcast -a ADB_INPUT_TEXT/ADB_CLEAR_TEXT --es msg/--es auth`（引擎 manage 的 `android_ui_input`，`plugins/dsh-android-manage/src/index.ts:1889`）。
+  - 键盘：`AdbKeyboardReceiver.onReceive`（`AdbKeyboardReceiver.kt:45`）← `am broadcast -n com.dsharnessmobile.shell/.AdbKeyboardReceiver -a ADB_INPUT_TEXT/ADB_CLEAR_TEXT --es msg/--es auth`（引擎 manage 的 `android_ui_input`，命令构造 `plugins/dsh-android-manage/src/ime-broadcast.ts:61`，调用点 `plugins/dsh-android-manage/src/index.ts:1999`）。点名组件是必需项：不点名时 targetSdk 34 的 manifest 接收器收不到隐式广播（0 个接收者），`am broadcast` 仍打印 `result=0`；纯隐式协议由 `AdbKeyboardService.registerRuntimeReceiver`（`AdbKeyboardService.kt:114`）在 IME 活跃期承接。两个实例按投递方式互补（`AdbKeyboardReceiver.shouldHandle`，`AdbKeyboardReceiver.kt:76`）：纯隐式只进运行期实例、点名组件/点名包只进 manifest 实例，保证同一次注入只提交一遍。
   - 设置页只读：`statusJson`（:214）/`token`（:235）经 `AndroidBridge.a11yStatus`（`MainActivity.kt:793`）。
 - **运行顺序**：
   1. 引擎工具面 → bridge `controlExec`（`plugins/dsh-android-bridge/src/index.ts:949`）→ 控制队列 enqueue（单在途；档位门、`A11Y_OPS` 门、`REAL_SCREEN_CONTROL_OPS` 范围门都在这一步）。
@@ -1267,7 +1267,7 @@ flowchart TD
 
 #### P02 管理插件（dsh-android-manage）
 
-- **一句话**：引擎侧 14 个 `android_*` 工具的实现——把模型意图经「屏幕范围门 + 会话档位门」翻译成壳侧无障碍队列 op 或特权 shell 命令，再把壳侧载荷剪枝成紧凑语义清单（含两级披露与「界面未变」快路径）。本块 5 个源文件在协调仓 `plugins/dsh-android-manage/src/` 是权威源，apk 仓为逐字节镜像（本轮 diff 逐文件一致）。
+- **一句话**：引擎侧 14 个 `android_*` 工具的实现——把模型意图经「屏幕范围门 + 会话档位门」翻译成壳侧无障碍队列 op 或特权 shell 命令，再把壳侧载荷剪枝成紧凑语义清单（含两级披露与「界面未变」快路径）。本块 6 个源文件在协调仓 `plugins/dsh-android-manage/src/` 是权威源，apk 仓为逐字节镜像（本轮 diff 逐文件一致）。
 - **入口/触发**：
   - 装配期（一次性）：`apply`（`plugins/dsh-android-manage/src/index.ts:2286`）取 `ctx.androidPrivilege`（`inject` 声明在 `:53`，要求 android-bridge 先装配），调用 `tools(ctx, face)`（`:105`）并把返回的 14 个工具逐个 `ctx.tools.register`（`:2295`）。服务缺失时退化为 fail-closed 桩（`:2291`）并 warn（`:2289`）。
   - 运行期（每次调用）：模型发起一次 tool call → 该工具的 `execute(args, exec)`；`exec.agent.session` 是档位判定的会话来源。
@@ -1339,7 +1339,7 @@ flowchart TD
   3. x/y 绝对坐标 + 非虚拟屏的组合没有执行路径（已确认代码事实）：`plugins/dsh-android-manage/src/index.ts:1494` 的 `useAbs` 一旦通过就不再校验 screenId；screenId 缺省或为 `real` 时，a11y 分支发 `nx/ny = undefined`（`:1615`，壳侧回「需要 row 或 nx/ny」），ADB 分支 `Math.round(nx! * size.w)` 得 NaN（`:1650`）后执行 `input tap NaN NaN`（`:1678`）。触发条件：模型按 `SCREEN_PARAM` 文案（real|virtual-N）传 x/y + `screenId:"real"`，或只传 x/y。
   4. 单槽 `uiCache` 不记录屏幕归属（未证实，代码路径可读证）：`plugins/dsh-android-manage/src/index.ts:901` 的缓存结构没有 screenId，`:948` 的结构指纹也不含屏幕维度。多屏会话里「dump 虚拟屏 → dump 真实屏 → 用虚拟屏的 n3 点击」会按最新一次缓存解析 ref，命中另一块屏的同名 n3，载荷再带上本次调用的 screenId，返回仍是 `ok:true` 与一组坐标；排查时表现为「点击坐标与预期不符」而看不出是串屏。
   5. vdInput 分支把 displayId 塞进 `x` 键（已确认代码事实）：`plugins/dsh-android-manage/src/index.ts:1537` 返回 `x: data.displayId, y: 0`，而 schema 与工具描述里的 `x`/`y` 语义是点击坐标（真实坐标只在 `text` 里）。影响：模型若据返回值的 x/y 推算下一步点击会拿到无意义坐标。
-- 漂移：`docs/AGENTS/gotchas.md:178` 说坑 72 的锚点是 `plugins/dsh-android-manage/src/lossless-json.ts` 与 `plugins/dsh-android-manage/test/privilege-status.test.mjs`，源码里这两个文件只在 bridge 插件下（`plugins/dsh-android-bridge/src/lossless-json.ts:1`、`plugins/dsh-android-bridge/test/privilege-status.test.mjs:1`），manage 的 `src/` 只有 index/ui-tree/protocol-v2/detail-store/vd-shot 五个文件。
+- 漂移：`docs/AGENTS/gotchas.md:178` 说坑 72 的锚点是 `plugins/dsh-android-manage/src/lossless-json.ts` 与 `plugins/dsh-android-manage/test/privilege-status.test.mjs`，源码里这两个文件只在 bridge 插件下（`plugins/dsh-android-bridge/src/lossless-json.ts:1`、`plugins/dsh-android-bridge/test/privilege-status.test.mjs:1`），manage 的 `src/` 只有 index/ui-tree/protocol-v2/detail-store/vd-shot/ime-broadcast 六个文件。
 - 漂移：`plugins/dsh-android-manage/src/index.ts:7` 的文件头工具集注释只列 8 个工具（screenshot/ui_tree/device_info/act_input/ui_dump/ui_click/ui_scroll/ui_input），源码 `plugins/dsh-android-manage/src/index.ts:2283` 实际注册 14 个（另有 screen_list/ui_detail/web_dump/env_prepare/app_launch/ui_global）。
 - 漂移：`scripts/check-code-map.mjs:152` 的注释说耦合边右端可以是「外部角色」文字，同文件 `scripts/check-code-map.mjs:103` 的解析正则却要求两端都形如查点 ID，凡右端写外部角色的边一律判 `bad-coupling`。
 
@@ -2240,6 +2240,7 @@ plugins/dsh-android-manage/src/ui-tree.ts
 plugins/dsh-android-manage/src/protocol-v2.ts
 plugins/dsh-android-manage/src/vd-shot.ts
 plugins/dsh-android-manage/src/detail-store.ts
+plugins/dsh-android-manage/src/ime-broadcast.ts
 glob:plugins/dsh-android-manage/test/*.test.mjs
 glob:plugins/dsh-android-manage/test/*.mjs
 plugins/dsh-android-browser/src/tools.ts

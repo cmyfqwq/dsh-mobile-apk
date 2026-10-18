@@ -2,7 +2,10 @@ package com.dsharnessmobile.shell
 
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.inputmethodservice.InputMethodService
+import android.os.Build
+import android.os.Process
 import android.view.Gravity
 import android.view.View
 import android.view.inputmethod.InputMethodManager
@@ -18,7 +21,7 @@ import android.widget.TextView
  *
  * 设计约束：
  * - 不抢用户默认输入法：仅当本 IME 被系统选为当前输入法时才提交文本
- *   （广播到达时校验 currentInputMethodId + 实例存在）；`ime enable` 由引擎侧
+ *   （广播到达时校验实例存在 + 输入连接存在）；`ime enable` 由引擎侧
  *   android_ui_input 自动执行（只加入输入法列表，不设默认）。
  * - 输入视图仅一个「收起键盘」按钮（与经典 ADBKeyboard 观感一致）。
  * - 文本只在「本 IME 活跃 + 当前输入连接存在」时写入——注入面封闭。
@@ -26,8 +29,23 @@ import android.widget.TextView
  * 协议动作（与引擎侧 android_ui_input 配对）：
  * - ADB_INPUT_TEXT：extra "msg" = UTF-8 文本（replace 语义）
  * - ADB_CLEAR_TEXT：清空当前输入框
+ *
+ * 0.14.8 #413 广播投递修复（设备实测，Android 16/17 各一台）：
+ * - manifest 声明的接收器在 targetSdk 34 上**收不到隐式广播**（`am broadcast -a
+ *   ADB_INPUT_TEXT` 解析出 0 个接收者，`Enqueued broadcast … : 0`），经典协议因此
+ *   全程静默失效；而 `Broadcast completed: result=0` 这行只表示「发送完成」，
+ *   与「文本已提交」无关。修法两条：① 本服务在 onCreate 里**运行期注册**同款
+ *   接收器（运行期接收器不受隐式限制，且只在 IME 活跃期存在 = 唯一能提交的窗口；
+ *   该实例只接纯隐式广播，点名/点名包的广播仍归 manifest 实例，见
+ *   `AdbKeyboardReceiver.shouldHandle`——一次注入只提交一遍）；
+ *   ② 引擎侧广播改为**点名组件** `-n …/.AdbKeyboardReceiver`（manifest 接收器）。
+ * - 接收器把处理结果写回广播结果码（[RESULT_COMMITTED] 等），调用方据此区分
+ *   「已提交 / 输入法未就绪 / 来源被拒」，不再靠猜。
  */
 class AdbKeyboardService : InputMethodService() {
+
+  /** 运行期注册的接收器实例（隐式广播通道；见类注释）。 */
+  private var runtimeReceiver: AdbKeyboardReceiver? = null
 
   override fun onCreateInputView(): View {
     val label = TextView(this).apply {
@@ -49,33 +67,38 @@ class AdbKeyboardService : InputMethodService() {
   override fun onCreate() {
     super.onCreate()
     instance = this
+    registerRuntimeReceiver()
   }
 
   override fun onDestroy() {
+    unregisterRuntimeReceiver()
     if (instance === this) instance = null
     super.onDestroy()
   }
 
-  /** 提交文本到当前输入连接（replace 语义，与 ADBKeyboard 默认一致）。幂等失败。 */
-  internal fun commitText(text: String) {
-    val conn = currentInputConnection ?: return
-    if (!conn.beginBatchEdit()) return
+  /** 提交文本到当前输入连接（replace 语义，与 ADBKeyboard 默认一致）。返回是否真的提交。 */
+  internal fun commitText(text: String): Boolean {
+    val conn = currentInputConnection ?: return false
+    val batched = conn.beginBatchEdit()
     try {
-      conn.commitText(text, 1)
+      // beginBatchEdit 失败（部分 WebView/自绘编辑器返回 false）不应连带放弃提交。
+      return conn.commitText(text, 1)
     } finally {
-      conn.endBatchEdit()
+      if (batched) conn.endBatchEdit()
     }
   }
 
-  /** 清空当前输入框（全选后删除）。 */
-  internal fun clearText() {
-    val conn = currentInputConnection ?: return
-    if (!conn.beginBatchEdit()) return
+  /** 清空当前输入框：按光标前后真实长度删除（不用 MAX_VALUE 这类溢出值）。返回是否执行。 */
+  internal fun clearText(): Boolean {
+    val conn = currentInputConnection ?: return false
+    val batched = conn.beginBatchEdit()
     try {
-      conn.setSelection(0, Int.MAX_VALUE)
-      conn.deleteSurroundingText(Int.MAX_VALUE, Int.MAX_VALUE)
+      val before = conn.getTextBeforeCursor(MAX_CLEAR_CHARS, 0)?.length ?: 0
+      val after = conn.getTextAfterCursor(MAX_CLEAR_CHARS, 0)?.length ?: 0
+      if (before == 0 && after == 0) return true
+      return conn.deleteSurroundingText(before, after)
     } finally {
-      conn.endBatchEdit()
+      if (batched) conn.endBatchEdit()
     }
   }
 
@@ -86,11 +109,57 @@ class AdbKeyboardService : InputMethodService() {
 
   private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
 
+  /** 运行期注册 ADB_INPUT_TEXT/ADB_CLEAR_TEXT 接收器（targetSdk 34 必须显式声明导出面）。 */
+  @Suppress("UnspecifiedRegisterReceiverFlag")
+  private fun registerRuntimeReceiver() {
+    if (runtimeReceiver != null) return
+    val filter = IntentFilter().apply {
+      addAction(ACTION_INPUT_TEXT)
+      addAction(ACTION_CLEAR_TEXT)
+    }
+    val receiver = AdbKeyboardReceiver().also { it.runtimeScoped = true }
+    val registered = try {
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED)
+      } else {
+        registerReceiver(receiver, filter)
+      }
+      true
+    } catch (e: Throwable) {
+      android.util.Log.w("dsh-adb-kb", "runtime receiver register failed: " + e.javaClass.simpleName)
+      false
+    }
+    if (registered) runtimeReceiver = receiver
+  }
+
+  private fun unregisterRuntimeReceiver() {
+    val receiver = runtimeReceiver ?: return
+    runtimeReceiver = null
+    try {
+      unregisterReceiver(receiver)
+    } catch (_: Throwable) {
+      // 未注册/已注销：忽略（IME 生命周期里重复调用无害）。
+    }
+  }
+
   companion object {
     const val ACTION_INPUT_TEXT = "ADB_INPUT_TEXT"
     const val ACTION_CLEAR_TEXT = "ADB_CLEAR_TEXT"
     const val EXTRA_MSG = "msg"
     const val EXTRA_AUTH = "auth"
+
+    /** 广播结果码：调用方（am broadcast / 引擎）据此判断真实处理结果，不再只看「发送成功」。 */
+    const val RESULT_COMMITTED = 1
+    const val RESULT_IME_NOT_READY = 2
+    const val RESULT_REJECTED = 3
+    const val RESULT_BAD_REQUEST = 4
+    const val RESULT_NO_CONNECTION = 5
+
+    /** adb shell 的固定 uid（root = 0）——经典 ADBKeyboard 协议由它们直发，无 nonce。 */
+    private const val SHELL_UID = 2000
+
+    /** 清空时单侧最多读取的字符数（EditText 上限远小于此值）。 */
+    private const val MAX_CLEAR_CHARS = 100_000
 
     /** 当前活跃服务实例（广播转发入口；绑定期间才非空）。 */
     @Volatile
@@ -105,16 +174,18 @@ class AdbKeyboardService : InputMethodService() {
      */
     fun canCommit(): Boolean = instance != null
 
-    /** 静态接收器统一入口：校验活跃后提交/清空。返回是否已处理。 */
-    fun handle(action: String, msg: String?): Boolean {
-      if (!canCommit()) return false
-      val svc = instance ?: return false
-      when (action) {
-        ACTION_INPUT_TEXT -> msg?.let { svc.commitText(it) } ?: return false
-        ACTION_CLEAR_TEXT -> svc.clearText()
-        else -> return false
+    /** 静态/运行期接收器统一入口：校验活跃后提交/清空，返回 [RESULT_COMMITTED] 等结果码。 */
+    fun handle(action: String, msg: String?): Int {
+      if (!canCommit()) return RESULT_IME_NOT_READY
+      val svc = instance ?: return RESULT_IME_NOT_READY
+      return when (action) {
+        ACTION_INPUT_TEXT -> {
+          if (msg.isNullOrEmpty()) return RESULT_BAD_REQUEST
+          if (svc.commitText(msg)) RESULT_COMMITTED else RESULT_NO_CONNECTION
+        }
+        ACTION_CLEAR_TEXT -> if (svc.clearText()) RESULT_COMMITTED else RESULT_NO_CONNECTION
+        else -> RESULT_BAD_REQUEST
       }
-      return true
     }
 
     /** 广播来源 nonce 文件（应用私有 filesDir 根；引擎经 DSH_FILES_DIR 读取后随广播回传）。 */
@@ -133,34 +204,35 @@ class AdbKeyboardService : InputMethodService() {
       return secret
     }
 
+    /** 来源 uid 白名单：root(0) / adb shell(2000)。纯判据，单测直接覆盖。 */
+    fun isTrustedUid(uid: Int): Boolean = uid == 0 || uid == SHELL_UID
+
     /**
      * 来源校验（0.13.8 #183，详见 AdbKeyboardReceiver 类注释）：
-     * 34+ uid 白名单（root/adb shell）或有效 auth nonce（引擎路径）。
-     * `MessageDigest.isEqual` 常量时间比较，防逐字节试探。
+     * uid 白名单（root/adb shell，`BroadcastReceiver.getSentFromUid()` 取自框架）
+     * 或有效 auth nonce（引擎路径）。
+     *
+     * #413 修正：旧实现反射 `Intent.getSentFromUid()`，而 AOSP 的 Intent **没有**
+     * 这个方法（正确位置是 BroadcastReceiver，API 34 起），反射恒抛 → 白名单恒不生效
+     * → adb shell 直发（不带 nonce）的广播一律被拒。现由调用方传入框架给出的真实 uid。
      */
-    fun isTrustedSender(context: Context, intent: Intent): Boolean {
-      if (android.os.Build.VERSION.SDK_INT >= 34) {
-        sentFromUid(intent)?.let { uid -> if (uid == 0 || uid == 2000) return true }
-      }
+    fun isTrustedSender(context: Context, intent: Intent, senderUid: Int): Boolean {
+      if (isTrustedUid(senderUid)) return true
       val given = intent.getStringExtra(EXTRA_AUTH) ?: return false
       val secret = try {
         nonceFile(context).takeIf { it.exists() }?.readText()?.trim()
       } catch (_: Throwable) {
         null
       } ?: return false
+      return trustNonce(given, secret)
+    }
+
+    /** 常量时间比较，防逐字节试探；空 secret 一律拒绝（非空 nonce 才能匹配）。 */
+    fun trustNonce(given: String, secret: String): Boolean {
+      if (secret.isEmpty()) return false
       return java.security.MessageDigest.isEqual(
         given.toByteArray(Charsets.UTF_8), secret.toByteArray(Charsets.UTF_8),
       )
-    }
-
-    /**
-     * API 34+ 的 Intent.getSentFromUid（反射调用——本机 SDK 平台 jar 实测缺该符号，
-     * 编译期不可见；运行时 34+ 设备必有该方法，缺失/异常一律返回 null 走 nonce 分支）。
-     */
-    private fun sentFromUid(intent: Intent): Int? = try {
-      Intent::class.java.getMethod("getSentFromUid").invoke(intent) as? Int
-    } catch (_: Throwable) {
-      null
     }
 
     private const val NONCE_FILE_NAME = "adb-keyboard-nonce"

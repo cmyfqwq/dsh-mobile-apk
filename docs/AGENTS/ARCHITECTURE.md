@@ -67,8 +67,8 @@
 
 | 文件 | 职责一句话 | 被引用 |
 |---|---|---|
-| AdbKeyboardService.kt | 内嵌 ADBKeyboard 协议 IME（android_ui_input 中文输入；仅活跃时提交） | AdbKeyboardReceiver（静态 handle 转发） |
-| AdbKeyboardReceiver.kt | ADB_INPUT_TEXT/ADB_CLEAR_TEXT 广播入口 | manifest 注册（无代码调用方） |
+| AdbKeyboardService.kt | 内嵌 ADBKeyboard 协议 IME（android_ui_input 中文输入；仅活跃时提交） | 运行期注册 AdbKeyboardReceiver（隐式广播）+ 注销 |
+| AdbKeyboardReceiver.kt | ADB_INPUT_TEXT/ADB_CLEAR_TEXT 广播入口；来源校验（uid 白名单 + nonce）并写回结果码 | manifest 注册（只收点名组件广播）＋ IME 运行期注册（隐式广播） |
 | BootReceiver.kt | BOOT_COMPLETED 恢复用户同意状态 + BatteryWhitelist 引导 | manifest 注册（无代码调用方） |
 | ShizukuSupport.kt | Shizuku 反射探活（历史：引导页状态行只读展示） | EngineStartFlow（状态行） |
 | ShizukuProbe.kt | Shizuku 五态探针（absent/not-running/denied/prev11 等错误码 + guidance，fail-closed） | MainActivity、DeviceControlService、VdisplayController |
@@ -135,7 +135,7 @@
 | .AdbKeyboardService | service（BIND_INPUT_METHOD，exported=true） | AdbKeyboardService.kt | @xml/input_method 注册 IME |
 | .DeviceControlService | service（BIND_ACCESSIBILITY_SERVICE，exported=true） | DeviceControlService.kt | @xml/accessibility_service_config 能力声明 |
 | .OverlayService | service（exported=false） | OverlayService.kt | SYSTEM_ALERT_WINDOW 悬浮球 |
-| .AdbKeyboardReceiver | receiver（exported=true，ADB_INPUT_TEXT/ADB_CLEAR_TEXT） | AdbKeyboardReceiver.kt | 仅 IME 活跃时生效 |
+| .AdbKeyboardReceiver | receiver（exported=true，ADB_INPUT_TEXT/ADB_CLEAR_TEXT） | AdbKeyboardReceiver.kt | 只收点名组件/点名包的广播（隐式广播在 targetSdk 26+ 收不到）；纯隐式协议走 IME 运行期注册的同款接收器 |
 | .BootReceiver | receiver（exported=true，BOOT_COMPLETED） | BootReceiver.kt | 开机恢复 |
 | .NotifyActionReceiver | receiver（exported=false，显式 Intent） | NotifyActionReceiver.kt | 通知动作（回复/选项/批准/拒绝/重试） |
 | androidx FileProvider | provider（${applicationId}.fileprovider） | （框架类） | 路径白名单 @xml/file_paths，不映射 .credentials.yaml 等机密区 |
